@@ -1,5 +1,11 @@
 use pyo3::prelude::*;
 
+pub mod coords;
+pub mod mesh;
+pub mod message;
+pub mod pe;
+pub mod profiling;
+
 /// Returns the version of the mesh runtime.
 #[pyfunction]
 fn runtime_version() -> &'static str {
