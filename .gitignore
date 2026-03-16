@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.so
+*.dylib
+
+# Rust
+/target/
+
+# Virtual environment
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Artifacts (keep directory, ignore contents)
+artifacts/compiled/*
+artifacts/traces/*
+!artifacts/**/.gitkeep
+
+# OS
+.DS_Store

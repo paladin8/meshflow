@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE_PATH=$(cat | jq -r '.tool_input.file_path // empty'); if [[ \"$FILE_PATH\" == *.py ]]; then uv run ruff format \"$FILE_PATH\" 2>/dev/null; fi",
+            "statusMessage": "Formatting Python file"
+          },
+          {
+            "type": "command",
+            "command": "FILE_PATH=$(cat | jq -r '.tool_input.file_path // empty'); if [[ \"$FILE_PATH\" == *.rs ]]; then . \"$HOME/.cargo/env\" && uv run maturin develop 2>/dev/null; fi",
+            "timeout": 30,
+            "statusMessage": "Rebuilding Rust extension"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,44 @@
+[project]
+name = "meshflow"
+version = "0.1.0"
+description = "Cerebras-inspired spatial inference engine"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "pydantic>=2.8",
+  "numpy>=2.0",
+  "orjson>=3.10",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "maturin>=1.7",
+]
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "meshflow._mesh_runtime"
+python-source = "python"
+manifest-path = "crates/mesh_runtime/Cargo.toml"
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+mypy_path = "python"
+
+[[tool.mypy.overrides]]
+module = "meshflow._mesh_runtime"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
