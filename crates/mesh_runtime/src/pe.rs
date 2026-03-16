@@ -45,9 +45,7 @@ pub enum TaskKind {
         hops: Vec<crate::coords::Direction>,
     },
     /// Consume payload from input_slot and mark it as simulation output.
-    CollectOutput {
-        input_slot: SlotId,
-    },
+    CollectOutput { input_slot: SlotId },
 }
 
 impl PE {

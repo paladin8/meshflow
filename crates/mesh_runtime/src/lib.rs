@@ -1,10 +1,12 @@
 use pyo3::prelude::*;
 
 pub mod coords;
+pub mod event;
 pub mod mesh;
 pub mod message;
 pub mod pe;
 pub mod profiling;
+pub mod route;
 
 /// Returns the version of the mesh runtime.
 #[pyfunction]
