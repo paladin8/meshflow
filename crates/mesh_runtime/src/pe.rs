@@ -36,11 +36,10 @@ pub struct TaskConfig {
 /// The kind of task and its parameters.
 #[derive(Debug, Clone)]
 pub enum TaskKind {
-    /// Copy payload from input_slot to output_slot, then emit a message
-    /// to route_dest using the pre-computed hop list.
+    /// Read payload from input_slot and emit a message to route_dest
+    /// using the pre-computed hop list.
     ForwardActivation {
         input_slot: SlotId,
-        output_slot: SlotId,
         route_dest: Coord,
         hops: Vec<crate::coords::Direction>,
     },
@@ -174,7 +173,6 @@ mod tests {
         pe.tasks.push(TaskConfig {
             kind: TaskKind::ForwardActivation {
                 input_slot: 0,
-                output_slot: 1,
                 route_dest: Coord::new(1, 0),
                 hops: vec![Direction::East],
             },

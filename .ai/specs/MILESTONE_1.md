@@ -128,7 +128,6 @@ Constructed with `Mesh::new(width, height)`. All access goes through accessor me
 enum TaskKind {
     ForwardActivation {
         input_slot: SlotId,
-        output_slot: SlotId,
         route_dest: Coord,
         hops: Vec<Direction>,  // pre-computed at setup time, not during execution
     },
@@ -143,7 +142,7 @@ struct TaskConfig {
 }
 ```
 
-- `ForwardActivation`: reads `input_slot`, writes to `output_slot`, emits a message to `route_dest` along the pre-computed `hops` list. The hop list is generated once at task configuration time (see section 4.1.1), not during event processing.
+- `ForwardActivation`: reads `input_slot` and emits a message to `route_dest` along the pre-computed `hops` list. The hop list is generated once at task configuration time (see section 4.1.1), not during event processing. No local output slot is written in M1 — the data goes directly into the outbound message.
 - `CollectOutput`: reads `input_slot`, stores it as a simulation output. No outbound message.
 
 A task fires when its `trigger_slot` is written by an incoming message.
@@ -316,9 +315,8 @@ while let Some(event) = queue.pop():
             pe = mesh.pe_mut(event.coord)
             task = &pe.tasks[task_index]
             match task.kind:
-                ForwardActivation { input_slot, output_slot, route_dest, hops }:
+                ForwardActivation { input_slot, route_dest, hops }:
                     data = pe.read_slot(input_slot).clone()
-                    pe.write_slot(output_slot, data.clone())
                     // build outbound message with pre-computed hop list
                     new_message = Message {
                         payload: data,
@@ -383,7 +381,7 @@ cfg.max_events = 100_000
 inp = SimInput()
 inp.add_message(source=(0, 0), dest=(3, 2), payload=[1.0, 2.0, 3.0])
 inp.add_task(coord=(0, 0), kind="forward_activation",
-             trigger_slot=0, output_slot=1, route_dest=(3, 2))
+             trigger_slot=0, route_dest=(3, 2))
 inp.add_task(coord=(3, 2), kind="collect_output", trigger_slot=0)
 ```
 

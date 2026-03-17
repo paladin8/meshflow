@@ -7,6 +7,7 @@ pub mod message;
 pub mod pe;
 pub mod profiling;
 pub mod route;
+pub mod runtime;
 
 /// Returns the version of the mesh runtime.
 #[pyfunction]

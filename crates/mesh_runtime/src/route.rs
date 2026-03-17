@@ -20,12 +20,7 @@ pub fn generate_route_xy(from: Coord, to: Coord) -> Vec<Direction> {
         None
     };
     if let Some(dir) = x_dir {
-        let dx = if to.x > from.x {
-            to.x - from.x
-        } else {
-            from.x - to.x
-        };
-        for _ in 0..dx {
+        for _ in 0..to.x.abs_diff(from.x) {
             hops.push(dir);
         }
     }
@@ -39,12 +34,7 @@ pub fn generate_route_xy(from: Coord, to: Coord) -> Vec<Direction> {
         None
     };
     if let Some(dir) = y_dir {
-        let dy = if to.y > from.y {
-            to.y - from.y
-        } else {
-            from.y - to.y
-        };
-        for _ in 0..dy {
+        for _ in 0..to.y.abs_diff(from.y) {
             hops.push(dir);
         }
     }
