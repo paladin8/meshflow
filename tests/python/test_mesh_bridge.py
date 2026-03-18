@@ -61,8 +61,12 @@ class TestForwardChain:
         cfg = MeshConfig(width=5, height=1)
         inp = SimInput()
 
-        inp.add_task(coord=(0, 0), kind=TaskKind.ForwardActivation, trigger_slot=0, route_dest=(2, 0))
-        inp.add_task(coord=(2, 0), kind=TaskKind.ForwardActivation, trigger_slot=0, route_dest=(4, 0))
+        inp.add_task(
+            coord=(0, 0), kind=TaskKind.ForwardActivation, trigger_slot=0, route_dest=(2, 0)
+        )
+        inp.add_task(
+            coord=(2, 0), kind=TaskKind.ForwardActivation, trigger_slot=0, route_dest=(4, 0)
+        )
         inp.add_task(coord=(4, 0), kind=TaskKind.CollectOutput, trigger_slot=0)
 
         inp.add_message(source=(0, 0), dest=(0, 0), payload=[1.0, 2.0, 3.0])
@@ -148,7 +152,9 @@ class TestValidation:
     def test_out_of_bounds_route_dest(self) -> None:
         cfg = MeshConfig(width=2, height=2)
         inp = SimInput()
-        inp.add_task(coord=(0, 0), kind=TaskKind.ForwardActivation, trigger_slot=0, route_dest=(5, 0))
+        inp.add_task(
+            coord=(0, 0), kind=TaskKind.ForwardActivation, trigger_slot=0, route_dest=(5, 0)
+        )
 
         with pytest.raises(ValueError, match="out of bounds"):
             run_simulation(config=cfg, inputs=inp)
