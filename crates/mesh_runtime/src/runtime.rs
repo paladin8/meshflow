@@ -46,6 +46,7 @@ pub struct InjectTask {
 }
 
 /// Task kind for injection (route hops are computed automatically).
+#[derive(Debug, Clone)]
 pub enum InjectTaskKind {
     ForwardActivation {
         input_slot: SlotId,

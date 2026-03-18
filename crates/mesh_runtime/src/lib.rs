@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+pub mod bridge;
 pub mod coords;
 pub mod event;
 pub mod mesh;
@@ -19,6 +20,7 @@ fn runtime_version() -> &'static str {
 #[pymodule]
 fn _mesh_runtime(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(runtime_version, m)?)?;
+    bridge::register(m)?;
     Ok(())
 }
 

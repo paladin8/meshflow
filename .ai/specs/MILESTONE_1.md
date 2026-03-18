@@ -380,9 +380,9 @@ cfg.max_events = 100_000
 ```python
 inp = SimInput()
 inp.add_message(source=(0, 0), dest=(3, 2), payload=[1.0, 2.0, 3.0])
-inp.add_task(coord=(0, 0), kind="forward_activation",
+inp.add_task(coord=(0, 0), kind=TaskKind.ForwardActivation,
              trigger_slot=0, route_dest=(3, 2))
-inp.add_task(coord=(3, 2), kind="collect_output", trigger_slot=0)
+inp.add_task(coord=(3, 2), kind=TaskKind.CollectOutput, trigger_slot=0)
 ```
 
 **`run_simulation` function:**
@@ -410,7 +410,7 @@ stats.tasks_executed     # int
 - **One call does the whole simulation.** Python builds config + inputs, calls `run_simulation`, gets results. No per-step callbacks across the boundary.
 - **Route generation stays in Rust.** `add_message` takes source/dest coordinates. Rust generates the hop list internally. Python never sees hop lists.
 - **Tuples for coordinates.** Python passes `(x, y)` tuples, Rust converts to `Coord`.
-- **Strings for task kinds.** Python passes `"forward_activation"` or `"collect_output"`, Rust parses to `TaskKind`.
+- **Enum for task kinds.** Python uses `TaskKind.ForwardActivation` or `TaskKind.CollectOutput` — a PyO3-exposed IntEnum. Invalid types are caught by PyO3 at the call boundary.
 - **Errors become Python exceptions.** Invalid inputs (out-of-bounds coordinates, unrecognized task kind strings, empty payloads) raise `ValueError` via PyO3's error conversion. Simulation invariant violations (e.g., missing SRAM slot) raise `RuntimeError`.
 
 ### 5.3 What is not exposed in M1
