@@ -240,14 +240,16 @@ pub fn run_simulation(
             PyRuntimeError::new_err(msg)
         })?;
 
-    // Convert outputs: HashMap<Coord, Vec<f32>> -> dict[tuple[int,int], list[float]]
+    sim_result_to_py(py, result)
+}
+
+fn sim_result_to_py(py: Python<'_>, result: crate::runtime::SimResult) -> PyResult<SimResult> {
     let outputs_dict = pyo3::types::PyDict::new(py);
     for (coord, data) in &result.outputs {
         let key = (coord.x, coord.y);
         outputs_dict.set_item(key, data.to_vec())?;
     }
 
-    // Convert per-PE stats: HashMap<Coord, PeCounters> -> dict[tuple[int,int], PeStats]
     let pe_stats_dict = pyo3::types::PyDict::new(py);
     for (coord, counters) in &result.profile.per_pe {
         let key = (coord.x, coord.y);
@@ -282,6 +284,24 @@ fn validate_coord(coord: Coord, width: u32, height: u32, label: &str) -> PyResul
     }
 }
 
+/// Run a compiled program artifact with input payloads.
+#[pyfunction]
+#[pyo3(signature = (program_bytes, inputs))]
+pub fn run_program(
+    py: Python<'_>,
+    program_bytes: &[u8],
+    inputs: std::collections::HashMap<String, Vec<f32>>,
+) -> PyResult<SimResult> {
+    let loaded = crate::program::load_program(program_bytes)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let result = loaded
+        .run_with_inputs(inputs)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    sim_result_to_py(py, result)
+}
+
 /// Register bridge types and functions on the PyO3 module.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TaskKind>()?;
@@ -290,5 +310,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PeStats>()?;
     m.add_class::<SimResult>()?;
     m.add_function(pyo3::wrap_pyfunction!(run_simulation, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(run_program, m)?)?;
     Ok(())
 }

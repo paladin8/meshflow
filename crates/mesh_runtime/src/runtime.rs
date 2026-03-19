@@ -111,6 +111,18 @@ impl Simulator {
         });
     }
 
+    /// Configure a task on a PE directly from a pre-built TaskConfig.
+    /// Used by artifact loading where hops are already in the artifact.
+    pub fn add_task_direct(&mut self, coord: Coord, task: TaskConfig) {
+        self.mesh.pe_mut(coord).tasks.push(task);
+    }
+
+    /// Write data to a PE's SRAM slot. Used for pre-loading weights
+    /// from a compiled artifact.
+    pub fn write_sram(&mut self, coord: Coord, slot: SlotId, data: Vec<f32>) {
+        self.mesh.pe_mut(coord).write_slot(slot, data);
+    }
+
     /// Inject a message into the simulation. Generates the hop list and
     /// enqueues the initial DeliverMessage event at timestamp 0.
     pub fn inject_message(&mut self, msg: InjectMessage) {

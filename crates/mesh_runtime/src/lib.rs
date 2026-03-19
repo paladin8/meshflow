@@ -7,8 +7,12 @@ pub mod mesh;
 pub mod message;
 pub mod pe;
 pub mod profiling;
+pub mod program;
 pub mod route;
 pub mod runtime;
+
+#[cfg(test)]
+pub mod compiler_test_helpers;
 
 /// Returns the version of the mesh runtime.
 #[pyfunction]
