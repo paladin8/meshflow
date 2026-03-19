@@ -221,6 +221,7 @@ When working in this repo:
 Do not make broad speculative refactors.
 Do not silently change repo structure unless necessary.
 Do not add new top-level dependencies without a reason.
+Always ask before committing — never commit without explicit approval.
 
 When implementing features, preserve the project direction:
 
