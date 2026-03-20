@@ -1,9 +1,11 @@
 """End-to-end tests: compile graph -> serialize -> load in Rust -> run -> verify."""
 
 import pytest
-from meshflow.compiler import compile
+import torch
+from meshflow.compiler import compile, CompilerConfig
 from meshflow.compiler.artifact import serialize
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
+from meshflow.models.reference import reference_linear
 from meshflow._mesh_runtime import (
     MeshConfig,
     SimInput,
@@ -148,3 +150,98 @@ class TestErrorHandling:
     def test_malformed_artifact(self) -> None:
         with pytest.raises(ValueError, match="deserialize"):
             run_program(b"not valid msgpack", inputs={})
+
+
+class TestLinearEndToEnd:
+    def test_linear_matches_torch(self) -> None:
+        """Compile a tiled linear layer and verify against torch reference."""
+        torch.manual_seed(42)
+        in_f, out_f = 4, 6
+
+        W = torch.randn(out_f, in_f)
+        b = torch.randn(out_f)
+        x = torch.randn(in_f)
+
+        # Compile and run on simulator
+        graph = GraphIR(
+            nodes=[
+                Node(
+                    id="linear1",
+                    op=OpType.LINEAR,
+                    attrs={"in_features": in_f, "out_features": out_f},
+                )
+            ],
+            edges=[],
+        )
+        config = CompilerConfig(mesh_width=4)  # 3 tiles + 1 collect
+        program = compile(
+            graph, config, weights={"linear1": {"weight": W.numpy(), "bias": b.numpy()}}
+        )
+        artifact_bytes = serialize(program)
+        result = run_program(artifact_bytes, inputs={"linear1": x.tolist()})
+
+        # Compare against torch reference
+        expected = reference_linear(x, W, b)
+        actual = torch.tensor(result.outputs[(3, 0)])
+        assert torch.allclose(actual, expected, atol=1e-6)
+
+    def test_linear_single_tile(self) -> None:
+        """Degenerate case: one tile PE does the full computation."""
+        torch.manual_seed(99)
+        in_f, out_f = 3, 2
+
+        W = torch.randn(out_f, in_f)
+        b = torch.randn(out_f)
+        x = torch.randn(in_f)
+
+        graph = GraphIR(
+            nodes=[
+                Node(
+                    id="lin",
+                    op=OpType.LINEAR,
+                    attrs={"in_features": in_f, "out_features": out_f},
+                )
+            ],
+            edges=[],
+        )
+        config = CompilerConfig(mesh_width=2)  # 1 tile + 1 collect
+        program = compile(graph, config, weights={"lin": {"weight": W.numpy(), "bias": b.numpy()}})
+        artifact_bytes = serialize(program)
+        result = run_program(artifact_bytes, inputs={"lin": x.tolist()})
+
+        expected = reference_linear(x, W, b)
+        actual = torch.tensor(result.outputs[(1, 0)])
+        assert torch.allclose(actual, expected, atol=1e-6)
+
+    def test_linear_profiling(self) -> None:
+        """Verify profiling counters for a linear layer execution."""
+        torch.manual_seed(42)
+        in_f, out_f = 4, 6
+
+        W = torch.randn(out_f, in_f)
+        b = torch.randn(out_f)
+        x = torch.randn(in_f)
+
+        graph = GraphIR(
+            nodes=[
+                Node(
+                    id="linear1",
+                    op=OpType.LINEAR,
+                    attrs={"in_features": in_f, "out_features": out_f},
+                )
+            ],
+            edges=[],
+        )
+        config = CompilerConfig(mesh_width=4)
+        program = compile(
+            graph, config, weights={"linear1": {"weight": W.numpy(), "bias": b.numpy()}}
+        )
+        artifact_bytes = serialize(program)
+        result = run_program(artifact_bytes, inputs={"linear1": x.tolist()})
+
+        # 3 broadcast input messages + 3 fragment messages from tile PEs
+        assert result.total_messages == 6
+        # 3 linear tasks + 3 concat_collect tasks
+        assert result.total_tasks_executed == 6
+        # Fragment hops: tile 0 -> collect = 3 east, tile 1 -> 2 east, tile 2 -> 1 east = 6
+        assert result.total_hops == 6
