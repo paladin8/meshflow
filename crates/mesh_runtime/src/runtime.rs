@@ -277,6 +277,101 @@ impl Simulator {
 
                 self.outputs.insert(coord, data);
             }
+            TaskKind::Linear {
+                input_slot,
+                weight_slot,
+                bias_slot,
+                tile_rows,
+                tile_cols,
+                route_dest,
+                hops,
+                fragment_slot,
+            } => {
+                let pe = self.mesh.pe_mut(coord);
+                let x = pe.read_slot(input_slot).clone();
+                let w = pe.read_slot(weight_slot).clone();
+                let b = pe.read_slot(bias_slot).clone();
+                pe.counters.tasks_executed += 1;
+                pe.counters.messages_sent += 1;
+                self.profile.total_tasks_executed += 1;
+
+                // Compute y = W @ x + b
+                let rows = tile_rows as usize;
+                let cols = tile_cols as usize;
+                let mut y = Vec::with_capacity(rows);
+                for i in 0..rows {
+                    let mut sum = b[i];
+                    for j in 0..cols {
+                        sum += w[i * cols + j] * x[j];
+                    }
+                    y.push(sum);
+                }
+
+                let message = Message {
+                    id: self.next_message_id,
+                    source: coord,
+                    dest: route_dest,
+                    hops,
+                    current_hop: 0,
+                    payload: y,
+                    payload_slot: fragment_slot,
+                    timestamp,
+                };
+                self.next_message_id += 1;
+
+                self.queue
+                    .push(timestamp, coord, EventKind::DeliverMessage { message });
+            }
+            TaskKind::ConcatCollect {
+                num_fragments,
+                rows_per_fragment,
+            } => {
+                // trigger_slot is the fragment index (0, 1, ..., N-1)
+                let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
+                let pe = self.mesh.pe_mut(coord);
+                let fragment = pe.read_slot(trigger_slot).clone();
+                pe.counters.tasks_executed += 1;
+                self.profile.total_tasks_executed += 1;
+
+                let total_size = (num_fragments * rows_per_fragment) as usize;
+                let rpf = rows_per_fragment as usize;
+                let frag_idx = trigger_slot as usize;
+
+                // Use a reserved SRAM slot for the accumulator buffer.
+                // Slot u32::MAX is the accumulator, slot (u32::MAX - 1) is the counter.
+                let accum_slot: SlotId = u32::MAX;
+                let counter_slot: SlotId = u32::MAX - 1;
+
+                // Initialize accumulator on first fragment
+                if !pe.has_slot(accum_slot) {
+                    pe.write_slot(accum_slot, vec![0.0; total_size]);
+                    pe.write_slot(counter_slot, vec![0.0]); // counter = 0
+                }
+
+                // Write fragment into accumulator at correct offset, then
+                // remove the fragment slot to keep SRAM usage at O(1).
+                {
+                    let mut buf = pe.read_slot(accum_slot).clone();
+                    let offset = frag_idx * rpf;
+                    buf[offset..offset + rpf].copy_from_slice(&fragment);
+                    pe.write_slot(accum_slot, buf);
+                    pe.remove_slot(trigger_slot);
+                }
+
+                // Increment counter
+                let count = {
+                    let c = pe.read_slot(counter_slot)[0] as u32 + 1;
+                    pe.write_slot(counter_slot, vec![c as f32]);
+                    c
+                };
+
+                // All fragments collected — emit output
+                if count == num_fragments {
+                    let result = pe.remove_slot(accum_slot).unwrap();
+                    pe.remove_slot(counter_slot);
+                    self.outputs.insert(coord, result);
+                }
+            }
         }
     }
 }

@@ -45,6 +45,25 @@ pub enum TaskKind {
     },
     /// Consume payload from input_slot and mark it as simulation output.
     CollectOutput { input_slot: SlotId },
+    /// Compute y = W @ x + b using weight/bias from SRAM, route output
+    /// fragment to the collect PE.
+    Linear {
+        input_slot: SlotId,
+        weight_slot: SlotId,
+        bias_slot: SlotId,
+        tile_rows: u32,
+        tile_cols: u32,
+        route_dest: Coord,
+        hops: Vec<crate::coords::Direction>,
+        fragment_slot: SlotId,
+    },
+    /// Accumulate output fragments into a pre-allocated buffer.
+    /// Each trigger writes fragment data at offset trigger_slot * rows_per_fragment.
+    /// When all fragments have arrived, stores the completed buffer as output.
+    ConcatCollect {
+        num_fragments: u32,
+        rows_per_fragment: u32,
+    },
 }
 
 impl PE {

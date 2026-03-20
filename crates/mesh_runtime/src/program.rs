@@ -49,6 +49,24 @@ enum TaskProgram {
     },
     #[serde(rename = "collect_output")]
     CollectOutput { trigger_slot: u32, input_slot: u32 },
+    #[serde(rename = "linear")]
+    Linear {
+        trigger_slot: u32,
+        input_slot: u32,
+        weight_slot: u32,
+        bias_slot: u32,
+        tile_rows: u32,
+        tile_cols: u32,
+        route_dest: (u32, u32),
+        route_hops: Vec<String>,
+        fragment_slot: u32,
+    },
+    #[serde(rename = "concat_collect")]
+    ConcatCollect {
+        trigger_slot: u32,
+        num_fragments: u32,
+        rows_per_fragment: u32,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,8 +90,6 @@ pub enum ProgramError {
     InvalidDirection(String),
     #[error("coordinate ({0}, {1}) out of bounds for {2}x{3} mesh")]
     OutOfBounds(u32, u32, u32, u32),
-    #[error("duplicate input slot name: {0:?}")]
-    DuplicateInputSlot(String),
     #[error("unknown input slot name: {0:?}")]
     UnknownInputSlot(String),
     #[error("simulation failed: {0}")]
@@ -89,7 +105,7 @@ pub enum ProgramError {
 pub struct LoadedProgram {
     config: SimConfig,
     pe_configs: Vec<PEConfig>,
-    input_slots: HashMap<String, InputSlotInfo>,
+    input_slots: HashMap<String, Vec<InputSlotInfo>>,
 }
 
 #[derive(Debug)]
@@ -149,21 +165,18 @@ pub fn load_program(bytes: &[u8]) -> Result<LoadedProgram, ProgramError> {
         });
     }
 
-    // Convert input slots
-    let mut input_slots = HashMap::new();
+    // Convert input slots — group by name for broadcast support
+    let mut input_slots: HashMap<String, Vec<InputSlotInfo>> = HashMap::new();
     for slot in &program.input_slots {
         let coord = Coord::new(slot.coord.0, slot.coord.1);
         validate_coord(coord, width, height)?;
-        if input_slots.contains_key(&slot.name) {
-            return Err(ProgramError::DuplicateInputSlot(slot.name.clone()));
-        }
-        input_slots.insert(
-            slot.name.clone(),
-            InputSlotInfo {
+        input_slots
+            .entry(slot.name.clone())
+            .or_default()
+            .push(InputSlotInfo {
                 coord,
                 payload_slot: slot.payload_slot,
-            },
-        );
+            });
     }
 
     Ok(LoadedProgram {
@@ -195,19 +208,21 @@ impl LoadedProgram {
             }
         }
 
-        // Inject input messages
+        // Inject input messages — broadcast to all matching entries
         for (name, payload) in inputs {
-            let slot_info = self
+            let slot_infos = self
                 .input_slots
                 .get(&name)
                 .ok_or_else(|| ProgramError::UnknownInputSlot(name.clone()))?;
 
-            sim.inject_message(InjectMessage {
-                source: slot_info.coord,
-                dest: slot_info.coord,
-                payload,
-                payload_slot: slot_info.payload_slot,
-            });
+            for slot_info in slot_infos {
+                sim.inject_message(InjectMessage {
+                    source: slot_info.coord,
+                    dest: slot_info.coord,
+                    payload: payload.clone(),
+                    payload_slot: slot_info.payload_slot,
+                });
+            }
         }
 
         // Run — catch panics
@@ -281,13 +296,55 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             },
             trigger_slot: *trigger_slot,
         }),
+        TaskProgram::Linear {
+            trigger_slot,
+            input_slot,
+            weight_slot,
+            bias_slot,
+            tile_rows,
+            tile_cols,
+            route_dest,
+            route_hops,
+            fragment_slot,
+        } => {
+            let dest = Coord::new(route_dest.0, route_dest.1);
+            validate_coord(dest, width, height)?;
+            let hops: Vec<Direction> = route_hops
+                .iter()
+                .map(|s| parse_direction(s))
+                .collect::<Result<_, _>>()?;
+            Ok(TaskConfig {
+                kind: TaskKind::Linear {
+                    input_slot: *input_slot,
+                    weight_slot: *weight_slot,
+                    bias_slot: *bias_slot,
+                    tile_rows: *tile_rows,
+                    tile_cols: *tile_cols,
+                    route_dest: dest,
+                    hops,
+                    fragment_slot: *fragment_slot,
+                },
+                trigger_slot: *trigger_slot,
+            })
+        }
+        TaskProgram::ConcatCollect {
+            trigger_slot,
+            num_fragments,
+            rows_per_fragment,
+        } => Ok(TaskConfig {
+            kind: TaskKind::ConcatCollect {
+                num_fragments: *num_fragments,
+                rows_per_fragment: *rows_per_fragment,
+            },
+            trigger_slot: *trigger_slot,
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler_test_helpers::make_chain_artifact;
+    use crate::compiler_test_helpers::{make_chain_artifact, make_linear_artifact};
 
     #[test]
     fn load_valid_artifact() {
@@ -298,6 +355,7 @@ mod tests {
         assert_eq!(program.pe_configs.len(), 3);
         assert_eq!(program.input_slots.len(), 1);
         assert!(program.input_slots.contains_key("a"));
+        assert_eq!(program.input_slots.get("a").unwrap().len(), 1);
     }
 
     #[test]
@@ -387,8 +445,9 @@ mod tests {
     }
 
     #[test]
-    fn reject_duplicate_input_slot() {
-        let program = rmp_serde::to_vec_named(&serde_json::json!({
+    fn broadcast_input_slots_grouped() {
+        // Duplicate names are valid — they represent broadcast targets
+        let bytes = rmp_serde::to_vec_named(&serde_json::json!({
             "version": 1,
             "mesh_config": {"width": 2, "height": 1, "hop_latency": 1, "task_base_latency": 1, "max_events": 100},
             "pe_programs": [],
@@ -398,8 +457,8 @@ mod tests {
             ]
         }))
         .unwrap();
-        let err = load_program(&program).unwrap_err();
-        assert!(matches!(err, ProgramError::DuplicateInputSlot(_)));
+        let program = load_program(&bytes).unwrap();
+        assert_eq!(program.input_slots.get("a").unwrap().len(), 2);
     }
 
     #[test]
@@ -410,5 +469,63 @@ mod tests {
         inputs.insert("nonexistent".to_string(), vec![1.0]);
         let err = program.run_with_inputs(inputs).unwrap_err();
         assert!(matches!(err, ProgramError::UnknownInputSlot(_)));
+    }
+
+    #[test]
+    fn load_linear_artifact() {
+        // 2x2 weight matrix, 2 tiles of 1 row each
+        let weights = vec![1.0, 2.0, 3.0, 4.0]; // [[1,2],[3,4]]
+        let bias = vec![0.5, 0.5];
+        let bytes = make_linear_artifact(2, 2, 2, &weights, &bias);
+        let program = load_program(&bytes).unwrap();
+
+        assert_eq!(program.config.width, 3); // 2 tiles + 1 collect
+        assert_eq!(program.pe_configs.len(), 3);
+        // Broadcast input "x" to 2 tile PEs
+        assert_eq!(program.input_slots.get("x").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn linear_compute_correctness() {
+        // W = [[1, 2], [3, 4]], b = [0.5, 0.5], x = [1, 1]
+        // y = W @ x + b = [1*1+2*1+0.5, 3*1+4*1+0.5] = [3.5, 7.5]
+        let weights = vec![1.0, 2.0, 3.0, 4.0];
+        let bias = vec![0.5, 0.5];
+        let bytes = make_linear_artifact(2, 2, 2, &weights, &bias);
+        let program = load_program(&bytes).unwrap();
+
+        let mut inputs = HashMap::new();
+        inputs.insert("x".to_string(), vec![1.0, 1.0]);
+        let result = program.run_with_inputs(inputs).unwrap();
+
+        let output = result.outputs.get(&Coord::new(2, 0)).unwrap();
+        assert_eq!(output.len(), 2);
+        assert!((output[0] - 3.5).abs() < 1e-6);
+        assert!((output[1] - 7.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn linear_compute_larger() {
+        // W = [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1],[1,1,0,0],[0,0,1,1]]
+        // 6x4 identity-like, b = [0;6], x = [1,2,3,4]
+        // y = [1,2,3,4,3,7]
+        let weights = vec![
+            1.0, 0.0, 0.0, 0.0, // row 0
+            0.0, 1.0, 0.0, 0.0, // row 1
+            0.0, 0.0, 1.0, 0.0, // row 2
+            0.0, 0.0, 0.0, 1.0, // row 3
+            1.0, 1.0, 0.0, 0.0, // row 4
+            0.0, 0.0, 1.0, 1.0, // row 5
+        ];
+        let bias = vec![0.0; 6];
+        let bytes = make_linear_artifact(4, 6, 3, &weights, &bias);
+        let program = load_program(&bytes).unwrap();
+
+        let mut inputs = HashMap::new();
+        inputs.insert("x".to_string(), vec![1.0, 2.0, 3.0, 4.0]);
+        let result = program.run_with_inputs(inputs).unwrap();
+
+        let output = result.outputs.get(&Coord::new(3, 0)).unwrap();
+        assert_eq!(output, &vec![1.0, 2.0, 3.0, 4.0, 3.0, 7.0]);
     }
 }
