@@ -83,6 +83,34 @@ class TestValidation:
         with pytest.raises(ValueError, match="cycle"):
             graph.validate()
 
+    def test_linear_valid(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="l", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 6})],
+            edges=[],
+        )
+        graph.validate()  # should not raise
+
+    def test_linear_missing_attrs(self) -> None:
+        graph = GraphIR(nodes=[Node(id="l", op=OpType.LINEAR)], edges=[])
+        with pytest.raises(ValueError, match="requires attrs"):
+            graph.validate()
+
+    def test_linear_missing_in_features(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="l", op=OpType.LINEAR, attrs={"out_features": 6})],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="missing required attr.*in_features"):
+            graph.validate()
+
+    def test_linear_non_positive_attr(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="l", op=OpType.LINEAR, attrs={"in_features": 0, "out_features": 6})],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="must be a positive integer"):
+            graph.validate()
+
 
 class TestInputNodes:
     def test_single_input(self) -> None:

@@ -37,14 +37,36 @@ class CollectOutputTask:
     input_slot: int = 0
 
 
-TaskProgram = ForwardActivationTask | CollectOutputTask
+@dataclass
+class LinearTask:
+    kind: str = field(default="linear", init=False)
+    trigger_slot: int = 0
+    input_slot: int = 0
+    weight_slot: int = 1
+    bias_slot: int = 2
+    tile_rows: int = 0
+    tile_cols: int = 0
+    route_dest: tuple[int, int] = (0, 0)
+    route_hops: list[str] = field(default_factory=list)
+    fragment_slot: int = 0
+
+
+@dataclass
+class ConcatCollectTask:
+    kind: str = field(default="concat_collect", init=False)
+    trigger_slot: int = 0
+    num_fragments: int = 0
+    rows_per_fragment: int = 0
+
+
+TaskProgram = ForwardActivationTask | CollectOutputTask | LinearTask | ConcatCollectTask
 """Union of all task types that can appear in a PEProgram."""
 
 
 @dataclass
 class PEProgram:
     coord: tuple[int, int]
-    tasks: list[ForwardActivationTask | CollectOutputTask]
+    tasks: list[TaskProgram]
     initial_sram: dict[int, list[float]] = field(default_factory=dict)
 
 
@@ -109,7 +131,7 @@ def _program_to_dict(program: RuntimeProgram) -> dict[str, Any]:
     }
 
 
-def _task_to_dict(task: ForwardActivationTask | CollectOutputTask) -> dict[str, Any]:
+def _task_to_dict(task: TaskProgram) -> dict[str, Any]:
     """Convert a per-kind task dataclass to a flat dict."""
     d = asdict(task)
     # Convert tuples to lists for msgpack
@@ -118,7 +140,7 @@ def _task_to_dict(task: ForwardActivationTask | CollectOutputTask) -> dict[str, 
     return d
 
 
-def _dict_to_task(d: dict[str, Any]) -> ForwardActivationTask | CollectOutputTask:
+def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
     """Dispatch on `kind` and construct the right task dataclass."""
     kind = d["kind"]
     fields = {k: v for k, v in d.items() if k != "kind"}
@@ -128,6 +150,12 @@ def _dict_to_task(d: dict[str, Any]) -> ForwardActivationTask | CollectOutputTas
         return ForwardActivationTask(**fields)
     if kind == "collect_output":
         return CollectOutputTask(**fields)
+    if kind == "linear":
+        if fields.get("route_dest") is not None:
+            fields["route_dest"] = tuple(fields["route_dest"])
+        return LinearTask(**fields)
+    if kind == "concat_collect":
+        return ConcatCollectTask(**fields)
     raise ValueError(f"unknown task kind: {kind!r}")
 
 

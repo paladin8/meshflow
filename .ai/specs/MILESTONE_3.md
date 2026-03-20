@@ -41,11 +41,9 @@ For a linear layer with `out_features=6, in_features=4, num_tiles=3`:
 
 Each tile PE routes its output fragment to the collect PE, but each sends to a **distinct payload slot** based on tile index: tile 0 sends to slot 0, tile 1 to slot 1, tile 2 to slot 2. This avoids SRAM overwrites on the collect PE.
 
-The collect PE uses a new `ConcatCollect` task kind (not the existing `CollectOutput`). It is configured with `num_fragments`. The compiler registers N `ConcatCollect` `TaskConfig` entries on the collect PE — one per fragment slot (`trigger_slot=0`, `trigger_slot=1`, ..., `trigger_slot=N-1`). This works with the existing trigger model where `triggered_tasks()` matches `trigger_slot == written_slot`.
+The collect PE uses a new `ConcatCollect` task kind (not the existing `CollectOutput`). It is configured with `num_fragments` and `rows_per_fragment`. The compiler registers N `ConcatCollect` `TaskConfig` entries on the collect PE — one per fragment slot (`trigger_slot=0`, `trigger_slot=1`, ..., `trigger_slot=N-1`). This works with the existing trigger model where `triggered_tasks()` matches `trigger_slot == written_slot`.
 
-Each fragment delivery triggers one `ConcatCollect` task instance. The task checks whether all slots `0..num_fragments` are populated in SRAM. If not, it does nothing. Once all fragments are present, it reads them in order, concatenates into a single vector, and stores in `outputs`.
-
-This means N task executions total, but only the last one (when all fragments have arrived) produces output. The N-1 earlier executions are cheap no-ops.
+**Accumulator model:** Instead of storing each fragment in a separate SRAM slot (which would require unbounded slots), the collect PE uses a single pre-allocated output buffer of size `num_fragments * rows_per_fragment`. Each fragment delivery triggers a `ConcatCollect` task that writes the fragment data into the buffer at offset `trigger_slot * rows_per_fragment`. A counter tracks arrivals; once counter == `num_fragments`, the completed buffer moves to `outputs`. This uses O(1) SRAM slots regardless of tile count, which is realistic for limited-SRAM hardware.
 
 ---
 
@@ -175,6 +173,7 @@ class ConcatCollectTask:
     kind: str = field(default="concat_collect", init=False)
     trigger_slot: int       # one per fragment slot; compiler generates N of these
     num_fragments: int      # total expected fragments
+    rows_per_fragment: int  # size of each fragment (for offset calculation)
 ```
 
 `PEProgram.tasks` becomes `list[ForwardActivationTask | CollectOutputTask | LinearTask | ConcatCollectTask]`.
@@ -215,6 +214,7 @@ pub enum TaskKind {
     },
     ConcatCollect {                   // new
         num_fragments: u32,
+        rows_per_fragment: u32,
     },
 }
 ```
@@ -235,9 +235,10 @@ Pure nested loops, no external math libraries. `tile_rows` / `tile_cols` are the
 
 **`ConcatCollect` arm:**
 
-1. Checks whether all fragment slots `0..num_fragments` are populated in SRAM.
-2. If not all present yet, does nothing (returns without producing output).
-3. Once all present, reads slots 0 through `num_fragments - 1` in order, concatenates them into a single `Vec<f32>`, and stores the result in `self.outputs` keyed by the PE's coordinate (same convention as `CollectOutput`).
+1. Reads the incoming fragment from the trigger slot.
+2. If the accumulator buffer doesn't exist yet, allocates `vec![0.0; num_fragments * rows_per_fragment]` in a designated SRAM slot.
+3. Writes the fragment into the buffer at offset `trigger_slot * rows_per_fragment`.
+4. Increments an arrival counter. When counter == `num_fragments`, moves the completed buffer to `self.outputs` keyed by the PE's coordinate (same convention as `CollectOutput`).
 
 ### 4.3 Artifact deserialization
 
@@ -275,6 +276,7 @@ enum TaskProgram {
     ConcatCollect {
         trigger_slot: u32,
         num_fragments: u32,
+        rows_per_fragment: u32,
     },
 }
 ```

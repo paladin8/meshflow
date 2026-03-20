@@ -2,34 +2,58 @@
 
 from meshflow.compiler.artifact import (
     CollectOutputTask,
+    ConcatCollectTask,
     ForwardActivationTask,
     InputSlotProgram,
+    LinearTask,
     MeshProgramConfig,
     PEProgram,
     RuntimeProgram,
+    TaskProgram,
 )
-from meshflow.compiler.schedule_ir import ScheduleIR, TaskEntry
+from meshflow.compiler.schedule_ir import (
+    CollectOutputEntry,
+    ConcatCollectEntry,
+    ForwardActivationEntry,
+    LinearEntry,
+    TaskEntry,
+)
+from meshflow.compiler.schedule_ir import ScheduleIR
 
 
-def _lower_task(
-    task: TaskEntry,
-) -> ForwardActivationTask | CollectOutputTask:
-    """Convert a ScheduleIR TaskEntry to the corresponding artifact task."""
-    if task.kind == "forward_activation":
-        assert task.route_dest is not None
-        assert task.route_hops is not None
+def _lower_task(task: TaskEntry) -> TaskProgram:
+    """Convert a ScheduleIR task entry to the corresponding artifact task."""
+    if isinstance(task, ForwardActivationEntry):
         return ForwardActivationTask(
             trigger_slot=task.trigger_slot,
             input_slot=task.input_slot,
             route_dest=task.route_dest,
             route_hops=[d.value for d in task.route_hops],
         )
-    if task.kind == "collect_output":
+    if isinstance(task, CollectOutputEntry):
         return CollectOutputTask(
             trigger_slot=task.trigger_slot,
             input_slot=task.input_slot,
         )
-    raise ValueError(f"unknown task kind: {task.kind!r}")
+    if isinstance(task, LinearEntry):
+        return LinearTask(
+            trigger_slot=task.trigger_slot,
+            input_slot=task.input_slot,
+            weight_slot=task.weight_slot,
+            bias_slot=task.bias_slot,
+            tile_rows=task.tile_rows,
+            tile_cols=task.tile_cols,
+            route_dest=task.route_dest,
+            route_hops=[d.value for d in task.route_hops],
+            fragment_slot=task.fragment_slot,
+        )
+    if isinstance(task, ConcatCollectEntry):
+        return ConcatCollectTask(
+            trigger_slot=task.trigger_slot,
+            num_fragments=task.num_fragments,
+            rows_per_fragment=task.rows_per_fragment,
+        )
+    raise ValueError(f"unknown task entry type: {type(task)!r}")
 
 
 def lower(schedule: ScheduleIR) -> RuntimeProgram:
@@ -43,7 +67,7 @@ def lower(schedule: ScheduleIR) -> RuntimeProgram:
         PEProgram(
             coord=pe.coord,
             tasks=[_lower_task(task) for task in pe.tasks],
-            initial_sram={},
+            initial_sram=pe.initial_sram,
         )
         for pe in schedule.pe_schedules
     ]

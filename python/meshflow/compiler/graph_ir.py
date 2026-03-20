@@ -3,17 +3,20 @@
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 
 class OpType(Enum):
     FORWARD = "forward"
     COLLECT = "collect"
+    LINEAR = "linear"
 
 
 @dataclass
 class Node:
     id: str
     op: OpType
+    attrs: dict[str, Any] | None = None
 
 
 @dataclass
@@ -34,6 +37,22 @@ class GraphIR:
         self._check_duplicate_node_ids()
         self._check_edge_references()
         self._check_acyclic()
+        self._check_linear_attrs()
+
+    def _check_linear_attrs(self) -> None:
+        for node in self.nodes:
+            if node.op == OpType.LINEAR:
+                if node.attrs is None:
+                    raise ValueError(
+                        f"LINEAR node {node.id!r} requires attrs with in_features and out_features"
+                    )
+                for key in ("in_features", "out_features"):
+                    if key not in node.attrs:
+                        raise ValueError(f"LINEAR node {node.id!r} missing required attr: {key!r}")
+                    if not isinstance(node.attrs[key], int) or node.attrs[key] <= 0:
+                        raise ValueError(
+                            f"LINEAR node {node.id!r} attr {key!r} must be a positive integer"
+                        )
 
     def input_node_ids(self) -> list[str]:
         """Return IDs of nodes with no incoming edges (input entry points)."""

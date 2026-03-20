@@ -1,7 +1,9 @@
 """Tests for compiler passes: place, route, lower."""
 
+import numpy as np
 import pytest
 from meshflow.compiler import CompilerConfig, compile
+from meshflow.compiler.artifact import ConcatCollectTask, LinearTask
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
 from meshflow.compiler.passes.place import place
 from meshflow.compiler.passes.route import _generate_route_xy, route
@@ -183,8 +185,8 @@ class TestRouting:
         assert len(b_pe.tasks) == 1
         task = b_pe.tasks[0]
         assert task.kind == "collect_output"
-        assert task.route_dest is None
-        assert task.route_hops is None
+        assert not hasattr(task, "route_dest")
+        assert not hasattr(task, "route_hops")
 
     def test_input_slots_detected(self) -> None:
         graph = GraphIR(
@@ -394,3 +396,282 @@ class TestCompileOrchestrator:
 
         assert program.mesh_config.width == 4
         assert program.mesh_config.height == 4
+
+
+class TestLinearPlacement:
+    def _make_linear_graph(self, in_f: int = 4, out_f: int = 6) -> GraphIR:
+        return GraphIR(
+            nodes=[
+                Node(
+                    id="linear1",
+                    op=OpType.LINEAR,
+                    attrs={"in_features": in_f, "out_features": out_f},
+                )
+            ],
+            edges=[],
+        )
+
+    def test_linear_expands_to_tiles_and_collect(self) -> None:
+        graph = self._make_linear_graph(in_f=4, out_f=6)
+        config = CompilerConfig(mesh_width=4)
+        spatial = place(graph, config)
+
+        # 3 tile PEs + 1 collect = 4 placed nodes
+        assert len(spatial.nodes) == 4
+        assert spatial.width == 4
+        assert spatial.height == 1
+
+        # First 3 are tile PEs
+        for i in range(3):
+            tile = spatial.nodes[i]
+            assert tile.id == f"linear1_tile_{i}"
+            assert tile.op == OpType.LINEAR
+            assert tile.coord == (i, 0)
+            assert tile.attrs is not None
+            assert tile.attrs["tile_index"] == i
+            assert tile.attrs["rows_per_pe"] == 2
+            assert tile.attrs["in_features"] == 4
+            assert tile.attrs["origin_id"] == "linear1"
+
+        # Last is collect PE
+        collect = spatial.nodes[3]
+        assert collect.id == "linear1_collect"
+        assert collect.op == OpType.COLLECT
+        assert collect.coord == (3, 0)
+        assert collect.attrs is not None
+        assert collect.attrs["num_fragments"] == 3
+        assert collect.attrs["rows_per_fragment"] == 2
+
+    def test_linear_generates_internal_edges(self) -> None:
+        graph = self._make_linear_graph(in_f=4, out_f=6)
+        config = CompilerConfig(mesh_width=4)
+        spatial = place(graph, config)
+
+        # 3 edges: tile_0->collect, tile_1->collect, tile_2->collect
+        assert len(spatial.edges) == 3
+        for i, edge in enumerate(spatial.edges):
+            assert edge.src_node == f"linear1_tile_{i}"
+            assert edge.dst_node == "linear1_collect"
+            assert edge.dst_slot == i
+
+    def test_linear_auto_sizing(self) -> None:
+        """Without explicit mesh_width, one PE per output row."""
+        graph = self._make_linear_graph(in_f=2, out_f=3)
+        spatial = place(graph, CompilerConfig())
+
+        # 3 tiles + 1 collect = 4 nodes, width=4
+        assert len(spatial.nodes) == 4
+        assert spatial.width == 4
+
+    def test_linear_validation_missing_attrs(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="bad", op=OpType.LINEAR)],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="requires attrs"):
+            place(graph, CompilerConfig())
+
+    def test_linear_uneven_tiling_rejected(self) -> None:
+        """out_features=7 with 3 tiles doesn't divide evenly."""
+        graph = GraphIR(
+            nodes=[
+                Node(
+                    id="linear1",
+                    op=OpType.LINEAR,
+                    attrs={"in_features": 4, "out_features": 7},
+                )
+            ],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="not evenly divisible"):
+            place(graph, CompilerConfig(mesh_width=4))
+
+
+class TestLinearRouting:
+    def _make_linear_weights(
+        self, in_f: int = 4, out_f: int = 6
+    ) -> dict[str, dict[str, np.ndarray]]:
+        rng = np.random.default_rng(42)
+        return {
+            "linear1": {
+                "weight": rng.standard_normal((out_f, in_f)).astype(np.float32),
+                "bias": rng.standard_normal(out_f).astype(np.float32),
+            }
+        }
+
+    def test_linear_routing_creates_tasks(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(
+                    id="linear1",
+                    op=OpType.LINEAR,
+                    attrs={"in_features": 4, "out_features": 6},
+                )
+            ],
+            edges=[],
+        )
+        config = CompilerConfig(mesh_width=4)
+        weights = self._make_linear_weights()
+
+        spatial = place(graph, config)
+        schedule = route(spatial, config, weights)
+
+        # 4 PEs in schedule
+        assert len(schedule.pe_schedules) == 4
+
+        # Tile PEs have linear tasks
+        for i in range(3):
+            pe = next(p for p in schedule.pe_schedules if p.coord == (i, 0))
+            assert len(pe.tasks) == 1
+            task = pe.tasks[0]
+            assert task.kind == "linear"
+            assert task.weight_slot == 1
+            assert task.bias_slot == 2
+            assert task.tile_rows == 2
+            assert task.tile_cols == 4
+            assert task.fragment_slot == i
+            assert task.route_dest == (3, 0)
+
+        # Collect PE has 3 concat_collect tasks
+        collect_pe = next(p for p in schedule.pe_schedules if p.coord == (3, 0))
+        assert len(collect_pe.tasks) == 3
+        for i, task in enumerate(collect_pe.tasks):
+            assert task.kind == "concat_collect"
+            assert task.trigger_slot == i
+            assert task.num_fragments == 3
+            assert task.rows_per_fragment == 2
+
+    def test_linear_weight_tiling_in_sram(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(
+                    id="linear1",
+                    op=OpType.LINEAR,
+                    attrs={"in_features": 4, "out_features": 6},
+                )
+            ],
+            edges=[],
+        )
+        config = CompilerConfig(mesh_width=4)
+        weights = self._make_linear_weights()
+
+        spatial = place(graph, config)
+        schedule = route(spatial, config, weights)
+
+        W = weights["linear1"]["weight"]
+        b = weights["linear1"]["bias"]
+
+        for i in range(3):
+            pe = next(p for p in schedule.pe_schedules if p.coord == (i, 0))
+            # Weight tile in slot 1
+            expected_w = W[i * 2 : (i + 1) * 2, :].flatten().tolist()
+            assert pe.initial_sram[1] == pytest.approx(expected_w)
+            # Bias tile in slot 2
+            expected_b = b[i * 2 : (i + 1) * 2].flatten().tolist()
+            assert pe.initial_sram[2] == pytest.approx(expected_b)
+
+    def test_linear_broadcast_input_slots(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(
+                    id="linear1",
+                    op=OpType.LINEAR,
+                    attrs={"in_features": 4, "out_features": 6},
+                )
+            ],
+            edges=[],
+        )
+        config = CompilerConfig(mesh_width=4)
+        weights = self._make_linear_weights()
+
+        spatial = place(graph, config)
+        schedule = route(spatial, config, weights)
+
+        # 3 input slots, all named "linear1" (broadcast)
+        assert len(schedule.input_slots) == 3
+        for slot in schedule.input_slots:
+            assert slot.name == "linear1"
+            assert slot.payload_slot == 0
+
+
+class TestLinearCompileOrchestrator:
+    def test_compile_linear(self) -> None:
+        rng = np.random.default_rng(42)
+        W = rng.standard_normal((6, 4)).astype(np.float32)
+        b = rng.standard_normal(6).astype(np.float32)
+
+        graph = GraphIR(
+            nodes=[
+                Node(
+                    id="linear1",
+                    op=OpType.LINEAR,
+                    attrs={"in_features": 4, "out_features": 6},
+                )
+            ],
+            edges=[],
+        )
+        config = CompilerConfig(mesh_width=4)
+        program = compile(graph, config, weights={"linear1": {"weight": W, "bias": b}})
+
+        assert program.version == 1
+        assert program.mesh_config.width == 4
+        assert len(program.pe_programs) == 4
+
+        # Tile PEs have LinearTask
+        for i in range(3):
+            pe = next(p for p in program.pe_programs if p.coord == (i, 0))
+            assert len(pe.tasks) == 1
+            assert isinstance(pe.tasks[0], LinearTask)
+            assert pe.tasks[0].tile_rows == 2
+            assert pe.tasks[0].tile_cols == 4
+            assert pe.tasks[0].fragment_slot == i
+            assert len(pe.initial_sram) == 2  # weight + bias
+
+        # Collect PE has ConcatCollectTask entries
+        collect_pe = next(p for p in program.pe_programs if p.coord == (3, 0))
+        assert len(collect_pe.tasks) == 3
+        for task in collect_pe.tasks:
+            assert isinstance(task, ConcatCollectTask)
+            assert task.num_fragments == 3
+            assert task.rows_per_fragment == 2
+
+        # 3 broadcast input slots
+        assert len(program.input_slots) == 3
+        assert all(s.name == "linear1" for s in program.input_slots)
+
+    def test_compile_linear_missing_weights(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(
+                    id="linear1",
+                    op=OpType.LINEAR,
+                    attrs={"in_features": 4, "out_features": 6},
+                )
+            ],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="requires weights"):
+            compile(graph)
+
+    def test_compile_linear_wrong_weight_shape(self) -> None:
+        rng = np.random.default_rng(42)
+        graph = GraphIR(
+            nodes=[
+                Node(
+                    id="linear1",
+                    op=OpType.LINEAR,
+                    attrs={"in_features": 4, "out_features": 6},
+                )
+            ],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="weight shape"):
+            compile(
+                graph,
+                weights={
+                    "linear1": {
+                        "weight": rng.standard_normal((3, 4)).astype(np.float32),
+                        "bias": rng.standard_normal(6).astype(np.float32),
+                    }
+                },
+            )

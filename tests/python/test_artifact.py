@@ -9,6 +9,8 @@ import pytest
 from meshflow.compiler import compile
 from meshflow.compiler.artifact import (
     CollectOutputTask,
+    ConcatCollectTask,
+    LinearTask,
     MeshProgramConfig,
     PEProgram,
     RuntimeProgram,
@@ -113,6 +115,53 @@ class TestSerializationRoundTrip:
         assert restored.mesh_config.hop_latency == 1
         assert restored.mesh_config.task_base_latency == 1
         assert restored.mesh_config.max_events == 100_000
+
+    def test_round_trip_linear_task(self) -> None:
+        program = RuntimeProgram(
+            version=1,
+            mesh_config=MeshProgramConfig(width=2, height=1),
+            pe_programs=[
+                PEProgram(
+                    coord=(0, 0),
+                    tasks=[
+                        LinearTask(
+                            trigger_slot=0,
+                            input_slot=0,
+                            weight_slot=1,
+                            bias_slot=2,
+                            tile_rows=3,
+                            tile_cols=4,
+                            route_dest=(1, 0),
+                            route_hops=["east"],
+                            fragment_slot=0,
+                        )
+                    ],
+                    initial_sram={1: [1.0, 2.0], 2: [3.0]},
+                ),
+                PEProgram(
+                    coord=(1, 0),
+                    tasks=[
+                        ConcatCollectTask(trigger_slot=0, num_fragments=2, rows_per_fragment=3),
+                    ],
+                    initial_sram={},
+                ),
+            ],
+            input_slots=[],
+        )
+        restored = deserialize(serialize(program))
+
+        task0 = restored.pe_programs[0].tasks[0]
+        assert isinstance(task0, LinearTask)
+        assert task0.tile_rows == 3
+        assert task0.tile_cols == 4
+        assert task0.route_dest == (1, 0)
+        assert task0.fragment_slot == 0
+        assert restored.pe_programs[0].initial_sram == {1: [1.0, 2.0], 2: [3.0]}
+
+        task1 = restored.pe_programs[1].tasks[0]
+        assert isinstance(task1, ConcatCollectTask)
+        assert task1.num_fragments == 2
+        assert task1.rows_per_fragment == 3
 
 
 class TestDeserializeErrors:
