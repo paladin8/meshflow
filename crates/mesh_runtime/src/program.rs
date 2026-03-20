@@ -38,12 +38,17 @@ struct PEProgram {
 }
 
 #[derive(Debug, Deserialize)]
-struct TaskProgram {
-    kind: String,
-    trigger_slot: u32,
-    input_slot: u32,
-    route_dest: Option<(u32, u32)>,
-    route_hops: Option<Vec<String>>,
+#[serde(tag = "kind")]
+enum TaskProgram {
+    #[serde(rename = "forward_activation")]
+    ForwardActivation {
+        trigger_slot: u32,
+        input_slot: u32,
+        route_dest: (u32, u32),
+        route_hops: Vec<String>,
+    },
+    #[serde(rename = "collect_output")]
+    CollectOutput { trigger_slot: u32, input_slot: u32 },
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,16 +68,10 @@ pub enum ProgramError {
     Deserialize(String),
     #[error("unsupported artifact version: {0}")]
     UnsupportedVersion(u32),
-    #[error("invalid task kind: {0:?}")]
-    InvalidTaskKind(String),
     #[error("invalid direction: {0:?}")]
     InvalidDirection(String),
     #[error("coordinate ({0}, {1}) out of bounds for {2}x{3} mesh")]
     OutOfBounds(u32, u32, u32, u32),
-    #[error("forward_activation task requires route_dest")]
-    MissingRouteDest,
-    #[error("forward_activation task requires route_hops")]
-    MissingRouteHops,
     #[error("duplicate input slot name: {0:?}")]
     DuplicateInputSlot(String),
     #[error("unknown input slot name: {0:?}")]
@@ -251,37 +250,38 @@ fn parse_direction(s: &str) -> Result<Direction, ProgramError> {
 }
 
 fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfig, ProgramError> {
-    let kind = match task.kind.as_str() {
-        "forward_activation" => {
-            let (dx, dy) = task.route_dest.ok_or(ProgramError::MissingRouteDest)?;
-            let route_dest = Coord::new(dx, dy);
-            validate_coord(route_dest, width, height)?;
-
-            let hop_strings = task
-                .route_hops
-                .as_ref()
-                .ok_or(ProgramError::MissingRouteHops)?;
-            let hops: Vec<Direction> = hop_strings
+    match task {
+        TaskProgram::ForwardActivation {
+            trigger_slot,
+            input_slot,
+            route_dest,
+            route_hops,
+        } => {
+            let dest = Coord::new(route_dest.0, route_dest.1);
+            validate_coord(dest, width, height)?;
+            let hops: Vec<Direction> = route_hops
                 .iter()
                 .map(|s| parse_direction(s))
                 .collect::<Result<_, _>>()?;
-
-            TaskKind::ForwardActivation {
-                input_slot: task.input_slot,
-                route_dest,
-                hops,
-            }
+            Ok(TaskConfig {
+                kind: TaskKind::ForwardActivation {
+                    input_slot: *input_slot,
+                    route_dest: dest,
+                    hops,
+                },
+                trigger_slot: *trigger_slot,
+            })
         }
-        "collect_output" => TaskKind::CollectOutput {
-            input_slot: task.input_slot,
-        },
-        other => return Err(ProgramError::InvalidTaskKind(other.to_string())),
-    };
-
-    Ok(TaskConfig {
-        kind,
-        trigger_slot: task.trigger_slot,
-    })
+        TaskProgram::CollectOutput {
+            trigger_slot,
+            input_slot,
+        } => Ok(TaskConfig {
+            kind: TaskKind::CollectOutput {
+                input_slot: *input_slot,
+            },
+            trigger_slot: *trigger_slot,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -336,24 +336,25 @@ mod tests {
 
     #[test]
     fn reject_invalid_task_kind() {
+        // With serde tagged enum, unknown kind is a deserialization error
         let program = rmp_serde::to_vec_named(&serde_json::json!({
             "version": 1,
             "mesh_config": {"width": 2, "height": 1, "hop_latency": 1, "task_base_latency": 1, "max_events": 100},
             "pe_programs": [{
                 "coord": [0, 0],
-                "tasks": [{"kind": "bogus", "trigger_slot": 0, "input_slot": 0, "route_dest": null, "route_hops": null}],
+                "tasks": [{"kind": "bogus", "trigger_slot": 0, "input_slot": 0}],
                 "initial_sram": {}
             }],
             "input_slots": []
         }))
         .unwrap();
         let err = load_program(&program).unwrap_err();
-        assert!(matches!(err, ProgramError::InvalidTaskKind(_)));
+        assert!(matches!(err, ProgramError::Deserialize(_)));
     }
 
     #[test]
     fn reject_invalid_direction() {
-        let program = rmp_serde::to_vec_named(&serde_json::json!({
+        let bytes = rmp_serde::to_vec_named(&serde_json::json!({
             "version": 1,
             "mesh_config": {"width": 2, "height": 1, "hop_latency": 1, "task_base_latency": 1, "max_events": 100},
             "pe_programs": [{
@@ -364,7 +365,7 @@ mod tests {
             "input_slots": []
         }))
         .unwrap();
-        let err = load_program(&program).unwrap_err();
+        let err = load_program(&bytes).unwrap_err();
         assert!(matches!(err, ProgramError::InvalidDirection(_)));
     }
 

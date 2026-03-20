@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from meshflow.compiler import compile
 from meshflow.compiler.artifact import (
+    CollectOutputTask,
     MeshProgramConfig,
     PEProgram,
     RuntimeProgram,
@@ -49,11 +50,10 @@ class TestSerializationRoundTrip:
             assert rest_pe.initial_sram == orig_pe.initial_sram
             assert len(rest_pe.tasks) == len(orig_pe.tasks)
             for orig_task, rest_task in zip(orig_pe.tasks, rest_pe.tasks):
+                assert type(rest_task) is type(orig_task)
                 assert rest_task.kind == orig_task.kind
                 assert rest_task.trigger_slot == orig_task.trigger_slot
-                assert rest_task.input_slot == orig_task.input_slot
-                assert rest_task.route_dest == orig_task.route_dest
-                assert rest_task.route_hops == orig_task.route_hops
+                assert rest_task == orig_task
 
         for orig_slot, rest_slot in zip(original.input_slots, restored.input_slots):
             assert rest_slot.name == orig_slot.name
@@ -71,8 +71,9 @@ class TestSerializationRoundTrip:
         assert restored.version == 1
         assert restored.mesh_config.width == 1
         assert len(restored.pe_programs) == 1
-        assert restored.pe_programs[0].tasks[0].kind == "collect_output"
-        assert restored.pe_programs[0].tasks[0].route_hops is None
+        task = restored.pe_programs[0].tasks[0]
+        assert task.kind == "collect_output"
+        assert isinstance(task, CollectOutputTask)
 
     def test_round_trip_with_initial_sram(self) -> None:
         """Verify initial_sram round-trips correctly (for future M3 use)."""

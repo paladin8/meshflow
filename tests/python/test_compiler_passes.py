@@ -379,7 +379,7 @@ class TestCompileOrchestrator:
 
         c_prog = next(pe for pe in program.pe_programs if pe.coord == (2, 0))
         assert c_prog.tasks[0].kind == "collect_output"
-        assert c_prog.tasks[0].route_hops is None
+        assert not hasattr(c_prog.tasks[0], "route_hops")
 
     def test_compile_with_explicit_config(self) -> None:
         graph = GraphIR(

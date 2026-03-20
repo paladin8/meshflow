@@ -28,8 +28,6 @@ pub fn make_chain_artifact(n: usize) -> Vec<u8> {
                 "kind": "collect_output",
                 "trigger_slot": 0,
                 "input_slot": 0,
-                "route_dest": null,
-                "route_hops": null,
             })]
         };
 

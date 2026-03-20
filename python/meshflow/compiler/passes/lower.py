@@ -1,13 +1,35 @@
 """Lowering pass — mechanical translation from ScheduleIR to RuntimeProgram."""
 
 from meshflow.compiler.artifact import (
+    CollectOutputTask,
+    ForwardActivationTask,
     InputSlotProgram,
     MeshProgramConfig,
     PEProgram,
     RuntimeProgram,
-    TaskProgram,
 )
-from meshflow.compiler.schedule_ir import ScheduleIR
+from meshflow.compiler.schedule_ir import ScheduleIR, TaskEntry
+
+
+def _lower_task(
+    task: TaskEntry,
+) -> ForwardActivationTask | CollectOutputTask:
+    """Convert a ScheduleIR TaskEntry to the corresponding artifact task."""
+    if task.kind == "forward_activation":
+        assert task.route_dest is not None
+        assert task.route_hops is not None
+        return ForwardActivationTask(
+            trigger_slot=task.trigger_slot,
+            input_slot=task.input_slot,
+            route_dest=task.route_dest,
+            route_hops=[d.value for d in task.route_hops],
+        )
+    if task.kind == "collect_output":
+        return CollectOutputTask(
+            trigger_slot=task.trigger_slot,
+            input_slot=task.input_slot,
+        )
+    raise ValueError(f"unknown task kind: {task.kind!r}")
 
 
 def lower(schedule: ScheduleIR) -> RuntimeProgram:
@@ -20,18 +42,7 @@ def lower(schedule: ScheduleIR) -> RuntimeProgram:
     pe_programs = [
         PEProgram(
             coord=pe.coord,
-            tasks=[
-                TaskProgram(
-                    kind=task.kind,
-                    trigger_slot=task.trigger_slot,
-                    input_slot=task.input_slot,
-                    route_dest=task.route_dest,
-                    route_hops=[d.value for d in task.route_hops]
-                    if task.route_hops is not None
-                    else None,
-                )
-                for task in pe.tasks
-            ],
+            tasks=[_lower_task(task) for task in pe.tasks],
             initial_sram={},
         )
         for pe in schedule.pe_schedules

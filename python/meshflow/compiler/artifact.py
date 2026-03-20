@@ -15,19 +15,36 @@ class MeshProgramConfig:
     max_events: int = 100_000
 
 
+# ---------------------------------------------------------------------------
+# Per-kind task dataclasses — each serializes as a flat dict with `kind`
+# as the discriminator.
+# ---------------------------------------------------------------------------
+
+
 @dataclass
-class TaskProgram:
-    kind: str
-    trigger_slot: int
-    input_slot: int
-    route_dest: tuple[int, int] | None = None
-    route_hops: list[str] | None = None
+class ForwardActivationTask:
+    kind: str = field(default="forward_activation", init=False)
+    trigger_slot: int = 0
+    input_slot: int = 0
+    route_dest: tuple[int, int] = (0, 0)
+    route_hops: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CollectOutputTask:
+    kind: str = field(default="collect_output", init=False)
+    trigger_slot: int = 0
+    input_slot: int = 0
+
+
+TaskProgram = ForwardActivationTask | CollectOutputTask
+"""Union of all task types that can appear in a PEProgram."""
 
 
 @dataclass
 class PEProgram:
     coord: tuple[int, int]
-    tasks: list[TaskProgram]
+    tasks: list[ForwardActivationTask | CollectOutputTask]
     initial_sram: dict[int, list[float]] = field(default_factory=dict)
 
 
@@ -76,18 +93,7 @@ def _program_to_dict(program: RuntimeProgram) -> dict[str, Any]:
         "pe_programs": [
             {
                 "coord": list(pe.coord),
-                "tasks": [
-                    {
-                        "kind": task.kind,
-                        "trigger_slot": task.trigger_slot,
-                        "input_slot": task.input_slot,
-                        "route_dest": list(task.route_dest)
-                        if task.route_dest is not None
-                        else None,
-                        "route_hops": task.route_hops,
-                    }
-                    for task in pe.tasks
-                ],
+                "tasks": [_task_to_dict(task) for task in pe.tasks],
                 "initial_sram": {k: v for k, v in pe.initial_sram.items()},
             }
             for pe in program.pe_programs
@@ -103,6 +109,28 @@ def _program_to_dict(program: RuntimeProgram) -> dict[str, Any]:
     }
 
 
+def _task_to_dict(task: ForwardActivationTask | CollectOutputTask) -> dict[str, Any]:
+    """Convert a per-kind task dataclass to a flat dict."""
+    d = asdict(task)
+    # Convert tuples to lists for msgpack
+    if "route_dest" in d and d["route_dest"] is not None:
+        d["route_dest"] = list(d["route_dest"])
+    return d
+
+
+def _dict_to_task(d: dict[str, Any]) -> ForwardActivationTask | CollectOutputTask:
+    """Dispatch on `kind` and construct the right task dataclass."""
+    kind = d["kind"]
+    fields = {k: v for k, v in d.items() if k != "kind"}
+    if kind == "forward_activation":
+        if fields.get("route_dest") is not None:
+            fields["route_dest"] = tuple(fields["route_dest"])
+        return ForwardActivationTask(**fields)
+    if kind == "collect_output":
+        return CollectOutputTask(**fields)
+    raise ValueError(f"unknown task kind: {kind!r}")
+
+
 def _dict_to_program(raw: dict[str, Any]) -> RuntimeProgram:
     """Convert a deserialized dict back into a RuntimeProgram."""
     mesh_config = MeshProgramConfig(**raw["mesh_config"])
@@ -110,18 +138,7 @@ def _dict_to_program(raw: dict[str, Any]) -> RuntimeProgram:
     pe_programs = [
         PEProgram(
             coord=tuple(pe["coord"]),  # type: ignore[arg-type]
-            tasks=[
-                TaskProgram(
-                    kind=task["kind"],
-                    trigger_slot=task["trigger_slot"],
-                    input_slot=task["input_slot"],
-                    route_dest=tuple(task["route_dest"])
-                    if task["route_dest"] is not None
-                    else None,  # type: ignore[arg-type]
-                    route_hops=task["route_hops"],
-                )
-                for task in pe["tasks"]
-            ],
+            tasks=[_dict_to_task(task) for task in pe["tasks"]],
             initial_sram={int(k): v for k, v in pe["initial_sram"].items()},
         )
         for pe in raw["pe_programs"]
