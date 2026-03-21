@@ -10,6 +10,15 @@ class OpType(Enum):
     FORWARD = "forward"
     COLLECT = "collect"
     LINEAR = "linear"
+    RELU = "relu"
+
+    @property
+    def is_activation(self) -> bool:
+        """Whether this op type is an activation function (fusable onto collect PEs)."""
+        return self in _ACTIVATION_OPS
+
+
+_ACTIVATION_OPS = frozenset({OpType.RELU})
 
 
 @dataclass
@@ -38,6 +47,7 @@ class GraphIR:
         self._check_edge_references()
         self._check_acyclic()
         self._check_linear_attrs()
+        self._check_activation_connectivity()
 
     def _check_linear_attrs(self) -> None:
         for node in self.nodes:
@@ -102,6 +112,34 @@ class GraphIR:
                 raise ValueError(f"edge references unknown source node: {edge.src_node!r}")
             if edge.dst_node not in node_ids:
                 raise ValueError(f"edge references unknown destination node: {edge.dst_node!r}")
+
+    def _check_activation_connectivity(self) -> None:
+        node_map = {n.id: n for n in self.nodes}
+        for node in self.nodes:
+            if not node.op.is_activation:
+                continue
+            kind = node.op.value.upper()
+            # Must have exactly one incoming edge
+            incoming = [e for e in self.edges if e.dst_node == node.id]
+            if len(incoming) != 1:
+                raise ValueError(
+                    f"{kind} node {node.id!r} must have exactly one incoming edge, "
+                    f"got {len(incoming)}"
+                )
+            # Incoming must be from a LINEAR node
+            src = node_map[incoming[0].src_node]
+            if src.op != OpType.LINEAR:
+                raise ValueError(
+                    f"{kind} node {node.id!r} must follow a LINEAR node, "
+                    f"but predecessor {src.id!r} is {src.op.value}"
+                )
+            # Must have zero or one outgoing edge
+            outgoing = [e for e in self.edges if e.src_node == node.id]
+            if len(outgoing) > 1:
+                raise ValueError(
+                    f"{kind} node {node.id!r} must have at most one outgoing edge, "
+                    f"got {len(outgoing)}"
+                )
 
     def _check_acyclic(self) -> None:
         self.topological_order()  # raises ValueError if cyclic

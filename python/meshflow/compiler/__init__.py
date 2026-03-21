@@ -33,7 +33,9 @@ def compile(
     if config is None:
         config = CompilerConfig()
 
+    graph.validate()
     _validate_weights(graph, weights)
+    _validate_shape_chaining(graph)
 
     spatial = place(graph, config)
     schedule = route(spatial, config, weights)
@@ -73,3 +75,34 @@ def _validate_weights(
             raise ValueError(
                 f"LINEAR node {node.id!r}: bias shape {b.shape} doesn't match ({out_f},)"
             )
+
+
+def _validate_shape_chaining(graph: GraphIR) -> None:
+    """Validate that connected LINEAR layers have compatible dimensions."""
+    node_map = {n.id: n for n in graph.nodes}
+
+    for node in graph.nodes:
+        if node.op != OpType.LINEAR:
+            continue
+        if node.attrs is None:
+            continue
+        out_f = node.attrs["out_features"]
+
+        # Follow outgoing edges through activation nodes to the next LINEAR
+        outgoing = [e for e in graph.edges if e.src_node == node.id]
+        for edge in outgoing:
+            successor = node_map[edge.dst_node]
+            # Skip through activation nodes to find the next LINEAR
+            if successor.op.is_activation:
+                act_outgoing = [e for e in graph.edges if e.src_node == successor.id]
+                if not act_outgoing:
+                    continue
+                successor = node_map[act_outgoing[0].dst_node]
+
+            if successor.op == OpType.LINEAR and successor.attrs is not None:
+                in_f = successor.attrs["in_features"]
+                if out_f != in_f:
+                    raise ValueError(
+                        f"shape mismatch: {node.id!r} out_features={out_f} != "
+                        f"{successor.id!r} in_features={in_f}"
+                    )

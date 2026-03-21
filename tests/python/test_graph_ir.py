@@ -148,6 +148,69 @@ class TestInputNodes:
         assert graph.input_node_ids() == ["a", "b"]
 
 
+class TestReluValidation:
+    def test_relu_after_linear_valid(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 8}),
+                Node(id="r1", op=OpType.RELU),
+            ],
+            edges=[Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0)],
+        )
+        graph.validate()  # should not raise
+
+    def test_relu_not_after_linear(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="f", op=OpType.FORWARD),
+                Node(id="r", op=OpType.RELU),
+            ],
+            edges=[Edge(src_node="f", src_slot=0, dst_node="r", dst_slot=0)],
+        )
+        with pytest.raises(ValueError, match="must follow a LINEAR"):
+            graph.validate()
+
+    def test_relu_no_incoming(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="r", op=OpType.RELU)],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="exactly one incoming edge"):
+            graph.validate()
+
+    def test_relu_multiple_outgoing(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 8}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 8, "out_features": 4}),
+                Node(id="l3", op=OpType.LINEAR, attrs={"in_features": 8, "out_features": 4}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+                Edge(src_node="r1", src_slot=1, dst_node="l3", dst_slot=0),
+            ],
+        )
+        with pytest.raises(ValueError, match="at most one outgoing edge"):
+            graph.validate()
+
+    def test_mlp_graph_valid(self) -> None:
+        """Full 2-layer MLP: Linear → ReLU → Linear."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 8}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 8, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        graph.validate()  # should not raise
+
+
 class TestTopologicalOrder:
     def test_simple_chain(self) -> None:
         graph = GraphIR(

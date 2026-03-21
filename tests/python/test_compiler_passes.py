@@ -500,6 +500,267 @@ class TestLinearPlacement:
         assert tile2.attrs["fragment_offset"] == 5
 
 
+class TestMultiLayerPlacement:
+    def test_two_layer_mlp_placement(self) -> None:
+        """Linear(4,8) → ReLU → Linear(8,3) with mesh_height=4."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 8}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 8, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig(mesh_height=4)
+        spatial = place(graph, config)
+
+        # 2 columns: l1 (3 tiles + collect), l2 (3 tiles + collect)
+        assert spatial.width == 2
+        assert spatial.height == 4
+
+        coords = {n.id: n.coord for n in spatial.nodes}
+        # Column 0: l1 tiles at (0,0)-(0,2), collect at (0,3)
+        assert coords["l1_tile_0"] == (0, 0)
+        assert coords["l1_tile_1"] == (0, 1)
+        assert coords["l1_tile_2"] == (0, 2)
+        assert coords["l1_collect"] == (0, 3)
+        # Column 1: l2 tiles at (1,0)-(1,2), collect at (1,3)
+        assert coords["l2_tile_0"] == (1, 0)
+        assert coords["l2_tile_1"] == (1, 1)
+        assert coords["l2_tile_2"] == (1, 2)
+        assert coords["l2_collect"] == (1, 3)
+
+        # RELU node is NOT placed (fused onto collect)
+        placed_ids = {n.id for n in spatial.nodes}
+        assert "r1" not in placed_ids
+
+        # l1 collect has activation and route_to attrs
+        l1_collect = next(n for n in spatial.nodes if n.id == "l1_collect")
+        assert l1_collect.attrs["activation"] == "relu"
+        assert l1_collect.attrs["route_to"] == "l2"
+
+        # l2 collect is terminal (no route_to)
+        l2_collect = next(n for n in spatial.nodes if n.id == "l2_collect")
+        assert "route_to" not in l2_collect.attrs
+        assert "activation" not in l2_collect.attrs
+
+    def test_relu_fused_no_placed_node(self) -> None:
+        """RELU nodes don't produce placed nodes."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 6}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 6, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        spatial = place(graph, CompilerConfig(mesh_height=4))
+        # Only LINEAR tiles + collect PEs, no RELU PE
+        assert all(n.op in (OpType.LINEAR, OpType.COLLECT) for n in spatial.nodes)
+
+    def test_three_layer_mlp_placement(self) -> None:
+        """Linear → ReLU → Linear → ReLU → Linear."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 8}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 8, "out_features": 6}),
+                Node(id="r2", op=OpType.RELU),
+                Node(id="l3", op=OpType.LINEAR, attrs={"in_features": 6, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+                Edge(src_node="l2", src_slot=0, dst_node="r2", dst_slot=0),
+                Edge(src_node="r2", src_slot=0, dst_node="l3", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig(mesh_height=4)
+        spatial = place(graph, config)
+
+        assert spatial.width == 3
+        assert spatial.height == 4
+
+        # l1 collect has activation + route_to
+        l1_collect = next(n for n in spatial.nodes if n.id == "l1_collect")
+        assert l1_collect.attrs["activation"] == "relu"
+        assert l1_collect.attrs["route_to"] == "l2"
+
+        # l2 collect has activation + route_to
+        l2_collect = next(n for n in spatial.nodes if n.id == "l2_collect")
+        assert l2_collect.attrs["activation"] == "relu"
+        assert l2_collect.attrs["route_to"] == "l3"
+
+        # l3 collect is terminal
+        l3_collect = next(n for n in spatial.nodes if n.id == "l3_collect")
+        assert "route_to" not in l3_collect.attrs
+        assert "activation" not in l3_collect.attrs
+
+    def test_linear_without_relu(self) -> None:
+        """Direct Linear → Linear (no activation)."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 6}),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 6, "out_features": 3}),
+            ],
+            edges=[Edge(src_node="l1", src_slot=0, dst_node="l2", dst_slot=0)],
+        )
+        spatial = place(graph, CompilerConfig(mesh_height=4))
+
+        l1_collect = next(n for n in spatial.nodes if n.id == "l1_collect")
+        assert l1_collect.attrs["route_to"] == "l2"
+        assert "activation" not in l1_collect.attrs
+
+    def test_uneven_tiling_different_layers(self) -> None:
+        """Layers with different out_features get different tile counts."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 7}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 7, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig(mesh_height=4)
+        spatial = place(graph, config)
+
+        # l1: 7 features, 3 tiles → [3, 2, 2] rows
+        l1_tiles = [n for n in spatial.nodes if n.id.startswith("l1_tile")]
+        assert len(l1_tiles) == 3
+        assert l1_tiles[0].attrs["tile_rows"] == 3
+        assert l1_tiles[1].attrs["tile_rows"] == 2
+        assert l1_tiles[2].attrs["tile_rows"] == 2
+
+        # l2: 3 features, 3 tiles → [1, 1, 1] rows
+        l2_tiles = [n for n in spatial.nodes if n.id.startswith("l2_tile")]
+        assert len(l2_tiles) == 3
+        assert all(t.attrs["tile_rows"] == 1 for t in l2_tiles)
+
+    def test_terminal_relu_placement(self) -> None:
+        """LINEAR → RELU at end of graph: collect gets activation but no route_to."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 6}),
+                Node(id="r1", op=OpType.RELU),
+            ],
+            edges=[Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0)],
+        )
+        spatial = place(graph, CompilerConfig(mesh_height=4))
+        l1_collect = next(n for n in spatial.nodes if n.id == "l1_collect")
+        assert l1_collect.attrs["activation"] == "relu"
+        assert "route_to" not in l1_collect.attrs
+
+    def test_no_inter_layer_placed_edges(self) -> None:
+        """Inter-layer edges are not placed; routing pass handles them."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 6}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 6, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        spatial = place(graph, CompilerConfig(mesh_height=4))
+
+        # Only internal tile→collect edges, no inter-layer edges
+        for edge in spatial.edges:
+            assert edge.dst_node.endswith("_collect"), f"unexpected edge: {edge}"
+
+
+class TestShapeChaining:
+    def test_shape_mismatch_rejected(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 8}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 6, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        with pytest.raises(ValueError, match="shape mismatch"):
+            compile(
+                graph,
+                weights={
+                    "l1": {
+                        "weight": np.zeros((8, 4), dtype=np.float32),
+                        "bias": np.zeros(8, dtype=np.float32),
+                    },
+                    "l2": {
+                        "weight": np.zeros((3, 6), dtype=np.float32),
+                        "bias": np.zeros(3, dtype=np.float32),
+                    },
+                },
+            )
+
+    def test_shape_mismatch_direct_linear(self) -> None:
+        """Direct LINEAR → LINEAR shape mismatch (no RELU between)."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 8}),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 6, "out_features": 3}),
+            ],
+            edges=[Edge(src_node="l1", src_slot=0, dst_node="l2", dst_slot=0)],
+        )
+        with pytest.raises(ValueError, match="shape mismatch"):
+            compile(
+                graph,
+                weights={
+                    "l1": {
+                        "weight": np.zeros((8, 4), dtype=np.float32),
+                        "bias": np.zeros(8, dtype=np.float32),
+                    },
+                    "l2": {
+                        "weight": np.zeros((3, 6), dtype=np.float32),
+                        "bias": np.zeros(3, dtype=np.float32),
+                    },
+                },
+            )
+
+    def test_shape_match_accepted(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 8}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 8, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        # Should not raise — shapes match (l1.out=8 == l2.in=8)
+        config = CompilerConfig(mesh_height=4)
+        compile(
+            graph,
+            config,
+            weights={
+                "l1": {
+                    "weight": np.zeros((8, 4), dtype=np.float32),
+                    "bias": np.zeros(8, dtype=np.float32),
+                },
+                "l2": {
+                    "weight": np.zeros((3, 8), dtype=np.float32),
+                    "bias": np.zeros(3, dtype=np.float32),
+                },
+            },
+        )
+
+
 class TestLinearRouting:
     def _make_linear_weights(
         self, in_f: int = 4, out_f: int = 6
