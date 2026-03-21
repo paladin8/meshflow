@@ -1,8 +1,27 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::coords::Coord;
+use crate::coords::{Coord, Direction};
 use crate::message::{Message, SlotId};
 use crate::profiling::PeCounters;
+
+/// Activation function applied after fragment collection.
+#[derive(Debug, Clone)]
+pub enum Activation {
+    ReLU,
+}
+
+impl Activation {
+    /// Apply the activation function in-place.
+    pub fn apply(&self, data: &mut [f32]) {
+        match self {
+            Activation::ReLU => {
+                for v in data.iter_mut() {
+                    *v = v.max(0.0);
+                }
+            }
+        }
+    }
+}
 
 /// A processing element on the 2D mesh.
 ///
@@ -41,7 +60,7 @@ pub enum TaskKind {
     ForwardActivation {
         input_slot: SlotId,
         route_dest: Coord,
-        hops: Vec<crate::coords::Direction>,
+        hops: Vec<Direction>,
     },
     /// Consume payload from input_slot and mark it as simulation output.
     CollectOutput { input_slot: SlotId },
@@ -54,7 +73,7 @@ pub enum TaskKind {
         tile_rows: u32,
         tile_cols: u32,
         route_dest: Coord,
-        hops: Vec<crate::coords::Direction>,
+        hops: Vec<Direction>,
         fragment_slot: SlotId,
         fragment_offset: u32,
     },
@@ -65,6 +84,15 @@ pub enum TaskKind {
         num_fragments: u32,
         total_rows: u32,
         fragment_offset: u32,
+    },
+    /// Accumulate fragments, apply activation, and broadcast to next layer's tile PEs.
+    /// Used for intermediate layers in multi-layer MLPs.
+    ConcatCollectForward {
+        num_fragments: u32,
+        total_rows: u32,
+        fragment_offset: u32,
+        activation: Option<Activation>,
+        route_dests: Vec<(Coord, Vec<Direction>)>,
     },
 }
 

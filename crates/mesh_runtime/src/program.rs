@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::coords::{Coord, Direction};
 use crate::message::SlotId;
-use crate::pe::{TaskConfig, TaskKind};
+use crate::pe::{Activation, TaskConfig, TaskKind};
 use crate::runtime::{InjectMessage, SimConfig, SimResult, Simulator};
 
 // ---------------------------------------------------------------------------
@@ -68,6 +68,15 @@ enum TaskProgram {
         num_fragments: u32,
         total_rows: u32,
         fragment_offset: u32,
+    },
+    #[serde(rename = "concat_collect_forward")]
+    ConcatCollectForward {
+        trigger_slot: u32,
+        num_fragments: u32,
+        total_rows: u32,
+        fragment_offset: u32,
+        activation: Option<String>,
+        route_dests: Vec<((u32, u32), Vec<String>)>,
     },
 }
 
@@ -256,6 +265,15 @@ fn validate_coord(coord: Coord, width: u32, height: u32) -> Result<(), ProgramEr
     }
 }
 
+fn parse_activation(s: &str) -> Result<Activation, ProgramError> {
+    match s {
+        "relu" => Ok(Activation::ReLU),
+        _ => Err(ProgramError::Deserialize(format!(
+            "unknown activation: {s:?}"
+        ))),
+    }
+}
+
 fn parse_direction(s: &str) -> Result<Direction, ProgramError> {
     match s {
         "north" => Ok(Direction::North),
@@ -344,6 +362,38 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             },
             trigger_slot: *trigger_slot,
         }),
+        TaskProgram::ConcatCollectForward {
+            trigger_slot,
+            num_fragments,
+            total_rows,
+            fragment_offset,
+            activation,
+            route_dests,
+        } => {
+            let act = activation.as_deref().map(parse_activation).transpose()?;
+            let dests: Vec<(Coord, Vec<Direction>)> = route_dests
+                .iter()
+                .map(|(coord, hops)| {
+                    let c = Coord::new(coord.0, coord.1);
+                    validate_coord(c, width, height)?;
+                    let h: Vec<Direction> = hops
+                        .iter()
+                        .map(|s| parse_direction(s))
+                        .collect::<Result<_, _>>()?;
+                    Ok((c, h))
+                })
+                .collect::<Result<_, ProgramError>>()?;
+            Ok(TaskConfig {
+                kind: TaskKind::ConcatCollectForward {
+                    num_fragments: *num_fragments,
+                    total_rows: *total_rows,
+                    fragment_offset: *fragment_offset,
+                    activation: act,
+                    route_dests: dests,
+                },
+                trigger_slot: *trigger_slot,
+            })
+        }
     }
 }
 

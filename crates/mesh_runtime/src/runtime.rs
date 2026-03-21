@@ -328,51 +328,118 @@ impl Simulator {
                 total_rows,
                 fragment_offset,
             } => {
-                // trigger_slot is the fragment index (0, 1, ..., N-1)
                 let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
-                let pe = self.mesh.pe_mut(coord);
-                let fragment = pe.read_slot(trigger_slot).clone();
-                pe.counters.tasks_executed += 1;
-                self.profile.total_tasks_executed += 1;
-
-                let total_size = total_rows as usize;
-                let offset = fragment_offset as usize;
-                let frag_len = fragment.len();
-
-                // Use a reserved SRAM slot for the accumulator buffer.
-                // Slot u32::MAX is the accumulator, slot (u32::MAX - 1) is the counter.
-                let accum_slot: SlotId = u32::MAX;
-                let counter_slot: SlotId = u32::MAX - 1;
-
-                // Initialize accumulator on first fragment
-                if !pe.has_slot(accum_slot) {
-                    pe.write_slot(accum_slot, vec![0.0; total_size]);
-                    pe.write_slot(counter_slot, vec![0.0]); // counter = 0
-                }
-
-                // Write fragment into accumulator at correct offset, then
-                // remove the fragment slot to keep SRAM usage at O(1).
-                {
-                    let mut buf = pe.read_slot(accum_slot).clone();
-                    buf[offset..offset + frag_len].copy_from_slice(&fragment);
-                    pe.write_slot(accum_slot, buf);
-                    pe.remove_slot(trigger_slot);
-                }
-
-                // Increment counter
-                let count = {
-                    let c = pe.read_slot(counter_slot)[0] as u32 + 1;
-                    pe.write_slot(counter_slot, vec![c as f32]);
-                    c
-                };
-
-                // All fragments collected — emit output
-                if count == num_fragments {
-                    let result = pe.remove_slot(accum_slot).unwrap();
-                    pe.remove_slot(counter_slot);
+                let completed = self.process_concat_fragment(
+                    coord,
+                    trigger_slot,
+                    num_fragments,
+                    total_rows,
+                    fragment_offset,
+                );
+                if let Some(result) = completed {
                     self.outputs.insert(coord, result);
                 }
             }
+            TaskKind::ConcatCollectForward {
+                num_fragments,
+                total_rows,
+                fragment_offset,
+                ref activation,
+                ref route_dests,
+            } => {
+                let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
+                let activation = activation.clone();
+                let route_dests = route_dests.clone();
+                let completed = self.process_concat_fragment(
+                    coord,
+                    trigger_slot,
+                    num_fragments,
+                    total_rows,
+                    fragment_offset,
+                );
+                if let Some(mut result) = completed {
+                    // Apply activation function if specified
+                    if let Some(act) = &activation {
+                        act.apply(&mut result);
+                    }
+
+                    // Broadcast to next layer's tile PEs with send serialization:
+                    // each send costs 1 time unit.
+                    let pe = self.mesh.pe_mut(coord);
+                    for (i, (dest, hops)) in route_dests.iter().enumerate() {
+                        pe.counters.messages_sent += 1;
+                        let send_time = timestamp + self.config.task_base_latency + i as u64;
+                        let message = Message {
+                            id: self.next_message_id,
+                            source: coord,
+                            dest: *dest,
+                            hops: hops.clone(),
+                            current_hop: 0,
+                            payload: result.clone(),
+                            payload_slot: 0, // deliver to input slot 0 on tile PEs
+                            timestamp: send_time,
+                        };
+                        self.next_message_id += 1;
+                        self.queue
+                            .push(send_time, coord, EventKind::DeliverMessage { message });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shared accumulator logic for ConcatCollect and ConcatCollectForward.
+    /// Returns Some(completed_buffer) when all fragments have arrived, None otherwise.
+    fn process_concat_fragment(
+        &mut self,
+        coord: Coord,
+        trigger_slot: SlotId,
+        num_fragments: u32,
+        total_rows: u32,
+        fragment_offset: u32,
+    ) -> Option<Vec<f32>> {
+        let pe = self.mesh.pe_mut(coord);
+        let fragment = pe.read_slot(trigger_slot).clone();
+        pe.counters.tasks_executed += 1;
+        self.profile.total_tasks_executed += 1;
+
+        let total_size = total_rows as usize;
+        let offset = fragment_offset as usize;
+        let frag_len = fragment.len();
+
+        // Use reserved SRAM slots for accumulator buffer and counter.
+        let accum_slot: SlotId = u32::MAX;
+        let counter_slot: SlotId = u32::MAX - 1;
+
+        // Initialize accumulator on first fragment
+        if !pe.has_slot(accum_slot) {
+            pe.write_slot(accum_slot, vec![0.0; total_size]);
+            pe.write_slot(counter_slot, vec![0.0]);
+        }
+
+        // Write fragment into accumulator at correct offset, then
+        // remove the fragment slot to keep SRAM usage at O(1).
+        {
+            let mut buf = pe.read_slot(accum_slot).clone();
+            buf[offset..offset + frag_len].copy_from_slice(&fragment);
+            pe.write_slot(accum_slot, buf);
+            pe.remove_slot(trigger_slot);
+        }
+
+        // Increment counter
+        let count = {
+            let c = pe.read_slot(counter_slot)[0] as u32 + 1;
+            pe.write_slot(counter_slot, vec![c as f32]);
+            c
+        };
+
+        // All fragments collected — return completed buffer
+        if count == num_fragments {
+            let result = pe.remove_slot(accum_slot).unwrap();
+            pe.remove_slot(counter_slot);
+            Some(result)
+        } else {
+            None
         }
     }
 }
