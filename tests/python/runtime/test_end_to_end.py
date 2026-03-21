@@ -5,7 +5,7 @@ import torch
 from meshflow.compiler import compile, CompilerConfig
 from meshflow.compiler.artifact import serialize
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
-from meshflow.models.reference import reference_linear
+from meshflow.models.reference import reference_linear, reference_mlp
 from meshflow._mesh_runtime import (
     MeshConfig,
     SimInput,
@@ -245,3 +245,200 @@ class TestLinearEndToEnd:
         assert result.total_tasks_executed == 6
         # Fragment hops: tile 0 -> collect = 3 north, tile 1 -> 2 north, tile 2 -> 1 north = 6
         assert result.total_hops == 6
+
+
+def _make_mlp_weights(
+    layer_sizes: list[tuple[int, int]], seed: int = 42
+) -> tuple[dict[str, dict[str, "torch.Tensor"]], list[tuple["torch.Tensor", "torch.Tensor"]]]:
+    """Create weights for an MLP. Returns (compiler_weights, reference_layers)."""
+    torch.manual_seed(seed)
+    compiler_weights: dict = {}
+    ref_layers: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for i, (in_f, out_f) in enumerate(layer_sizes):
+        W = torch.randn(out_f, in_f)
+        b = torch.randn(out_f)
+        name = f"l{i + 1}"
+        compiler_weights[name] = {"weight": W.numpy(), "bias": b.numpy()}
+        ref_layers.append((W, b))
+    return compiler_weights, ref_layers
+
+
+class TestMLPEndToEnd:
+    def test_two_layer_mlp(self) -> None:
+        """Linear(4,8) → ReLU → Linear(8,6): verify against reference_mlp."""
+        torch.manual_seed(42)
+        x = torch.randn(4)
+        weights, ref_layers = _make_mlp_weights([(4, 8), (8, 6)])
+
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 8}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 8, "out_features": 6}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig(mesh_height=4)
+        program = compile(graph, config, weights=weights)
+        artifact_bytes = serialize(program)
+        result = run_program(artifact_bytes, inputs={"l1": x.tolist()})
+
+        expected = reference_mlp(x, ref_layers)
+        # l2 collect at (1, 3) — column 1, top of column
+        actual = torch.tensor(result.outputs[(1, 3)])
+        assert torch.allclose(actual, expected, atol=1e-6)
+
+    def test_three_layer_mlp(self) -> None:
+        """Linear(4,8) → ReLU → Linear(8,6) → ReLU → Linear(6,3)."""
+        torch.manual_seed(42)
+        x = torch.randn(4)
+        weights, ref_layers = _make_mlp_weights([(4, 8), (8, 6), (6, 3)])
+
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 8}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 8, "out_features": 6}),
+                Node(id="r2", op=OpType.RELU),
+                Node(id="l3", op=OpType.LINEAR, attrs={"in_features": 6, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+                Edge(src_node="l2", src_slot=0, dst_node="r2", dst_slot=0),
+                Edge(src_node="r2", src_slot=0, dst_node="l3", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig(mesh_height=4)
+        program = compile(graph, config, weights=weights)
+        artifact_bytes = serialize(program)
+        result = run_program(artifact_bytes, inputs={"l1": x.tolist()})
+
+        expected = reference_mlp(x, ref_layers)
+        # l3 collect at (2, 3) — column 2, top of column
+        actual = torch.tensor(result.outputs[(2, 3)])
+        assert torch.allclose(actual, expected, atol=1e-6)
+
+    def test_uneven_tiling_mlp(self) -> None:
+        """MLP with out_features not divisible by num_tiles."""
+        torch.manual_seed(42)
+        x = torch.randn(4)
+        # 7 out_features with mesh_height=4 → 3 tiles → [3, 2, 2] rows
+        weights, ref_layers = _make_mlp_weights([(4, 7), (7, 3)])
+
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 7}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 7, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig(mesh_height=4)
+        program = compile(graph, config, weights=weights)
+        artifact_bytes = serialize(program)
+        result = run_program(artifact_bytes, inputs={"l1": x.tolist()})
+
+        expected = reference_mlp(x, ref_layers)
+        actual = torch.tensor(result.outputs[(1, 3)])
+        assert torch.allclose(actual, expected, atol=1e-6)
+
+    def test_single_tile_mlp(self) -> None:
+        """Degenerate: mesh_height=2 (1 tile + 1 collect per layer)."""
+        torch.manual_seed(42)
+        x = torch.randn(3)
+        weights, ref_layers = _make_mlp_weights([(3, 4), (4, 2)])
+
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 3, "out_features": 4}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 2}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig(mesh_height=2)
+        program = compile(graph, config, weights=weights)
+        artifact_bytes = serialize(program)
+        result = run_program(artifact_bytes, inputs={"l1": x.tolist()})
+
+        expected = reference_mlp(x, ref_layers)
+        # 1 tile + 1 collect per column, collect at y=1
+        actual = torch.tensor(result.outputs[(1, 1)])
+        assert torch.allclose(actual, expected, atol=1e-6)
+
+    def test_mlp_profiling(self) -> None:
+        """Verify profiling counters for a 2-layer MLP."""
+        torch.manual_seed(42)
+        x = torch.randn(4)
+        weights, _ = _make_mlp_weights([(4, 6), (6, 3)])
+
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 6}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 6, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig(mesh_height=4)
+        program = compile(graph, config, weights=weights)
+        artifact_bytes = serialize(program)
+        result = run_program(artifact_bytes, inputs={"l1": x.tolist()})
+
+        # Layer 1: 3 broadcast inputs + 3 fragments to collect = 6 messages
+        # Inter-layer: 3 broadcast messages from l1 collect to l2 tiles = 3 messages
+        # Layer 2: 3 fragments to collect = 3 messages
+        # Total = 6 + 3 + 3 = 12
+        assert result.total_messages == 12
+
+        # Layer 1: 3 linear + 3 concat_collect_forward = 6
+        # Layer 2: 3 linear + 3 concat_collect = 6
+        # Total = 12
+        assert result.total_tasks_executed == 12
+
+
+class TestMLPValidationErrors:
+    def test_relu_not_after_linear(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="f", op=OpType.FORWARD),
+                Node(id="r", op=OpType.RELU),
+            ],
+            edges=[Edge(src_node="f", src_slot=0, dst_node="r", dst_slot=0)],
+        )
+        with pytest.raises(ValueError, match="must follow a LINEAR"):
+            compile(graph)
+
+    def test_shape_mismatch(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 8}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 6, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+        with pytest.raises(ValueError, match="shape mismatch"):
+            compile(
+                graph,
+                weights={
+                    "l1": {"weight": torch.zeros(8, 4).numpy(), "bias": torch.zeros(8).numpy()},
+                    "l2": {"weight": torch.zeros(3, 6).numpy(), "bias": torch.zeros(3).numpy()},
+                },
+            )
