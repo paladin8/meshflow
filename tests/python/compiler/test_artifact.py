@@ -9,6 +9,7 @@ import pytest
 from meshflow.compiler import compile
 from meshflow.compiler.artifact import (
     CollectOutputTask,
+    ConcatCollectForwardTask,
     ConcatCollectTask,
     LinearTask,
     MeshProgramConfig,
@@ -167,6 +168,46 @@ class TestSerializationRoundTrip:
         assert task1.num_fragments == 2
         assert task1.total_rows == 6
         assert task1.fragment_offset == 0
+
+    def test_round_trip_concat_collect_forward_task(self) -> None:
+        program = RuntimeProgram(
+            version=1,
+            mesh_config=MeshProgramConfig(width=2, height=4),
+            pe_programs=[
+                PEProgram(
+                    coord=(0, 3),
+                    tasks=[
+                        ConcatCollectForwardTask(
+                            trigger_slot=0,
+                            num_fragments=3,
+                            total_rows=6,
+                            fragment_offset=0,
+                            activation="relu",
+                            route_dests=[
+                                ((1, 0), ["east", "south", "south", "south"]),
+                                ((1, 1), ["east", "south", "south"]),
+                                ((1, 2), ["east", "south"]),
+                            ],
+                        ),
+                    ],
+                    initial_sram={},
+                ),
+            ],
+            input_slots=[],
+        )
+        restored = deserialize(serialize(program))
+
+        task = restored.pe_programs[0].tasks[0]
+        assert isinstance(task, ConcatCollectForwardTask)
+        assert task.kind == "concat_collect_forward"
+        assert task.num_fragments == 3
+        assert task.total_rows == 6
+        assert task.fragment_offset == 0
+        assert task.activation == "relu"
+        assert len(task.route_dests) == 3
+        assert task.route_dests[0] == ((1, 0), ["east", "south", "south", "south"])
+        assert task.route_dests[1] == ((1, 1), ["east", "south", "south"])
+        assert task.route_dests[2] == ((1, 2), ["east", "south"])
 
 
 class TestDeserializeErrors:

@@ -6,7 +6,7 @@ from meshflow.compiler import CompilerConfig
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
 from meshflow.compiler.passes.place import place
 from meshflow.compiler.passes.route import _generate_route_xy, route
-from meshflow.compiler.schedule_ir import Direction
+from meshflow.compiler.schedule_ir import ConcatCollectForwardEntry, Direction
 
 
 class TestRouting:
@@ -291,3 +291,151 @@ class TestLinearRouting:
         for slot in schedule.input_slots:
             assert slot.name == "linear1"
             assert slot.payload_slot == 0
+
+
+class TestMultiLayerRouting:
+    def _make_mlp_graph(self) -> GraphIR:
+        """Linear(4,6) → ReLU → Linear(6,3) with mesh_height=4."""
+        return GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 6}),
+                Node(id="r1", op=OpType.RELU),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 6, "out_features": 3}),
+            ],
+            edges=[
+                Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0),
+                Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
+            ],
+        )
+
+    def _make_mlp_weights(self) -> dict[str, dict[str, np.ndarray]]:
+        rng = np.random.default_rng(42)
+        return {
+            "l1": {
+                "weight": rng.standard_normal((6, 4)).astype(np.float32),
+                "bias": rng.standard_normal(6).astype(np.float32),
+            },
+            "l2": {
+                "weight": rng.standard_normal((3, 6)).astype(np.float32),
+                "bias": rng.standard_normal(3).astype(np.float32),
+            },
+        }
+
+    def test_intermediate_collect_has_forward_tasks(self) -> None:
+        graph = self._make_mlp_graph()
+        config = CompilerConfig(mesh_height=4)
+        spatial = place(graph, config)
+        schedule = route(spatial, config, self._make_mlp_weights())
+
+        # l1 collect at (0, 3) should have ConcatCollectForwardEntry tasks
+        l1_collect = next(p for p in schedule.pe_schedules if p.coord == (0, 3))
+        assert len(l1_collect.tasks) == 3
+        for i, task in enumerate(l1_collect.tasks):
+            assert isinstance(task, ConcatCollectForwardEntry)
+            assert task.kind == "concat_collect_forward"
+            assert task.trigger_slot == i
+            assert task.num_fragments == 3
+            assert task.total_rows == 6
+            assert task.activation == "relu"
+            # Routes to l2 tile PEs at (1, 0), (1, 1), (1, 2)
+            assert len(task.route_dests) == 3
+            dest_coords = [coord for coord, _ in task.route_dests]
+            assert dest_coords == [(1, 0), (1, 1), (1, 2)]
+
+    def test_terminal_collect_has_concat_tasks(self) -> None:
+        graph = self._make_mlp_graph()
+        config = CompilerConfig(mesh_height=4)
+        spatial = place(graph, config)
+        schedule = route(spatial, config, self._make_mlp_weights())
+
+        # l2 collect at (1, 3) should have ConcatCollectEntry tasks (terminal)
+        l2_collect = next(p for p in schedule.pe_schedules if p.coord == (1, 3))
+        assert len(l2_collect.tasks) == 3
+        for task in l2_collect.tasks:
+            assert task.kind == "concat_collect"
+
+    def test_inter_layer_route_hops(self) -> None:
+        """Route from l1 collect (0,3) to l2 tiles: east then south."""
+        graph = self._make_mlp_graph()
+        config = CompilerConfig(mesh_height=4)
+        spatial = place(graph, config)
+        schedule = route(spatial, config, self._make_mlp_weights())
+
+        l1_collect = next(p for p in schedule.pe_schedules if p.coord == (0, 3))
+        task = l1_collect.tasks[0]
+        assert isinstance(task, ConcatCollectForwardEntry)
+
+        # (0,3) → (1,0): 1 east, 3 south
+        coord_0, hops_0 = task.route_dests[0]
+        assert coord_0 == (1, 0)
+        assert hops_0 == [Direction.EAST, Direction.SOUTH, Direction.SOUTH, Direction.SOUTH]
+
+        # (0,3) → (1,1): 1 east, 2 south
+        coord_1, hops_1 = task.route_dests[1]
+        assert coord_1 == (1, 1)
+        assert hops_1 == [Direction.EAST, Direction.SOUTH, Direction.SOUTH]
+
+        # (0,3) → (1,2): 1 east, 1 south
+        coord_2, hops_2 = task.route_dests[2]
+        assert coord_2 == (1, 2)
+        assert hops_2 == [Direction.EAST, Direction.SOUTH]
+
+    def test_only_first_layer_has_input_slots(self) -> None:
+        graph = self._make_mlp_graph()
+        config = CompilerConfig(mesh_height=4)
+        spatial = place(graph, config)
+        schedule = route(spatial, config, self._make_mlp_weights())
+
+        # Only l1 tile PEs are external inputs
+        assert len(schedule.input_slots) == 3
+        for slot in schedule.input_slots:
+            assert slot.name == "l1"
+            assert slot.coord[0] == 0  # column 0
+
+    def test_both_layers_have_weights_in_sram(self) -> None:
+        graph = self._make_mlp_graph()
+        config = CompilerConfig(mesh_height=4)
+        weights = self._make_mlp_weights()
+        spatial = place(graph, config)
+        schedule = route(spatial, config, weights)
+
+        # l1 tiles at (0, 0)-(0, 2) have weights
+        for i in range(3):
+            pe = next(p for p in schedule.pe_schedules if p.coord == (0, i))
+            assert 1 in pe.initial_sram  # weight
+            assert 2 in pe.initial_sram  # bias
+
+        # l2 tiles at (1, 0)-(1, 2) have weights
+        for i in range(3):
+            pe = next(p for p in schedule.pe_schedules if p.coord == (1, i))
+            assert 1 in pe.initial_sram
+            assert 2 in pe.initial_sram
+
+    def test_no_activation_on_direct_linear(self) -> None:
+        """Linear → Linear (no RELU): forward tasks have activation=None."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 6}),
+                Node(id="l2", op=OpType.LINEAR, attrs={"in_features": 6, "out_features": 3}),
+            ],
+            edges=[Edge(src_node="l1", src_slot=0, dst_node="l2", dst_slot=0)],
+        )
+        rng = np.random.default_rng(42)
+        weights = {
+            "l1": {
+                "weight": rng.standard_normal((6, 4)).astype(np.float32),
+                "bias": rng.standard_normal(6).astype(np.float32),
+            },
+            "l2": {
+                "weight": rng.standard_normal((3, 6)).astype(np.float32),
+                "bias": rng.standard_normal(3).astype(np.float32),
+            },
+        }
+        config = CompilerConfig(mesh_height=4)
+        spatial = place(graph, config)
+        schedule = route(spatial, config, weights)
+
+        l1_collect = next(p for p in schedule.pe_schedules if p.coord == (0, 3))
+        task = l1_collect.tasks[0]
+        assert isinstance(task, ConcatCollectForwardEntry)
+        assert task.activation is None

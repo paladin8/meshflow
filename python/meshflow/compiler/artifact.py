@@ -61,7 +61,24 @@ class ConcatCollectTask:
     fragment_offset: int = 0
 
 
-TaskProgram = ForwardActivationTask | CollectOutputTask | LinearTask | ConcatCollectTask
+@dataclass
+class ConcatCollectForwardTask:
+    kind: str = field(default="concat_collect_forward", init=False)
+    trigger_slot: int = 0
+    num_fragments: int = 0
+    total_rows: int = 0
+    fragment_offset: int = 0
+    activation: str | None = None
+    route_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
+
+
+TaskProgram = (
+    ForwardActivationTask
+    | CollectOutputTask
+    | LinearTask
+    | ConcatCollectTask
+    | ConcatCollectForwardTask
+)
 """Union of all task types that can appear in a PEProgram."""
 
 
@@ -139,6 +156,9 @@ def _task_to_dict(task: TaskProgram) -> dict[str, Any]:
     # Convert tuples to lists for msgpack
     if "route_dest" in d and d["route_dest"] is not None:
         d["route_dest"] = list(d["route_dest"])
+    # Convert route_dests list of (coord_tuple, hops) for ConcatCollectForwardTask
+    if "route_dests" in d:
+        d["route_dests"] = [[list(coord), hops] for coord, hops in d["route_dests"]]
     return d
 
 
@@ -158,6 +178,11 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
         return LinearTask(**fields)
     if kind == "concat_collect":
         return ConcatCollectTask(**fields)
+    if kind == "concat_collect_forward":
+        # Convert route_dests: [[coord_list, hops], ...] → [(coord_tuple, hops), ...]
+        if "route_dests" in fields:
+            fields["route_dests"] = [(tuple(coord), hops) for coord, hops in fields["route_dests"]]
+        return ConcatCollectForwardTask(**fields)
     raise ValueError(f"unknown task kind: {kind!r}")
 
 

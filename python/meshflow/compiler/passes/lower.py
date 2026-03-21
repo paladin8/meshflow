@@ -2,6 +2,7 @@
 
 from meshflow.compiler.artifact import (
     CollectOutputTask,
+    ConcatCollectForwardTask,
     ConcatCollectTask,
     ForwardActivationTask,
     InputSlotProgram,
@@ -14,6 +15,7 @@ from meshflow.compiler.artifact import (
 from meshflow.compiler.schedule_ir import (
     CollectOutputEntry,
     ConcatCollectEntry,
+    ConcatCollectForwardEntry,
     ForwardActivationEntry,
     LinearEntry,
     TaskEntry,
@@ -54,6 +56,15 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             num_fragments=task.num_fragments,
             total_rows=task.total_rows,
             fragment_offset=task.fragment_offset,
+        )
+    if isinstance(task, ConcatCollectForwardEntry):
+        return ConcatCollectForwardTask(
+            trigger_slot=task.trigger_slot,
+            num_fragments=task.num_fragments,
+            total_rows=task.total_rows,
+            fragment_offset=task.fragment_offset,
+            activation=task.activation,
+            route_dests=[(coord, [d.value for d in hops]) for coord, hops in task.route_dests],
         )
     raise ValueError(f"unknown task entry type: {type(task)!r}")
 

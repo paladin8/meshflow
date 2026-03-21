@@ -56,7 +56,24 @@ class ConcatCollectEntry:
     fragment_offset: int = 0
 
 
-TaskEntry = ForwardActivationEntry | CollectOutputEntry | LinearEntry | ConcatCollectEntry
+@dataclass
+class ConcatCollectForwardEntry:
+    kind: str = field(default="concat_collect_forward", init=False)
+    trigger_slot: int = 0
+    num_fragments: int = 0
+    total_rows: int = 0
+    fragment_offset: int = 0
+    activation: str | None = None
+    route_dests: list[tuple[tuple[int, int], list[Direction]]] = field(default_factory=list)
+
+
+TaskEntry = (
+    ForwardActivationEntry
+    | CollectOutputEntry
+    | LinearEntry
+    | ConcatCollectEntry
+    | ConcatCollectForwardEntry
+)
 
 
 @dataclass

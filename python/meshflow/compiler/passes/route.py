@@ -7,6 +7,7 @@ from meshflow.compiler.graph_ir import OpType
 from meshflow.compiler.schedule_ir import (
     CollectOutputEntry,
     ConcatCollectEntry,
+    ConcatCollectForwardEntry,
     Direction,
     ForwardActivationEntry,
     InputSlot,
@@ -47,10 +48,12 @@ def _route_xy(
         pe_tasks.setdefault(node.coord, [])
         pe_sram.setdefault(node.coord, {})
 
-    # Collect incoming edges per destination node for building tasks
-    incoming_edges: dict[str, list[tuple[str, int, int]]] = {n.id: [] for n in spatial.nodes}
-    for edge in spatial.edges:
-        incoming_edges[edge.dst_node].append((edge.src_node, edge.src_slot, edge.dst_slot))
+    # Build index: origin_id → list of tile PE nodes (for inter-layer routing)
+    tiles_by_origin: dict[str, list] = {}
+    for node in spatial.nodes:
+        if node.op == OpType.LINEAR and node.attrs is not None:
+            origin = node.attrs["origin_id"]
+            tiles_by_origin.setdefault(origin, []).append(node)
 
     # For each node, create task entries
     for node in spatial.nodes:
@@ -112,13 +115,42 @@ def _route_xy(
                 pe_sram[node.coord][2] = bias_tile
 
         elif node.op == OpType.COLLECT:
-            # Check if this is a ConcatCollect (has num_fragments attr)
-            if node.attrs is not None and "num_fragments" in node.attrs:
-                num_fragments = node.attrs["num_fragments"]
-                total_rows = node.attrs["total_rows"]
-                # Compute per-fragment offsets
-                base = total_rows // num_fragments
-                remainder = total_rows % num_fragments
+            if node.attrs is None or "num_fragments" not in node.attrs:
+                # Simple collect (M2 style)
+                pe_tasks[node.coord].append(CollectOutputEntry(trigger_slot=0, input_slot=0))
+                continue
+
+            num_fragments = node.attrs["num_fragments"]
+            total_rows = node.attrs["total_rows"]
+            activation = node.attrs.get("activation")
+            route_to = node.attrs.get("route_to")
+
+            # Compute per-fragment offsets
+            base = total_rows // num_fragments
+            remainder = total_rows % num_fragments
+
+            if route_to is not None:
+                # Intermediate layer: ConcatCollectForward with routes to next layer's tiles
+                next_tiles = tiles_by_origin.get(route_to, [])
+                route_dests: list[tuple[tuple[int, int], list[Direction]]] = []
+                for tile_node in next_tiles:
+                    tile_hops = _generate_route_xy(node.coord, tile_node.coord)
+                    route_dests.append((tile_node.coord, tile_hops))
+
+                for i in range(num_fragments):
+                    frag_offset = i * base + min(i, remainder)
+                    pe_tasks[node.coord].append(
+                        ConcatCollectForwardEntry(
+                            trigger_slot=i,
+                            num_fragments=num_fragments,
+                            total_rows=total_rows,
+                            fragment_offset=frag_offset,
+                            activation=activation,
+                            route_dests=list(route_dests),  # copy to avoid shared mutation
+                        )
+                    )
+            else:
+                # Terminal layer: ConcatCollect (writes to outputs)
                 for i in range(num_fragments):
                     frag_offset = i * base + min(i, remainder)
                     pe_tasks[node.coord].append(
@@ -129,13 +161,6 @@ def _route_xy(
                             fragment_offset=frag_offset,
                         )
                     )
-            else:
-                pe_tasks[node.coord].append(
-                    CollectOutputEntry(
-                        trigger_slot=0,
-                        input_slot=0,
-                    )
-                )
 
     # Build PESchedule entries
     pe_schedules = [
@@ -143,22 +168,20 @@ def _route_xy(
         for coord, tasks in pe_tasks.items()
     ]
 
-    # Identify input nodes (no incoming edges in the spatial graph)
-    nodes_with_incoming = {e.dst_node for e in spatial.edges}
-
-    # For LINEAR tile nodes, use the origin_id as the input slot name
-    # (broadcast: multiple entries with the same name)
+    # Input slots: only first layer's tile PEs are external inputs.
+    # For multi-layer graphs, intermediate tiles receive input from the
+    # preceding collect PE's broadcast, not from external input.
+    first_layer_origin = _find_first_layer_origin(spatial)
     input_slots: list[InputSlot] = []
     for n in spatial.nodes:
-        if n.id in nodes_with_incoming:
-            continue
         if n.op == OpType.LINEAR and n.attrs is not None:
-            # Tile PE: broadcast input under the original node name
-            input_slots.append(InputSlot(name=n.attrs["origin_id"], coord=n.coord, payload_slot=0))
+            origin = n.attrs["origin_id"]
+            if first_layer_origin is not None and origin == first_layer_origin:
+                input_slots.append(InputSlot(name=origin, coord=n.coord, payload_slot=0))
         elif n.attrs is not None and "origin_id" in n.attrs:
-            # Collect PE generated by LINEAR expansion — not an external input
+            # Collect PE from LINEAR expansion — not an external input
             continue
-        else:
+        elif n.id not in {e.dst_node for e in spatial.edges}:
             # Regular input node (FORWARD, standalone COLLECT, etc.)
             input_slots.append(InputSlot(name=n.id, coord=n.coord, payload_slot=0))
 
@@ -168,6 +191,15 @@ def _route_xy(
         pe_schedules=pe_schedules,
         input_slots=input_slots,
     )
+
+
+def _find_first_layer_origin(spatial: SpatialIR) -> str | None:
+    """Find the origin_id of the first LINEAR layer (leftmost column, x=0)."""
+    for node in spatial.nodes:
+        if node.op == OpType.LINEAR and node.attrs is not None:
+            if node.coord[0] == 0:  # column 0
+                return node.attrs["origin_id"]
+    return None
 
 
 def _generate_route_xy(src: tuple[int, int], dst: tuple[int, int]) -> list[Direction]:
