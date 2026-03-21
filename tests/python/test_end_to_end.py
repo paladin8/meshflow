@@ -173,16 +173,16 @@ class TestLinearEndToEnd:
             ],
             edges=[],
         )
-        config = CompilerConfig(mesh_width=4)  # 3 tiles + 1 collect
+        config = CompilerConfig(mesh_height=4)  # 3 tiles + 1 collect (vertical)
         program = compile(
             graph, config, weights={"linear1": {"weight": W.numpy(), "bias": b.numpy()}}
         )
         artifact_bytes = serialize(program)
         result = run_program(artifact_bytes, inputs={"linear1": x.tolist()})
 
-        # Compare against torch reference
+        # Compare against torch reference — collect at (0, 3) in vertical layout
         expected = reference_linear(x, W, b)
-        actual = torch.tensor(result.outputs[(3, 0)])
+        actual = torch.tensor(result.outputs[(0, 3)])
         assert torch.allclose(actual, expected, atol=1e-6)
 
     def test_linear_single_tile(self) -> None:
@@ -204,13 +204,13 @@ class TestLinearEndToEnd:
             ],
             edges=[],
         )
-        config = CompilerConfig(mesh_width=2)  # 1 tile + 1 collect
+        config = CompilerConfig(mesh_height=2)  # 1 tile + 1 collect (vertical)
         program = compile(graph, config, weights={"lin": {"weight": W.numpy(), "bias": b.numpy()}})
         artifact_bytes = serialize(program)
         result = run_program(artifact_bytes, inputs={"lin": x.tolist()})
 
         expected = reference_linear(x, W, b)
-        actual = torch.tensor(result.outputs[(1, 0)])
+        actual = torch.tensor(result.outputs[(0, 1)])
         assert torch.allclose(actual, expected, atol=1e-6)
 
     def test_linear_profiling(self) -> None:
@@ -232,7 +232,7 @@ class TestLinearEndToEnd:
             ],
             edges=[],
         )
-        config = CompilerConfig(mesh_width=4)
+        config = CompilerConfig(mesh_height=4)
         program = compile(
             graph, config, weights={"linear1": {"weight": W.numpy(), "bias": b.numpy()}}
         )
@@ -243,5 +243,5 @@ class TestLinearEndToEnd:
         assert result.total_messages == 6
         # 3 linear tasks + 3 concat_collect tasks
         assert result.total_tasks_executed == 6
-        # Fragment hops: tile 0 -> collect = 3 east, tile 1 -> 2 east, tile 2 -> 1 east = 6
+        # Fragment hops: tile 0 -> collect = 3 north, tile 1 -> 2 north, tile 2 -> 1 north = 6
         assert result.total_hops == 6

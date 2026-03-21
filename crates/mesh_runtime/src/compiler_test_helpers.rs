@@ -48,21 +48,17 @@ pub fn make_chain_artifact(n: usize) -> Vec<u8> {
             "max_events": 100_000,
         },
         "pe_programs": pe_programs,
-        "input_slots": [{
-            "name": "a",
-            "coord": [0, 0],
-            "payload_slot": 0,
-        }],
+        "input_slots": [{"name": "a", "coord": [0, 0], "payload_slot": 0}],
     });
 
     rmp_serde::to_vec_named(&program).unwrap()
 }
 
-/// Build a msgpack artifact for a tiled linear layer.
+/// Build a msgpack artifact for a tiled linear layer using vertical column layout.
 ///
-/// Creates `num_tiles` tile PEs + 1 collect PE on a (num_tiles+1)x1 mesh.
+/// Creates `num_tiles` tile PEs + 1 collect PE on a 1x(num_tiles+1) mesh.
+/// Tiles are stacked vertically: tile i at (0, i), collect at (0, num_tiles).
 /// Weight matrix is `(out_features, in_features)`, bias is `(out_features,)`.
-/// Each tile gets `rows_per_pe = out_features / num_tiles` rows.
 /// Broadcast input "x" to all tile PEs.
 pub fn make_linear_artifact(
     in_features: usize,
@@ -75,7 +71,6 @@ pub fn make_linear_artifact(
 
     assert_eq!(weights.len(), out_features * in_features);
     assert_eq!(bias.len(), out_features);
-    assert_eq!(out_features % num_tiles, 0);
 
     // Use serde-serializable structs so initial_sram gets integer keys in msgpack.
     #[derive(Serialize)]
@@ -120,9 +115,11 @@ pub fn make_linear_artifact(
         #[serde(skip_serializing_if = "Option::is_none")]
         fragment_slot: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        fragment_offset: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         num_fragments: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        rows_per_fragment: Option<u32>,
+        total_rows: Option<u32>,
     }
     #[derive(Serialize)]
     struct InputSlot {
@@ -131,51 +128,55 @@ pub fn make_linear_artifact(
         payload_slot: u32,
     }
 
-    let rows_per_pe = out_features / num_tiles;
-    let width = num_tiles + 1;
-    let collect_x = num_tiles as u32;
+    let base = out_features / num_tiles;
+    let remainder = out_features % num_tiles;
+    let height = num_tiles + 1;
+    let collect_y = num_tiles as u32;
 
     let mut pe_programs = Vec::new();
     let mut input_slots_vec = Vec::new();
 
     for i in 0..num_tiles {
-        let hops_count = collect_x as usize - i;
-        let hops: Vec<String> = (0..hops_count).map(|_| "east".to_string()).collect();
+        let tile_rows = if i < remainder { base + 1 } else { base };
+        let frag_offset = i * base + std::cmp::min(i, remainder);
 
-        let row_start = i * rows_per_pe;
-        let row_end = row_start + rows_per_pe;
-        let weight_tile: Vec<f32> = (row_start..row_end)
+        // Hops: north from (0, i) to (0, collect_y)
+        let hops_count = collect_y as usize - i;
+        let hops: Vec<String> = (0..hops_count).map(|_| "north".to_string()).collect();
+
+        let weight_tile: Vec<f32> = (frag_offset..frag_offset + tile_rows)
             .flat_map(|r| &weights[r * in_features..(r + 1) * in_features])
             .copied()
             .collect();
-        let bias_tile: Vec<f32> = bias[row_start..row_end].to_vec();
+        let bias_tile: Vec<f32> = bias[frag_offset..frag_offset + tile_rows].to_vec();
 
         let mut sram = std::collections::HashMap::new();
         sram.insert(1u32, weight_tile);
         sram.insert(2u32, bias_tile);
 
         pe_programs.push(PEProg {
-            coord: (i as u32, 0),
+            coord: (0, i as u32),
             tasks: vec![Task {
                 kind: "linear".to_string(),
                 trigger_slot: 0,
                 input_slot: Some(0),
                 weight_slot: Some(1),
                 bias_slot: Some(2),
-                tile_rows: Some(rows_per_pe as u32),
+                tile_rows: Some(tile_rows as u32),
                 tile_cols: Some(in_features as u32),
-                route_dest: Some((collect_x, 0)),
+                route_dest: Some((0, collect_y)),
                 route_hops: Some(hops),
                 fragment_slot: Some(i as u32),
+                fragment_offset: Some(frag_offset as u32),
                 num_fragments: None,
-                rows_per_fragment: None,
+                total_rows: None,
             }],
             initial_sram: sram,
         });
 
         input_slots_vec.push(InputSlot {
             name: "x".to_string(),
-            coord: (i as u32, 0),
+            coord: (0, i as u32),
             payload_slot: 0,
         });
     }
@@ -183,6 +184,7 @@ pub fn make_linear_artifact(
     // Collect PE with concat_collect tasks
     let mut collect_tasks = Vec::new();
     for i in 0..num_tiles {
+        let frag_offset = i * base + std::cmp::min(i, remainder);
         collect_tasks.push(Task {
             kind: "concat_collect".to_string(),
             trigger_slot: i as u32,
@@ -194,13 +196,14 @@ pub fn make_linear_artifact(
             route_dest: None,
             route_hops: None,
             fragment_slot: None,
+            fragment_offset: Some(frag_offset as u32),
             num_fragments: Some(num_tiles as u32),
-            rows_per_fragment: Some(rows_per_pe as u32),
+            total_rows: Some(out_features as u32),
         });
     }
 
     pe_programs.push(PEProg {
-        coord: (collect_x, 0),
+        coord: (0, collect_y),
         tasks: collect_tasks,
         initial_sram: std::collections::HashMap::new(),
     });
@@ -208,8 +211,8 @@ pub fn make_linear_artifact(
     let program = Program {
         version: 1,
         mesh_config: MeshConfig {
-            width: width as u32,
-            height: 1,
+            width: 1,
+            height: height as u32,
             hop_latency: 1,
             task_base_latency: 1,
             max_events: 100_000,

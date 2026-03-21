@@ -56,13 +56,15 @@ pub enum TaskKind {
         route_dest: Coord,
         hops: Vec<crate::coords::Direction>,
         fragment_slot: SlotId,
+        fragment_offset: u32,
     },
     /// Accumulate output fragments into a pre-allocated buffer.
-    /// Each trigger writes fragment data at offset trigger_slot * rows_per_fragment.
+    /// Each trigger writes fragment data at fragment_offset.
     /// When all fragments have arrived, stores the completed buffer as output.
     ConcatCollect {
         num_fragments: u32,
-        rows_per_fragment: u32,
+        total_rows: u32,
+        fragment_offset: u32,
     },
 }
 

@@ -134,6 +134,7 @@ class TestSerializationRoundTrip:
                             route_dest=(1, 0),
                             route_hops=["east"],
                             fragment_slot=0,
+                            fragment_offset=0,
                         )
                     ],
                     initial_sram={1: [1.0, 2.0], 2: [3.0]},
@@ -141,7 +142,9 @@ class TestSerializationRoundTrip:
                 PEProgram(
                     coord=(1, 0),
                     tasks=[
-                        ConcatCollectTask(trigger_slot=0, num_fragments=2, rows_per_fragment=3),
+                        ConcatCollectTask(
+                            trigger_slot=0, num_fragments=2, total_rows=6, fragment_offset=0
+                        ),
                     ],
                     initial_sram={},
                 ),
@@ -156,12 +159,14 @@ class TestSerializationRoundTrip:
         assert task0.tile_cols == 4
         assert task0.route_dest == (1, 0)
         assert task0.fragment_slot == 0
+        assert task0.fragment_offset == 0
         assert restored.pe_programs[0].initial_sram == {1: [1.0, 2.0], 2: [3.0]}
 
         task1 = restored.pe_programs[1].tasks[0]
         assert isinstance(task1, ConcatCollectTask)
         assert task1.num_fragments == 2
-        assert task1.rows_per_fragment == 3
+        assert task1.total_rows == 6
+        assert task1.fragment_offset == 0
 
 
 class TestDeserializeErrors:

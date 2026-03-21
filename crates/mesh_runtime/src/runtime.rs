@@ -286,6 +286,7 @@ impl Simulator {
                 route_dest,
                 hops,
                 fragment_slot,
+                fragment_offset: _,
             } => {
                 let pe = self.mesh.pe_mut(coord);
                 let x = pe.read_slot(input_slot).clone();
@@ -324,7 +325,8 @@ impl Simulator {
             }
             TaskKind::ConcatCollect {
                 num_fragments,
-                rows_per_fragment,
+                total_rows,
+                fragment_offset,
             } => {
                 // trigger_slot is the fragment index (0, 1, ..., N-1)
                 let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
@@ -333,9 +335,9 @@ impl Simulator {
                 pe.counters.tasks_executed += 1;
                 self.profile.total_tasks_executed += 1;
 
-                let total_size = (num_fragments * rows_per_fragment) as usize;
-                let rpf = rows_per_fragment as usize;
-                let frag_idx = trigger_slot as usize;
+                let total_size = total_rows as usize;
+                let offset = fragment_offset as usize;
+                let frag_len = fragment.len();
 
                 // Use a reserved SRAM slot for the accumulator buffer.
                 // Slot u32::MAX is the accumulator, slot (u32::MAX - 1) is the counter.
@@ -352,8 +354,7 @@ impl Simulator {
                 // remove the fragment slot to keep SRAM usage at O(1).
                 {
                     let mut buf = pe.read_slot(accum_slot).clone();
-                    let offset = frag_idx * rpf;
-                    buf[offset..offset + rpf].copy_from_slice(&fragment);
+                    buf[offset..offset + frag_len].copy_from_slice(&fragment);
                     pe.write_slot(accum_slot, buf);
                     pe.remove_slot(trigger_slot);
                 }

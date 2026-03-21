@@ -44,6 +44,7 @@ class LinearEntry:
     route_dest: tuple[int, int] = (0, 0)
     route_hops: list[Direction] = field(default_factory=list)
     fragment_slot: int = 0
+    fragment_offset: int = 0
 
 
 @dataclass
@@ -51,7 +52,8 @@ class ConcatCollectEntry:
     kind: str = field(default="concat_collect", init=False)
     trigger_slot: int = 0
     num_fragments: int = 0
-    rows_per_fragment: int = 0
+    total_rows: int = 0
+    fragment_offset: int = 0
 
 
 TaskEntry = ForwardActivationEntry | CollectOutputEntry | LinearEntry | ConcatCollectEntry

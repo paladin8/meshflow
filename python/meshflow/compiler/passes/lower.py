@@ -46,12 +46,14 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             route_dest=task.route_dest,
             route_hops=[d.value for d in task.route_hops],
             fragment_slot=task.fragment_slot,
+            fragment_offset=task.fragment_offset,
         )
     if isinstance(task, ConcatCollectEntry):
         return ConcatCollectTask(
             trigger_slot=task.trigger_slot,
             num_fragments=task.num_fragments,
-            rows_per_fragment=task.rows_per_fragment,
+            total_rows=task.total_rows,
+            fragment_offset=task.fragment_offset,
         )
     raise ValueError(f"unknown task entry type: {type(task)!r}")
 

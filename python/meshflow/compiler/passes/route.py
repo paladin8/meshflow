@@ -56,7 +56,6 @@ def _route_xy(
     for node in spatial.nodes:
         if node.op == OpType.FORWARD:
             # Find the outgoing edge to determine route_dest.
-            # M2 limitation: only the first outgoing edge is routed.
             outgoing = [e for e in spatial.edges if e.src_node == node.id]
             if not outgoing:
                 continue
@@ -73,15 +72,18 @@ def _route_xy(
 
         elif node.op == OpType.LINEAR:
             # Tile PE: compute y_i = W_i @ x + b_i, route to collect
-            assert node.attrs is not None
+            if node.attrs is None:
+                raise ValueError(f"LINEAR tile node {node.id!r} missing attrs")
             tile_index = node.attrs["tile_index"]
-            rows_per_pe = node.attrs["rows_per_pe"]
+            tile_rows = node.attrs["tile_rows"]
+            fragment_offset = node.attrs["fragment_offset"]
             in_features = node.attrs["in_features"]
             origin_id = node.attrs["origin_id"]
 
             # Find the outgoing edge (tile -> collect)
             outgoing = [e for e in spatial.edges if e.src_node == node.id]
-            assert len(outgoing) == 1
+            if not outgoing:
+                raise ValueError(f"LINEAR tile node {node.id!r} has no outgoing edge")
             collect_node = node_map[outgoing[0].dst_node]
             hops = _generate_route_xy(node.coord, collect_node.coord)
 
@@ -91,11 +93,12 @@ def _route_xy(
                     input_slot=0,
                     weight_slot=1,
                     bias_slot=2,
-                    tile_rows=rows_per_pe,
+                    tile_rows=tile_rows,
                     tile_cols=in_features,
                     route_dest=collect_node.coord,
                     route_hops=hops,
                     fragment_slot=tile_index,
+                    fragment_offset=fragment_offset,
                 )
             )
 
@@ -103,10 +106,8 @@ def _route_xy(
             if weights is not None and origin_id in weights:
                 w = weights[origin_id]["weight"]
                 b = weights[origin_id]["bias"]
-                row_start = tile_index * rows_per_pe
-                row_end = row_start + rows_per_pe
-                weight_tile = w[row_start:row_end, :].flatten().tolist()
-                bias_tile = b[row_start:row_end].flatten().tolist()
+                weight_tile = w[fragment_offset : fragment_offset + tile_rows, :].flatten().tolist()
+                bias_tile = b[fragment_offset : fragment_offset + tile_rows].flatten().tolist()
                 pe_sram[node.coord][1] = weight_tile
                 pe_sram[node.coord][2] = bias_tile
 
@@ -114,13 +115,18 @@ def _route_xy(
             # Check if this is a ConcatCollect (has num_fragments attr)
             if node.attrs is not None and "num_fragments" in node.attrs:
                 num_fragments = node.attrs["num_fragments"]
-                rows_per_fragment = node.attrs["rows_per_fragment"]
+                total_rows = node.attrs["total_rows"]
+                # Compute per-fragment offsets
+                base = total_rows // num_fragments
+                remainder = total_rows % num_fragments
                 for i in range(num_fragments):
+                    frag_offset = i * base + min(i, remainder)
                     pe_tasks[node.coord].append(
                         ConcatCollectEntry(
                             trigger_slot=i,
                             num_fragments=num_fragments,
-                            rows_per_fragment=rows_per_fragment,
+                            total_rows=total_rows,
+                            fragment_offset=frag_offset,
                         )
                     )
             else:

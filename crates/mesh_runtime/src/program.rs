@@ -60,12 +60,14 @@ enum TaskProgram {
         route_dest: (u32, u32),
         route_hops: Vec<String>,
         fragment_slot: u32,
+        fragment_offset: u32,
     },
     #[serde(rename = "concat_collect")]
     ConcatCollect {
         trigger_slot: u32,
         num_fragments: u32,
-        rows_per_fragment: u32,
+        total_rows: u32,
+        fragment_offset: u32,
     },
 }
 
@@ -306,6 +308,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             route_dest,
             route_hops,
             fragment_slot,
+            fragment_offset,
         } => {
             let dest = Coord::new(route_dest.0, route_dest.1);
             validate_coord(dest, width, height)?;
@@ -323,6 +326,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     route_dest: dest,
                     hops,
                     fragment_slot: *fragment_slot,
+                    fragment_offset: *fragment_offset,
                 },
                 trigger_slot: *trigger_slot,
             })
@@ -330,11 +334,13 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
         TaskProgram::ConcatCollect {
             trigger_slot,
             num_fragments,
-            rows_per_fragment,
+            total_rows,
+            fragment_offset,
         } => Ok(TaskConfig {
             kind: TaskKind::ConcatCollect {
                 num_fragments: *num_fragments,
-                rows_per_fragment: *rows_per_fragment,
+                total_rows: *total_rows,
+                fragment_offset: *fragment_offset,
             },
             trigger_slot: *trigger_slot,
         }),
@@ -473,13 +479,14 @@ mod tests {
 
     #[test]
     fn load_linear_artifact() {
-        // 2x2 weight matrix, 2 tiles of 1 row each
+        // 2x2 weight matrix, 2 tiles of 1 row each, vertical layout
         let weights = vec![1.0, 2.0, 3.0, 4.0]; // [[1,2],[3,4]]
         let bias = vec![0.5, 0.5];
         let bytes = make_linear_artifact(2, 2, 2, &weights, &bias);
         let program = load_program(&bytes).unwrap();
 
-        assert_eq!(program.config.width, 3); // 2 tiles + 1 collect
+        assert_eq!(program.config.width, 1); // single column
+        assert_eq!(program.config.height, 3); // 2 tiles + 1 collect
         assert_eq!(program.pe_configs.len(), 3);
         // Broadcast input "x" to 2 tile PEs
         assert_eq!(program.input_slots.get("x").unwrap().len(), 2);
@@ -489,6 +496,7 @@ mod tests {
     fn linear_compute_correctness() {
         // W = [[1, 2], [3, 4]], b = [0.5, 0.5], x = [1, 1]
         // y = W @ x + b = [1*1+2*1+0.5, 3*1+4*1+0.5] = [3.5, 7.5]
+        // Vertical layout: collect at (0, 2)
         let weights = vec![1.0, 2.0, 3.0, 4.0];
         let bias = vec![0.5, 0.5];
         let bytes = make_linear_artifact(2, 2, 2, &weights, &bias);
@@ -498,7 +506,7 @@ mod tests {
         inputs.insert("x".to_string(), vec![1.0, 1.0]);
         let result = program.run_with_inputs(inputs).unwrap();
 
-        let output = result.outputs.get(&Coord::new(2, 0)).unwrap();
+        let output = result.outputs.get(&Coord::new(0, 2)).unwrap();
         assert_eq!(output.len(), 2);
         assert!((output[0] - 3.5).abs() < 1e-6);
         assert!((output[1] - 7.5).abs() < 1e-6);
@@ -509,6 +517,7 @@ mod tests {
         // W = [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1],[1,1,0,0],[0,0,1,1]]
         // 6x4 identity-like, b = [0;6], x = [1,2,3,4]
         // y = [1,2,3,4,3,7]
+        // Vertical layout: 3 tiles at (0,0)-(0,2), collect at (0,3)
         let weights = vec![
             1.0, 0.0, 0.0, 0.0, // row 0
             0.0, 1.0, 0.0, 0.0, // row 1
@@ -525,7 +534,7 @@ mod tests {
         inputs.insert("x".to_string(), vec![1.0, 2.0, 3.0, 4.0]);
         let result = program.run_with_inputs(inputs).unwrap();
 
-        let output = result.outputs.get(&Coord::new(3, 0)).unwrap();
+        let output = result.outputs.get(&Coord::new(0, 3)).unwrap();
         assert_eq!(output, &vec![1.0, 2.0, 3.0, 4.0, 3.0, 7.0]);
     }
 }
