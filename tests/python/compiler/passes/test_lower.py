@@ -2,6 +2,7 @@
 
 from meshflow.compiler import CompilerConfig, compile
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
+from meshflow.compiler.passes.expand import expand
 from meshflow.compiler.passes.lower import lower
 from meshflow.compiler.passes.place import place
 from meshflow.compiler.passes.route import route
@@ -16,7 +17,8 @@ class TestLowering:
             ],
             edges=[Edge(src_node="a", src_slot=0, dst_node="b", dst_slot=0)],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         schedule = route(spatial, CompilerConfig())
         program = lower(schedule)
 
@@ -35,7 +37,8 @@ class TestLowering:
             ],
             edges=[Edge(src_node="a", src_slot=0, dst_node="b", dst_slot=0)],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         schedule = route(spatial, CompilerConfig())
         program = lower(schedule)
 
@@ -48,7 +51,8 @@ class TestLowering:
             nodes=[Node(id="a", op=OpType.COLLECT)],
             edges=[],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         schedule = route(spatial, CompilerConfig())
         program = lower(schedule)
 

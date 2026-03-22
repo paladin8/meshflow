@@ -5,7 +5,7 @@ import numpy as np
 from meshflow.compiler.artifact import RuntimeProgram
 from meshflow.compiler.config import CompilerConfig, PlacementStrategy, RoutingStrategy
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
-from meshflow.compiler.passes import lower, place, route
+from meshflow.compiler.passes import expand, lower, place, route
 
 __all__ = [
     "CompilerConfig",
@@ -37,7 +37,8 @@ def compile(
     _validate_weights(graph, weights)
     _validate_shape_chaining(graph)
 
-    spatial = place(graph, config)
+    expanded = expand(graph, config)
+    spatial = place(expanded, config)
     schedule = route(spatial, config, weights)
     return lower(schedule)
 

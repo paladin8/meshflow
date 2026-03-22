@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from meshflow.compiler import CompilerConfig
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
+from meshflow.compiler.passes.expand import expand
 from meshflow.compiler.passes.place import place
 from meshflow.compiler.passes.route import _generate_route_xy, route
 from meshflow.compiler.schedule_ir import ConcatCollectForwardEntry, Direction
@@ -18,7 +19,8 @@ class TestRouting:
             ],
             edges=[Edge(src_node="a", src_slot=0, dst_node="b", dst_slot=0)],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         schedule = route(spatial, CompilerConfig())
 
         # a at (0,0), b at (1,0) — one hop east
@@ -41,7 +43,8 @@ class TestRouting:
                 Edge(src_node="b", src_slot=0, dst_node="c", dst_slot=0),
             ],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         schedule = route(spatial, CompilerConfig())
 
         # b at (1,0) forwards to c at (2,0)
@@ -58,7 +61,8 @@ class TestRouting:
             edges=[Edge(src_node="a", src_slot=0, dst_node="b", dst_slot=0)],
         )
         config = CompilerConfig(mesh_width=1, mesh_height=2)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
         # a at (0,0), b at (0,1) — one hop north
         schedule = route(spatial, config)
 
@@ -74,7 +78,8 @@ class TestRouting:
             ],
             edges=[Edge(src_node="a", src_slot=0, dst_node="b", dst_slot=0)],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         schedule = route(spatial, CompilerConfig())
 
         b_pe = next(pe for pe in schedule.pe_schedules if pe.coord == (1, 0))
@@ -96,7 +101,8 @@ class TestRouting:
                 Edge(src_node="b", src_slot=0, dst_node="c", dst_slot=1),
             ],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         schedule = route(spatial, CompilerConfig())
 
         input_names = {s.name for s in schedule.input_slots}
@@ -111,7 +117,8 @@ class TestRouting:
             ],
             edges=[Edge(src_node="a", src_slot=0, dst_node="b", dst_slot=0)],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         schedule = route(spatial, CompilerConfig())
 
         for pe in schedule.pe_schedules:
@@ -135,7 +142,8 @@ class TestRouting:
             ],
         )
         config = CompilerConfig(mesh_width=2, mesh_height=2)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
         schedule = route(spatial, config)
 
         # a at (0,0) -> d at (1,1): [East, North]
@@ -210,7 +218,8 @@ class TestLinearRouting:
         config = CompilerConfig(mesh_height=4)
         weights = self._make_linear_weights()
 
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
         # 4 PEs in schedule (vertical layout)
@@ -254,7 +263,8 @@ class TestLinearRouting:
         config = CompilerConfig(mesh_height=4)
         weights = self._make_linear_weights()
 
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
         W = weights["linear1"]["weight"]
@@ -283,7 +293,8 @@ class TestLinearRouting:
         config = CompilerConfig(mesh_height=4)
         weights = self._make_linear_weights()
 
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
         # 3 input slots, all named "linear1" (broadcast)
@@ -324,7 +335,8 @@ class TestMultiLayerRouting:
     def test_intermediate_collect_has_forward_tasks(self) -> None:
         graph = self._make_mlp_graph()
         config = CompilerConfig(mesh_height=4)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
         schedule = route(spatial, config, self._make_mlp_weights())
 
         # l1 collect at (0, 3) should have ConcatCollectForwardEntry tasks
@@ -345,7 +357,8 @@ class TestMultiLayerRouting:
     def test_terminal_collect_has_concat_tasks(self) -> None:
         graph = self._make_mlp_graph()
         config = CompilerConfig(mesh_height=4)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
         schedule = route(spatial, config, self._make_mlp_weights())
 
         # l2 collect at (1, 3) should have ConcatCollectEntry tasks (terminal)
@@ -358,7 +371,8 @@ class TestMultiLayerRouting:
         """Route from l1 collect (0,3) to l2 tiles: east then south."""
         graph = self._make_mlp_graph()
         config = CompilerConfig(mesh_height=4)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
         schedule = route(spatial, config, self._make_mlp_weights())
 
         l1_collect = next(p for p in schedule.pe_schedules if p.coord == (0, 3))
@@ -383,7 +397,8 @@ class TestMultiLayerRouting:
     def test_only_first_layer_has_input_slots(self) -> None:
         graph = self._make_mlp_graph()
         config = CompilerConfig(mesh_height=4)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
         schedule = route(spatial, config, self._make_mlp_weights())
 
         # Only l1 tile PEs are external inputs
@@ -396,7 +411,8 @@ class TestMultiLayerRouting:
         graph = self._make_mlp_graph()
         config = CompilerConfig(mesh_height=4)
         weights = self._make_mlp_weights()
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
         # l1 tiles at (0, 0)-(0, 2) have weights
@@ -432,7 +448,8 @@ class TestMultiLayerRouting:
             },
         }
         config = CompilerConfig(mesh_height=4)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
         l1_collect = next(p for p in schedule.pe_schedules if p.coord == (0, 3))

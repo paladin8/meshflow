@@ -7,10 +7,37 @@ from meshflow.compiler.graph_ir import OpType
 
 
 @dataclass
+class PlacedTileData:
+    """Typed data for a LINEAR tile PE."""
+
+    tile_index: int
+    tile_rows: int
+    fragment_offset: int
+    in_features: int
+    origin_id: str
+
+
+@dataclass
+class PlacedCollectData:
+    """Typed data for a COLLECT PE from a tiled operator group."""
+
+    num_fragments: int
+    total_rows: int
+    origin_id: str
+    activation: str | None = None
+
+
+PlacedNodeData = PlacedTileData | PlacedCollectData | None
+
+
+@dataclass
 class PlacedNode:
     id: str
     op: OpType
     coord: tuple[int, int]
+    data: PlacedNodeData = None
+    # DEPRECATED: attrs is kept temporarily for routing backward compat.
+    # Will be removed after routing is updated to use typed data.
     attrs: dict[str, Any] | None = None
 
 

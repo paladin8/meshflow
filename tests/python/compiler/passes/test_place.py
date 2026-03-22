@@ -3,7 +3,9 @@
 import pytest
 from meshflow.compiler import CompilerConfig
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
+from meshflow.compiler.passes.expand import expand
 from meshflow.compiler.passes.place import place
+from meshflow.compiler.spatial_ir import PlacedCollectData, PlacedTileData
 
 
 class TestPlacement:
@@ -19,19 +21,24 @@ class TestPlacement:
                 Edge(src_node="b", src_slot=0, dst_node="c", dst_slot=0),
             ],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
 
         assert spatial.width == 3
         assert spatial.height == 1
         coords = {n.id: n.coord for n in spatial.nodes}
         assert coords == {"a": (0, 0), "b": (1, 0), "c": (2, 0)}
+        # Passthrough nodes have no typed data
+        for n in spatial.nodes:
+            assert n.data is None
 
     def test_auto_sizing_nx1(self) -> None:
         graph = GraphIR(
             nodes=[Node(id=f"n{i}", op=OpType.FORWARD) for i in range(5)],
             edges=[],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         assert spatial.width == 5
         assert spatial.height == 1
 
@@ -50,7 +57,8 @@ class TestPlacement:
             ],
         )
         config = CompilerConfig(mesh_width=2, mesh_height=2)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
 
         assert spatial.width == 2
         assert spatial.height == 2
@@ -66,22 +74,25 @@ class TestPlacement:
             edges=[],
         )
         config = CompilerConfig(mesh_width=2, mesh_height=2)
+        expanded = expand(graph, config)
         with pytest.raises(ValueError, match="does not fit"):
-            place(graph, config)
+            place(expanded, config)
 
     def test_single_node(self) -> None:
         graph = GraphIR(
             nodes=[Node(id="x", op=OpType.COLLECT)],
             edges=[],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         assert spatial.width == 1
         assert spatial.height == 1
         assert spatial.nodes[0].coord == (0, 0)
 
     def test_empty_graph(self) -> None:
         graph = GraphIR(nodes=[], edges=[])
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         assert spatial.width == 1
         assert spatial.height == 1
         assert spatial.nodes == []
@@ -94,7 +105,8 @@ class TestPlacement:
             ],
             edges=[Edge(src_node="a", src_slot=0, dst_node="b", dst_slot=0)],
         )
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
         assert len(spatial.edges) == 1
         assert spatial.edges[0].src_node == "a"
         assert spatial.edges[0].dst_node == "b"
@@ -105,7 +117,7 @@ class TestPlacement:
             edges=[Edge(src_node="a", src_slot=0, dst_node="missing", dst_slot=0)],
         )
         with pytest.raises(ValueError, match="unknown destination node"):
-            place(graph, CompilerConfig())
+            expand(graph, CompilerConfig())
 
 
 class TestLinearPlacement:
@@ -124,7 +136,8 @@ class TestLinearPlacement:
     def test_linear_expands_to_tiles_and_collect(self) -> None:
         graph = self._make_linear_graph(in_f=4, out_f=6)
         config = CompilerConfig(mesh_height=4)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
 
         # 3 tile PEs + 1 collect = 4 placed nodes, vertical layout
         assert len(spatial.nodes) == 4
@@ -137,29 +150,31 @@ class TestLinearPlacement:
             assert tile.id == f"linear1_tile_{i}"
             assert tile.op == OpType.LINEAR
             assert tile.coord == (0, i)
-            assert tile.attrs is not None
-            assert tile.attrs["tile_index"] == i
-            assert tile.attrs["tile_rows"] == 2
-            assert tile.attrs["in_features"] == 4
-            assert tile.attrs["origin_id"] == "linear1"
+            assert isinstance(tile.data, PlacedTileData)
+            assert tile.data.tile_index == i
+            assert tile.data.tile_rows == 2
+            assert tile.data.in_features == 4
+            assert tile.data.origin_id == "linear1"
 
         # Last is collect PE at top of column
         collect = spatial.nodes[3]
         assert collect.id == "linear1_collect"
         assert collect.op == OpType.COLLECT
         assert collect.coord == (0, 3)
-        assert collect.attrs is not None
-        assert collect.attrs["num_fragments"] == 3
-        assert collect.attrs["total_rows"] == 6
+        assert isinstance(collect.data, PlacedCollectData)
+        assert collect.data.num_fragments == 3
+        assert collect.data.total_rows == 6
 
     def test_linear_generates_internal_edges(self) -> None:
         graph = self._make_linear_graph(in_f=4, out_f=6)
         config = CompilerConfig(mesh_height=4)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
 
-        # 3 edges: tile_0->collect, tile_1->collect, tile_2->collect
-        assert len(spatial.edges) == 3
-        for i, edge in enumerate(spatial.edges):
+        # 3 internal edges: tile_0->collect, tile_1->collect, tile_2->collect
+        internal_edges = [e for e in spatial.edges if e.dst_node == "linear1_collect"]
+        assert len(internal_edges) == 3
+        for i, edge in enumerate(internal_edges):
             assert edge.src_node == f"linear1_tile_{i}"
             assert edge.dst_node == "linear1_collect"
             assert edge.dst_slot == i
@@ -167,7 +182,8 @@ class TestLinearPlacement:
     def test_linear_auto_sizing(self) -> None:
         """Without explicit mesh_height, one PE per output row."""
         graph = self._make_linear_graph(in_f=2, out_f=3)
-        spatial = place(graph, CompilerConfig())
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
 
         # 3 tiles + 1 collect = 4 nodes, height=4 (vertical)
         assert len(spatial.nodes) == 4
@@ -180,7 +196,7 @@ class TestLinearPlacement:
             edges=[],
         )
         with pytest.raises(ValueError, match="requires attrs"):
-            place(graph, CompilerConfig())
+            expand(graph, CompilerConfig())
 
     def test_linear_uneven_tiling(self) -> None:
         """out_features=7 with 3 tiles uses base/remainder distribution."""
@@ -195,19 +211,23 @@ class TestLinearPlacement:
             edges=[],
         )
         config = CompilerConfig(mesh_height=4)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
 
         # 3 tiles: base=2, remainder=1 → tiles get [3, 2, 2] rows
         assert len(spatial.nodes) == 4
         tile0 = spatial.nodes[0]
         tile1 = spatial.nodes[1]
         tile2 = spatial.nodes[2]
-        assert tile0.attrs["tile_rows"] == 3
-        assert tile0.attrs["fragment_offset"] == 0
-        assert tile1.attrs["tile_rows"] == 2
-        assert tile1.attrs["fragment_offset"] == 3
-        assert tile2.attrs["tile_rows"] == 2
-        assert tile2.attrs["fragment_offset"] == 5
+        assert isinstance(tile0.data, PlacedTileData)
+        assert tile0.data.tile_rows == 3
+        assert tile0.data.fragment_offset == 0
+        assert isinstance(tile1.data, PlacedTileData)
+        assert tile1.data.tile_rows == 2
+        assert tile1.data.fragment_offset == 3
+        assert isinstance(tile2.data, PlacedTileData)
+        assert tile2.data.tile_rows == 2
+        assert tile2.data.fragment_offset == 5
 
 
 class TestMultiLayerPlacement:
@@ -225,7 +245,8 @@ class TestMultiLayerPlacement:
             ],
         )
         config = CompilerConfig(mesh_height=4)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
 
         # 2 columns: l1 (3 tiles + collect), l2 (3 tiles + collect)
         assert spatial.width == 2
@@ -247,15 +268,15 @@ class TestMultiLayerPlacement:
         placed_ids = {n.id for n in spatial.nodes}
         assert "r1" not in placed_ids
 
-        # l1 collect has activation and route_to attrs
+        # l1 collect has activation via typed data
         l1_collect = next(n for n in spatial.nodes if n.id == "l1_collect")
-        assert l1_collect.attrs["activation"] == "relu"
-        assert l1_collect.attrs["route_to"] == "l2"
+        assert isinstance(l1_collect.data, PlacedCollectData)
+        assert l1_collect.data.activation == "relu"
 
-        # l2 collect is terminal (no route_to)
+        # l2 collect is terminal (no activation)
         l2_collect = next(n for n in spatial.nodes if n.id == "l2_collect")
-        assert "route_to" not in l2_collect.attrs
-        assert "activation" not in l2_collect.attrs
+        assert isinstance(l2_collect.data, PlacedCollectData)
+        assert l2_collect.data.activation is None
 
     def test_relu_fused_no_placed_node(self) -> None:
         """RELU nodes don't produce placed nodes."""
@@ -270,7 +291,8 @@ class TestMultiLayerPlacement:
                 Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
             ],
         )
-        spatial = place(graph, CompilerConfig(mesh_height=4))
+        expanded = expand(graph, CompilerConfig(mesh_height=4))
+        spatial = place(expanded, CompilerConfig(mesh_height=4))
         # Only LINEAR tiles + collect PEs, no RELU PE
         assert all(n.op in (OpType.LINEAR, OpType.COLLECT) for n in spatial.nodes)
 
@@ -292,25 +314,26 @@ class TestMultiLayerPlacement:
             ],
         )
         config = CompilerConfig(mesh_height=4)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
 
         assert spatial.width == 3
         assert spatial.height == 4
 
-        # l1 collect has activation + route_to
+        # l1 collect has activation
         l1_collect = next(n for n in spatial.nodes if n.id == "l1_collect")
-        assert l1_collect.attrs["activation"] == "relu"
-        assert l1_collect.attrs["route_to"] == "l2"
+        assert isinstance(l1_collect.data, PlacedCollectData)
+        assert l1_collect.data.activation == "relu"
 
-        # l2 collect has activation + route_to
+        # l2 collect has activation
         l2_collect = next(n for n in spatial.nodes if n.id == "l2_collect")
-        assert l2_collect.attrs["activation"] == "relu"
-        assert l2_collect.attrs["route_to"] == "l3"
+        assert isinstance(l2_collect.data, PlacedCollectData)
+        assert l2_collect.data.activation == "relu"
 
         # l3 collect is terminal
         l3_collect = next(n for n in spatial.nodes if n.id == "l3_collect")
-        assert "route_to" not in l3_collect.attrs
-        assert "activation" not in l3_collect.attrs
+        assert isinstance(l3_collect.data, PlacedCollectData)
+        assert l3_collect.data.activation is None
 
     def test_linear_without_relu(self) -> None:
         """Direct Linear → Linear (no activation)."""
@@ -321,11 +344,12 @@ class TestMultiLayerPlacement:
             ],
             edges=[Edge(src_node="l1", src_slot=0, dst_node="l2", dst_slot=0)],
         )
-        spatial = place(graph, CompilerConfig(mesh_height=4))
+        expanded = expand(graph, CompilerConfig(mesh_height=4))
+        spatial = place(expanded, CompilerConfig(mesh_height=4))
 
         l1_collect = next(n for n in spatial.nodes if n.id == "l1_collect")
-        assert l1_collect.attrs["route_to"] == "l2"
-        assert "activation" not in l1_collect.attrs
+        assert isinstance(l1_collect.data, PlacedCollectData)
+        assert l1_collect.data.activation is None
 
     def test_uneven_tiling_different_layers(self) -> None:
         """Layers with different out_features get different tile counts."""
@@ -341,22 +365,26 @@ class TestMultiLayerPlacement:
             ],
         )
         config = CompilerConfig(mesh_height=4)
-        spatial = place(graph, config)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
 
         # l1: 7 features, 3 tiles → [3, 2, 2] rows
         l1_tiles = [n for n in spatial.nodes if n.id.startswith("l1_tile")]
         assert len(l1_tiles) == 3
-        assert l1_tiles[0].attrs["tile_rows"] == 3
-        assert l1_tiles[1].attrs["tile_rows"] == 2
-        assert l1_tiles[2].attrs["tile_rows"] == 2
+        assert isinstance(l1_tiles[0].data, PlacedTileData)
+        assert l1_tiles[0].data.tile_rows == 3
+        assert isinstance(l1_tiles[1].data, PlacedTileData)
+        assert l1_tiles[1].data.tile_rows == 2
+        assert isinstance(l1_tiles[2].data, PlacedTileData)
+        assert l1_tiles[2].data.tile_rows == 2
 
         # l2: 3 features, 3 tiles → [1, 1, 1] rows
         l2_tiles = [n for n in spatial.nodes if n.id.startswith("l2_tile")]
         assert len(l2_tiles) == 3
-        assert all(t.attrs["tile_rows"] == 1 for t in l2_tiles)
+        assert all(isinstance(t.data, PlacedTileData) and t.data.tile_rows == 1 for t in l2_tiles)
 
     def test_terminal_relu_placement(self) -> None:
-        """LINEAR → RELU at end of graph: collect gets activation but no route_to."""
+        """LINEAR → RELU at end of graph: collect gets activation but no next group."""
         graph = GraphIR(
             nodes=[
                 Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 6}),
@@ -364,13 +392,14 @@ class TestMultiLayerPlacement:
             ],
             edges=[Edge(src_node="l1", src_slot=0, dst_node="r1", dst_slot=0)],
         )
-        spatial = place(graph, CompilerConfig(mesh_height=4))
+        expanded = expand(graph, CompilerConfig(mesh_height=4))
+        spatial = place(expanded, CompilerConfig(mesh_height=4))
         l1_collect = next(n for n in spatial.nodes if n.id == "l1_collect")
-        assert l1_collect.attrs["activation"] == "relu"
-        assert "route_to" not in l1_collect.attrs
+        assert isinstance(l1_collect.data, PlacedCollectData)
+        assert l1_collect.data.activation == "relu"
 
-    def test_no_inter_layer_placed_edges(self) -> None:
-        """Inter-layer edges are not placed; routing pass handles them."""
+    def test_inter_layer_edges_explicit(self) -> None:
+        """Inter-layer edges are now explicit collect → next tiles."""
         graph = GraphIR(
             nodes=[
                 Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 6}),
@@ -382,8 +411,15 @@ class TestMultiLayerPlacement:
                 Edge(src_node="r1", src_slot=0, dst_node="l2", dst_slot=0),
             ],
         )
-        spatial = place(graph, CompilerConfig(mesh_height=4))
+        expanded = expand(graph, CompilerConfig(mesh_height=4))
+        spatial = place(expanded, CompilerConfig(mesh_height=4))
 
-        # Only internal tile→collect edges, no inter-layer edges
-        for edge in spatial.edges:
-            assert edge.dst_node.endswith("_collect"), f"unexpected edge: {edge}"
+        # Internal tile→collect edges exist
+        internal_edges = [e for e in spatial.edges if e.dst_node.endswith("_collect")]
+        assert len(internal_edges) == 6  # 3 for l1, 3 for l2
+
+        # Explicit inter-group edges: l1_collect → l2 tiles
+        inter_group_edges = [e for e in spatial.edges if e.src_node == "l1_collect"]
+        assert len(inter_group_edges) == 3
+        dest_ids = sorted(e.dst_node for e in inter_group_edges)
+        assert dest_ids == ["l2_tile_0", "l2_tile_1", "l2_tile_2"]
