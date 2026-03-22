@@ -92,14 +92,6 @@ def _place_linear_columns(expanded: ExpandedIR, config: CompilerConfig) -> Spati
 
         for spec in group.tiles:
             tile_id = f"{group.origin_id}_tile_{spec.tile_index}"
-            # Build attrs dict for routing backward compat (removed in Task 5)
-            tile_attrs = {
-                "tile_index": spec.tile_index,
-                "tile_rows": spec.tile_rows,
-                "fragment_offset": spec.fragment_offset,
-                "in_features": spec.in_features,
-                "origin_id": group.origin_id,
-            }
             node = PlacedNode(
                 id=tile_id,
                 op=OpType.LINEAR,
@@ -111,7 +103,6 @@ def _place_linear_columns(expanded: ExpandedIR, config: CompilerConfig) -> Spati
                     in_features=spec.in_features,
                     origin_id=group.origin_id,
                 ),
-                attrs=tile_attrs,
             )
             placed_nodes.append(node)
             tile_nodes.append(node)
@@ -119,17 +110,6 @@ def _place_linear_columns(expanded: ExpandedIR, config: CompilerConfig) -> Spati
         # Collect PE at top of column
         collect_row = len(group.tiles)
         collect_id = f"{group.origin_id}_collect"
-
-        # Build collect attrs for routing backward compat (removed in Task 5)
-        collect_attrs: dict = {
-            "num_fragments": group.collect.num_fragments,
-            "total_rows": group.collect.total_rows,
-            "origin_id": group.origin_id,
-        }
-        if group.collect.activation is not None:
-            collect_attrs["activation"] = group.collect.activation
-        if group.next_group is not None:
-            collect_attrs["route_to"] = group.next_group
 
         collect_node = PlacedNode(
             id=collect_id,
@@ -141,7 +121,6 @@ def _place_linear_columns(expanded: ExpandedIR, config: CompilerConfig) -> Spati
                 origin_id=group.origin_id,
                 activation=group.collect.activation,
             ),
-            attrs=collect_attrs,
         )
         placed_nodes.append(collect_node)
 

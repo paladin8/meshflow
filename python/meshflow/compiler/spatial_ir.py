@@ -1,7 +1,6 @@
 """Spatial IR — graph with placement (each node assigned a PE coordinate)."""
 
 from dataclasses import dataclass
-from typing import Any
 
 from meshflow.compiler.graph_ir import OpType
 
@@ -36,9 +35,6 @@ class PlacedNode:
     op: OpType
     coord: tuple[int, int]
     data: PlacedNodeData = None
-    # DEPRECATED: attrs is kept temporarily for routing backward compat.
-    # Will be removed after routing is updated to use typed data.
-    attrs: dict[str, Any] | None = None
 
 
 @dataclass
