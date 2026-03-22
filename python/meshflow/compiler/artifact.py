@@ -107,7 +107,9 @@ class RuntimeProgram:
 def serialize(program: RuntimeProgram) -> bytes:
     """Serialize a RuntimeProgram to MessagePack bytes (named-field map style)."""
     data = _program_to_dict(program)
-    return msgpack.packb(data, use_bin_type=True)
+    result = msgpack.packb(data, use_bin_type=True)
+    assert result is not None
+    return result
 
 
 def deserialize(data: bytes) -> RuntimeProgram:

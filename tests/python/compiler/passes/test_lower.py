@@ -1,6 +1,7 @@
 """Tests for the lowering pass."""
 
 from meshflow.compiler import CompilerConfig, compile
+from meshflow.compiler.artifact import ForwardActivationTask
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
 from meshflow.compiler.passes.expand import expand
 from meshflow.compiler.passes.lower import lower
@@ -44,6 +45,7 @@ class TestLowering:
 
         a_prog = next(pe for pe in program.pe_programs if pe.coord == (0, 0))
         task = a_prog.tasks[0]
+        assert isinstance(task, ForwardActivationTask)
         assert task.route_hops == ["east"]
 
     def test_lower_empty_initial_sram(self) -> None:
