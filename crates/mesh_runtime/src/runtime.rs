@@ -5,7 +5,7 @@ use crate::event::{EventKind, EventQueue};
 use crate::mesh::Mesh;
 use crate::message::{Message, SlotId};
 use crate::pe::{TaskConfig, TaskKind};
-use crate::profiling::ProfileSummary;
+use crate::profiling::{OperatorTiming, ProfileSummary, TraceEvent, TraceEventKind};
 use crate::route::generate_route_xy;
 
 /// Simulator configuration.
@@ -73,6 +73,10 @@ pub struct Simulator {
     outputs: HashMap<Coord, Vec<f32>>,
     profile: ProfileSummary,
     next_message_id: u64,
+    /// Current pending DeliverMessage event count per PE.
+    pending_counts: HashMap<Coord, u64>,
+    /// Peak pending count per PE (written to PeCounters at end).
+    max_pending: HashMap<Coord, u64>,
 }
 
 impl Simulator {
@@ -83,6 +87,8 @@ impl Simulator {
             outputs: HashMap::new(),
             profile: ProfileSummary::new(),
             next_message_id: 0,
+            pending_counts: HashMap::new(),
+            max_pending: HashMap::new(),
             config,
         }
     }
@@ -149,8 +155,53 @@ impl Simulator {
         // Enqueue at the source PE at timestamp 0.
         // If same-PE (empty hops), the event loop will detect is_arrived()
         // and do final delivery. Otherwise it will forward hop by hop.
+        // Note: no trace event for injection — it's setup, not a runtime send.
+        self.track_enqueue(msg.source);
         self.queue
             .push(0, msg.source, EventKind::DeliverMessage { message });
+    }
+
+    /// Track a DeliverMessage enqueue for pending depth counting.
+    fn track_enqueue(&mut self, coord: Coord) {
+        let count = self.pending_counts.entry(coord).or_insert(0);
+        *count += 1;
+        let max = self.max_pending.entry(coord).or_insert(0);
+        if *count > *max {
+            *max = *count;
+        }
+    }
+
+    /// Enqueue a DeliverMessage event with full profiling:
+    /// pending depth tracking + MessageSend trace event.
+    ///
+    /// Use this for all runtime message sends. `inject_message` is the
+    /// only caller that bypasses this (setup, not a runtime event).
+    fn enqueue_deliver(
+        &mut self,
+        timestamp: u64,
+        target: Coord,
+        source_coord: Coord,
+        message: Message,
+    ) {
+        self.track_enqueue(target);
+
+        // Trace event
+        self.profile.trace_events.push(TraceEvent {
+            timestamp,
+            coord: source_coord,
+            kind: TraceEventKind::MessageSend,
+            detail: format!("({},{})", message.dest.x, message.dest.y),
+        });
+
+        self.queue
+            .push(timestamp, target, EventKind::DeliverMessage { message });
+    }
+
+    /// Track a DeliverMessage dequeue for pending depth counting.
+    fn track_dequeue(&mut self, coord: Coord) {
+        if let Some(count) = self.pending_counts.get_mut(&coord) {
+            *count = count.saturating_sub(1);
+        }
     }
 
     /// Run the simulation to completion and return results.
@@ -162,6 +213,13 @@ impl Simulator {
 
             match event.kind {
                 EventKind::DeliverMessage { mut message } => {
+                    self.track_dequeue(event.coord);
+                    self.profile.trace_events.push(TraceEvent {
+                        timestamp: event.timestamp,
+                        coord: event.coord,
+                        kind: TraceEventKind::MessageDeliver,
+                        detail: format!("({},{})", message.dest.x, message.dest.y),
+                    });
                     self.process_deliver(event.timestamp, event.coord, &mut message);
                 }
                 EventKind::ExecuteTask { task_index } => {
@@ -171,6 +229,12 @@ impl Simulator {
 
             self.profile.total_events_processed += 1;
             self.profile.final_timestamp = event.timestamp;
+        }
+
+        // Merge max_pending into PeCounters before collecting
+        for (coord, max_depth) in &self.max_pending {
+            let pe = self.mesh.pe_mut(*coord);
+            pe.counters.max_queue_depth = *max_depth;
         }
 
         // Collect per-PE counters into profile summary
@@ -206,17 +270,23 @@ impl Simulator {
 
             pe.counters.messages_sent += 1;
 
+            // Track link usage
+            *self
+                .profile
+                .link_counts
+                .entry((coord, neighbor))
+                .or_insert(0) += 1;
+
             // Move message into the next event
             let forwarded = std::mem::take(&mut message.payload);
             let mut new_message = message.clone();
             new_message.payload = forwarded;
 
-            self.queue.push(
+            self.enqueue_deliver(
                 timestamp + self.config.hop_latency,
                 neighbor,
-                EventKind::DeliverMessage {
-                    message: new_message,
-                },
+                coord,
+                new_message,
             );
         } else {
             // FINAL DELIVERY: write payload to SRAM, trigger tasks
@@ -245,6 +315,21 @@ impl Simulator {
         // Clone the task to avoid borrow conflicts with the PE
         let task = self.mesh.pe(coord).tasks[task_index].kind.clone();
 
+        // Record operator timing and trace event
+        let task_kind_str = task.to_string();
+        self.profile.operator_timings.push(OperatorTiming {
+            task_kind: task_kind_str.clone(),
+            coord,
+            start_ts: timestamp,
+            end_ts: timestamp + self.config.task_base_latency,
+        });
+        self.profile.trace_events.push(TraceEvent {
+            timestamp,
+            coord,
+            kind: TraceEventKind::TaskExecute,
+            detail: task_kind_str,
+        });
+
         match task {
             TaskKind::ForwardActivation {
                 input_slot,
@@ -271,8 +356,7 @@ impl Simulator {
 
                 // Enqueue at current PE — the event loop will forward or
                 // deliver locally depending on whether hops is empty.
-                self.queue
-                    .push(timestamp, coord, EventKind::DeliverMessage { message });
+                self.enqueue_deliver(timestamp, coord, coord, message);
             }
             TaskKind::CollectOutput { input_slot } => {
                 let pe = self.mesh.pe_mut(coord);
@@ -325,8 +409,7 @@ impl Simulator {
                 };
                 self.next_message_id += 1;
 
-                self.queue
-                    .push(timestamp, coord, EventKind::DeliverMessage { message });
+                self.enqueue_deliver(timestamp, coord, coord, message);
             }
             TaskKind::ConcatCollect {
                 num_fragments,
@@ -370,9 +453,11 @@ impl Simulator {
 
                     // Broadcast to next layer's tile PEs with send serialization:
                     // each send costs 1 time unit.
-                    let pe = self.mesh.pe_mut(coord);
+                    // Update PE counters first to avoid borrow conflicts.
+                    let num_sends = route_dests.len() as u64;
+                    self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
+
                     for (i, (dest, hops)) in route_dests.iter().enumerate() {
-                        pe.counters.messages_sent += 1;
                         let send_time = timestamp + self.config.task_base_latency + i as u64;
                         let message = Message {
                             id: self.next_message_id,
@@ -385,8 +470,7 @@ impl Simulator {
                             timestamp: send_time,
                         };
                         self.next_message_id += 1;
-                        self.queue
-                            .push(send_time, coord, EventKind::DeliverMessage { message });
+                        self.enqueue_deliver(send_time, coord, coord, message);
                     }
                 }
             }
@@ -683,6 +767,155 @@ mod tests {
         assert_eq!(result.profile.total_events_processed, 5);
         // Message should NOT have been fully delivered
         assert!(result.outputs.is_empty());
+    }
+
+    #[test]
+    fn link_counts_tracked() {
+        // Message: (0,0) -> (2,0), hops through (0,0)->(1,0)->(2,0)
+        let mut s = sim(3, 1);
+        s.add_task(InjectTask {
+            coord: Coord::new(2, 0),
+            kind: InjectTaskKind::CollectOutput { input_slot: 0 },
+            trigger_slot: 0,
+        });
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(2, 0),
+            payload: vec![1.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+
+        // Two links traversed: (0,0)->(1,0) and (1,0)->(2,0)
+        assert_eq!(
+            result
+                .profile
+                .link_counts
+                .get(&(Coord::new(0, 0), Coord::new(1, 0))),
+            Some(&1)
+        );
+        assert_eq!(
+            result
+                .profile
+                .link_counts
+                .get(&(Coord::new(1, 0), Coord::new(2, 0))),
+            Some(&1)
+        );
+        assert_eq!(result.profile.link_counts.len(), 2);
+    }
+
+    #[test]
+    fn operator_timings_recorded() {
+        // Forward -> Collect chain: should record 2 operator timings
+        let mut s = sim(3, 1);
+        s.add_task(InjectTask {
+            coord: Coord::new(0, 0),
+            kind: InjectTaskKind::ForwardActivation {
+                input_slot: 0,
+                route_dest: Coord::new(2, 0),
+            },
+            trigger_slot: 0,
+        });
+        s.add_task(InjectTask {
+            coord: Coord::new(2, 0),
+            kind: InjectTaskKind::CollectOutput { input_slot: 0 },
+            trigger_slot: 0,
+        });
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![1.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+
+        assert_eq!(result.profile.operator_timings.len(), 2);
+
+        let fwd = &result.profile.operator_timings[0];
+        assert_eq!(fwd.task_kind, "forward_activation");
+        assert_eq!(fwd.coord, Coord::new(0, 0));
+        assert!(fwd.end_ts > fwd.start_ts);
+
+        let collect = &result.profile.operator_timings[1];
+        assert_eq!(collect.task_kind, "collect_output");
+        assert_eq!(collect.coord, Coord::new(2, 0));
+    }
+
+    #[test]
+    fn trace_events_recorded() {
+        // Single hop: (0,0) -> (1,0) with collect
+        let mut s = sim(2, 1);
+        s.add_task(InjectTask {
+            coord: Coord::new(1, 0),
+            kind: InjectTaskKind::CollectOutput { input_slot: 0 },
+            trigger_slot: 0,
+        });
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(1, 0),
+            payload: vec![1.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+
+        // Should have trace events for: deliver@(0,0), send@(0,0), deliver@(1,0), execute@(1,0)
+        use crate::profiling::TraceEventKind;
+        let delivers: Vec<_> = result
+            .profile
+            .trace_events
+            .iter()
+            .filter(|e| e.kind == TraceEventKind::MessageDeliver)
+            .collect();
+        let sends: Vec<_> = result
+            .profile
+            .trace_events
+            .iter()
+            .filter(|e| e.kind == TraceEventKind::MessageSend)
+            .collect();
+        let executes: Vec<_> = result
+            .profile
+            .trace_events
+            .iter()
+            .filter(|e| e.kind == TraceEventKind::TaskExecute)
+            .collect();
+
+        assert_eq!(delivers.len(), 2); // intermediate + final
+        assert_eq!(sends.len(), 1); // forwarded from (0,0) to (1,0)
+        assert_eq!(executes.len(), 1); // collect task
+        assert_eq!(executes[0].detail, "collect_output");
+    }
+
+    #[test]
+    fn max_queue_depth_tracked() {
+        // Two messages targeting the same PE injected at t=0
+        let mut s = sim(2, 1);
+        s.add_task(InjectTask {
+            coord: Coord::new(1, 0),
+            kind: InjectTaskKind::CollectOutput { input_slot: 0 },
+            trigger_slot: 0,
+        });
+        // Both messages go to (1,0) via 1 hop from (0,0)
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(1, 0),
+            payload: vec![1.0],
+            payload_slot: 0,
+        });
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(1, 0),
+            payload: vec![2.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+
+        // (0,0) had 2 pending DeliverMessage events at injection time
+        let pe00 = result.profile.per_pe.get(&Coord::new(0, 0)).unwrap();
+        assert_eq!(pe00.max_queue_depth, 2);
     }
 
     #[test]

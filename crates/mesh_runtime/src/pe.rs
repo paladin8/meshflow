@@ -96,6 +96,18 @@ pub enum TaskKind {
     },
 }
 
+impl std::fmt::Display for TaskKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskKind::ForwardActivation { .. } => write!(f, "forward_activation"),
+            TaskKind::CollectOutput { .. } => write!(f, "collect_output"),
+            TaskKind::Linear { .. } => write!(f, "linear"),
+            TaskKind::ConcatCollect { .. } => write!(f, "concat_collect"),
+            TaskKind::ConcatCollectForward { .. } => write!(f, "concat_collect_forward"),
+        }
+    }
+}
+
 impl PE {
     pub fn new(coord: Coord) -> Self {
         Self {
