@@ -163,6 +163,8 @@ pub struct PeStats {
     pub tasks_executed: u64,
     #[pyo3(get)]
     pub slots_written: u64,
+    #[pyo3(get)]
+    pub max_queue_depth: u64,
 }
 
 /// Simulation result returned to Python.
@@ -183,6 +185,12 @@ pub struct SimResult {
     pub final_timestamp: u64,
     #[pyo3(get)]
     pub pe_stats: PyObject,
+    #[pyo3(get)]
+    pub trace_events: PyObject,
+    #[pyo3(get)]
+    pub operator_timings: PyObject,
+    #[pyo3(get)]
+    pub link_counts: PyObject,
 }
 
 /// Run a simulation with the given configuration and inputs.
@@ -258,8 +266,38 @@ fn sim_result_to_py(py: Python<'_>, result: crate::runtime::SimResult) -> PyResu
             messages_sent: counters.messages_sent,
             tasks_executed: counters.tasks_executed,
             slots_written: counters.slots_written,
+            max_queue_depth: counters.max_queue_depth,
         };
         pe_stats_dict.set_item(key, stats.into_pyobject(py)?)?;
+    }
+
+    // Convert trace events: Vec<TraceEvent> -> list[dict]
+    let trace_list = pyo3::types::PyList::empty(py);
+    for event in &result.profile.trace_events {
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("timestamp", event.timestamp)?;
+        d.set_item("coord", (event.coord.x, event.coord.y))?;
+        d.set_item("kind", event.kind.to_string())?;
+        d.set_item("detail", &event.detail)?;
+        trace_list.append(d)?;
+    }
+
+    // Convert operator timings: Vec<OperatorTiming> -> list[dict]
+    let timings_list = pyo3::types::PyList::empty(py);
+    for timing in &result.profile.operator_timings {
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("task_kind", &timing.task_kind)?;
+        d.set_item("coord", (timing.coord.x, timing.coord.y))?;
+        d.set_item("start_ts", timing.start_ts)?;
+        d.set_item("end_ts", timing.end_ts)?;
+        timings_list.append(d)?;
+    }
+
+    // Convert link counts: HashMap<(Coord, Coord), u64> -> dict[((x1,y1),(x2,y2)), count]
+    let link_counts_dict = pyo3::types::PyDict::new(py);
+    for ((from, to), count) in &result.profile.link_counts {
+        let key = ((from.x, from.y), (to.x, to.y));
+        link_counts_dict.set_item(key, *count)?;
     }
 
     Ok(SimResult {
@@ -270,6 +308,9 @@ fn sim_result_to_py(py: Python<'_>, result: crate::runtime::SimResult) -> PyResu
         total_tasks_executed: result.profile.total_tasks_executed,
         final_timestamp: result.profile.final_timestamp,
         pe_stats: pe_stats_dict.into(),
+        trace_events: trace_list.into(),
+        operator_timings: timings_list.into(),
+        link_counts: link_counts_dict.into(),
     })
 }
 
