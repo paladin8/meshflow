@@ -9,8 +9,12 @@ from meshflow.compiler import compile
 from meshflow.compiler.artifact import RuntimeProgram, serialize
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
 from meshflow.viz.contention import route_contention
+from meshflow.viz.dump import dump_all
 from meshflow.viz.heatmap import pe_heatmap
+from meshflow.viz.latency import operator_latency
+from meshflow.viz.queue import queue_depth
 from meshflow.viz.sram import sram_usage
+from meshflow.viz.timeline import event_timeline
 
 
 def _run_simple() -> tuple[object, RuntimeProgram]:
@@ -125,3 +129,62 @@ class TestRouteContention:
         )
         assert out.exists()
         assert out.stat().st_size > 0
+
+
+class TestOperatorLatency:
+    def test_produces_png(self, tmp_path: Path) -> None:
+        result, _ = _run_linear()
+        out = operator_latency(result, output_path=tmp_path / "latency.png")
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_simple_graph(self, tmp_path: Path) -> None:
+        result, _ = _run_simple()
+        out = operator_latency(result, output_path=tmp_path / "latency_simple.png")
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+
+class TestQueueDepth:
+    def test_produces_png(self, tmp_path: Path) -> None:
+        result, _ = _run_linear()
+        out = queue_depth(result, output_path=tmp_path / "queue.png")
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_simple_graph(self, tmp_path: Path) -> None:
+        result, _ = _run_simple()
+        out = queue_depth(result, output_path=tmp_path / "queue_simple.png")
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+
+class TestEventTimeline:
+    def test_produces_png(self, tmp_path: Path) -> None:
+        result, _ = _run_linear()
+        out = event_timeline(result, output_path=tmp_path / "timeline.png")
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_simple_graph(self, tmp_path: Path) -> None:
+        result, _ = _run_simple()
+        out = event_timeline(result, output_path=tmp_path / "timeline_simple.png")
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+
+class TestDumpAll:
+    def test_produces_all_six(self, tmp_path: Path) -> None:
+        result, program = _run_linear()
+        paths = dump_all(result, program, output_dir=tmp_path)
+        assert len(paths) == 6
+        for p in paths:
+            assert p.exists()
+            assert p.stat().st_size > 0
+
+    def test_simple_graph(self, tmp_path: Path) -> None:
+        result, program = _run_simple()
+        paths = dump_all(result, program, output_dir=tmp_path)
+        assert len(paths) == 6
+        for p in paths:
+            assert p.exists()
