@@ -43,6 +43,7 @@ class PeStats:
     messages_sent: int
     tasks_executed: int
     slots_written: int
+    max_queue_depth: int
 
 class SimResult:
     outputs: dict[tuple[int, int], list[float]]
@@ -52,6 +53,9 @@ class SimResult:
     total_tasks_executed: int
     final_timestamp: int
     pe_stats: dict[tuple[int, int], PeStats]
+    trace_events: list[dict[str, object]]
+    operator_timings: list[dict[str, object]]
+    link_counts: dict[tuple[tuple[int, int], tuple[int, int]], int]
 
 def run_simulation(config: MeshConfig, inputs: SimInput) -> SimResult: ...
 def run_program(program_bytes: bytes, inputs: dict[str, list[float]]) -> SimResult: ...
