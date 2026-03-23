@@ -164,4 +164,6 @@ def _build_config(req: CompileRequest) -> CompilerConfig:
             config.mesh_height = req.config.mesh_height
         if req.config.mesh_width is not None:
             config.mesh_width = req.config.mesh_width
+        if req.config.sram_capacity_bytes is not None:
+            config.sram_capacity_bytes = req.config.sram_capacity_bytes
     return config

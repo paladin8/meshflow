@@ -35,6 +35,8 @@ struct PEProgram {
     coord: (u32, u32),
     tasks: Vec<TaskProgram>,
     initial_sram: HashMap<u32, Vec<f32>>,
+    #[serde(default)]
+    sram_capacity_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +126,7 @@ struct PEConfig {
     coord: Coord,
     tasks: Vec<TaskConfig>,
     initial_sram: HashMap<SlotId, Vec<f32>>,
+    sram_capacity_bytes: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -173,6 +176,7 @@ pub fn load_program(bytes: &[u8]) -> Result<LoadedProgram, ProgramError> {
             coord,
             tasks,
             initial_sram,
+            sram_capacity_bytes: pe.sram_capacity_bytes,
         });
     }
 
@@ -207,8 +211,12 @@ impl LoadedProgram {
     ) -> Result<SimResult, ProgramError> {
         let mut sim = Simulator::new(self.config.clone());
 
-        // Configure tasks on PEs
+        // Configure tasks and SRAM capacity on PEs
         for pe_config in &self.pe_configs {
+            if let Some(cap) = pe_config.sram_capacity_bytes {
+                sim.set_sram_capacity(pe_config.coord, cap);
+            }
+
             for task in &pe_config.tasks {
                 sim.add_task_direct(pe_config.coord, task.clone());
             }

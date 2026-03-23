@@ -36,7 +36,7 @@ pub struct PE {
     pub input_queue: VecDeque<Message>,
     /// Task configurations assigned to this PE.
     pub tasks: Vec<TaskConfig>,
-    /// Optional capacity limit in bytes (not enforced in M1).
+    /// Optional capacity limit in bytes. Panics on write if exceeded.
     pub sram_capacity_bytes: Option<usize>,
     /// Profiling counters.
     pub counters: PeCounters,
@@ -109,8 +109,29 @@ impl PE {
     }
 
     /// Write data to an SRAM slot (insert or overwrite).
+    ///
+    /// Panics if the write would cause total SRAM usage to exceed the
+    /// configured `sram_capacity_bytes` limit.
     pub fn write_slot(&mut self, slot: SlotId, data: Vec<f32>) {
         self.sram.insert(slot, data);
+
+        if let Some(limit) = self.sram_capacity_bytes {
+            let used = self.sram_used_bytes();
+            if used > limit {
+                panic!(
+                    "PE {}: SRAM capacity exceeded ({} bytes used, {} byte limit)",
+                    self.coord, used, limit
+                );
+            }
+        }
+    }
+
+    /// Total SRAM usage in bytes across all slots.
+    pub fn sram_used_bytes(&self) -> usize {
+        self.sram
+            .values()
+            .map(|v| v.len() * std::mem::size_of::<f32>())
+            .sum()
     }
 
     /// Read data from an SRAM slot. Panics if the slot does not exist
@@ -189,6 +210,52 @@ mod tests {
         assert!(!pe.has_slot(0));
         pe.write_slot(0, vec![]);
         assert!(pe.has_slot(0));
+    }
+
+    #[test]
+    fn sram_capacity_enforced() {
+        let mut pe = make_pe();
+        // 3 floats * 4 bytes = 12 bytes; set limit to 16
+        pe.sram_capacity_bytes = Some(16);
+        pe.write_slot(0, vec![1.0, 2.0, 3.0]); // 12 bytes — fits
+        pe.write_slot(1, vec![4.0]); // +4 = 16 bytes — fits exactly
+    }
+
+    #[test]
+    #[should_panic(expected = "SRAM capacity exceeded")]
+    fn sram_capacity_exceeded_panics() {
+        let mut pe = make_pe();
+        pe.sram_capacity_bytes = Some(16);
+        pe.write_slot(0, vec![1.0, 2.0, 3.0]); // 12 bytes
+        pe.write_slot(1, vec![4.0, 5.0]); // +8 = 20 bytes — exceeds 16
+    }
+
+    #[test]
+    fn sram_overwrite_reclaims_space() {
+        let mut pe = make_pe();
+        pe.sram_capacity_bytes = Some(16);
+        pe.write_slot(0, vec![1.0, 2.0, 3.0]); // 12 bytes
+        pe.write_slot(0, vec![1.0]); // overwrite: now 4 bytes
+        pe.write_slot(1, vec![2.0, 3.0, 4.0]); // +12 = 16 bytes — fits
+    }
+
+    #[test]
+    fn sram_no_limit_allows_any_size() {
+        let mut pe = make_pe();
+        // sram_capacity_bytes is None by default
+        pe.write_slot(0, vec![0.0; 100_000]); // should not panic
+    }
+
+    #[test]
+    fn sram_used_bytes() {
+        let mut pe = make_pe();
+        assert_eq!(pe.sram_used_bytes(), 0);
+        pe.write_slot(0, vec![1.0, 2.0]); // 8 bytes
+        assert_eq!(pe.sram_used_bytes(), 8);
+        pe.write_slot(1, vec![3.0]); // +4 = 12 bytes
+        assert_eq!(pe.sram_used_bytes(), 12);
+        pe.remove_slot(0);
+        assert_eq!(pe.sram_used_bytes(), 4);
     }
 
     #[test]

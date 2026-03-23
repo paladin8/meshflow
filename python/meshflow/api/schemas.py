@@ -31,6 +31,7 @@ class ConfigInput(BaseModel):
     routing: str | None = None
     mesh_height: int | None = None
     mesh_width: int | None = None
+    sram_capacity_bytes: int | None = None
 
 
 class CompileRequest(BaseModel):

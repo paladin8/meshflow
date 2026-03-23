@@ -12,6 +12,7 @@ from meshflow.compiler.artifact import (
     RuntimeProgram,
     TaskProgram,
 )
+from meshflow.compiler.config import CompilerConfig
 from meshflow.compiler.schedule_ir import (
     CollectOutputEntry,
     ConcatCollectEntry,
@@ -69,8 +70,11 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
     raise ValueError(f"unknown task entry type: {type(task)!r}")
 
 
-def lower(schedule: ScheduleIR) -> RuntimeProgram:
+def lower(schedule: ScheduleIR, config: CompilerConfig | None = None) -> RuntimeProgram:
     """Lower a ScheduleIR into a RuntimeProgram artifact."""
+    if config is None:
+        config = CompilerConfig()
+
     mesh_config = MeshProgramConfig(
         width=schedule.width,
         height=schedule.height,
@@ -81,6 +85,7 @@ def lower(schedule: ScheduleIR) -> RuntimeProgram:
             coord=pe.coord,
             tasks=[_lower_task(task) for task in pe.tasks],
             initial_sram=pe.initial_sram,
+            sram_capacity_bytes=config.sram_capacity_bytes,
         )
         for pe in schedule.pe_schedules
     ]

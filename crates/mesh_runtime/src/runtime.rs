@@ -117,6 +117,11 @@ impl Simulator {
         self.mesh.pe_mut(coord).tasks.push(task);
     }
 
+    /// Set SRAM capacity limit on a PE.
+    pub fn set_sram_capacity(&mut self, coord: Coord, capacity_bytes: usize) {
+        self.mesh.pe_mut(coord).sram_capacity_bytes = Some(capacity_bytes);
+    }
+
     /// Write data to a PE's SRAM slot. Used for pre-loading weights
     /// from a compiled artifact.
     pub fn write_sram(&mut self, coord: Coord, slot: SlotId, data: Vec<f32>) {

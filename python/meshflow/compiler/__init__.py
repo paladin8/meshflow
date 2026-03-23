@@ -40,7 +40,7 @@ def compile(
     expanded = expand(graph, config)
     spatial = place(expanded, config)
     schedule = route(spatial, config, weights)
-    return lower(schedule)
+    return lower(schedule, config)
 
 
 def _validate_weights(

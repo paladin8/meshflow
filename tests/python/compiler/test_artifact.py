@@ -98,6 +98,22 @@ class TestSerializationRoundTrip:
         assert restored.pe_programs[0].initial_sram == {0: [1.0, 2.0, 3.0], 1: [4.0, 5.0]}
         assert restored.pe_programs[1].initial_sram == {}
 
+    def test_round_trip_sram_capacity(self) -> None:
+        """Verify sram_capacity_bytes round-trips correctly."""
+        program = RuntimeProgram(
+            version=1,
+            mesh_config=MeshProgramConfig(width=2, height=1),
+            pe_programs=[
+                PEProgram(coord=(0, 0), tasks=[], sram_capacity_bytes=65536),
+                PEProgram(coord=(1, 0), tasks=[], sram_capacity_bytes=None),
+            ],
+            input_slots=[],
+        )
+        restored = deserialize(serialize(program))
+
+        assert restored.pe_programs[0].sram_capacity_bytes == 65536
+        assert restored.pe_programs[1].sram_capacity_bytes is None
+
     def test_serialized_bytes_are_msgpack(self) -> None:
         import msgpack
 

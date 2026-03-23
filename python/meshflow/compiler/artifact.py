@@ -87,6 +87,7 @@ class PEProgram:
     coord: tuple[int, int]
     tasks: list[TaskProgram]
     initial_sram: dict[int, list[float]] = field(default_factory=dict)
+    sram_capacity_bytes: int | None = None
 
 
 @dataclass
@@ -138,6 +139,7 @@ def _program_to_dict(program: RuntimeProgram) -> dict[str, Any]:
                 "coord": list(pe.coord),
                 "tasks": [_task_to_dict(task) for task in pe.tasks],
                 "initial_sram": {k: v for k, v in pe.initial_sram.items()},
+                "sram_capacity_bytes": pe.sram_capacity_bytes,
             }
             for pe in program.pe_programs
         ],
@@ -197,6 +199,7 @@ def _dict_to_program(raw: dict[str, Any]) -> RuntimeProgram:
             coord=tuple(pe["coord"]),  # type: ignore[arg-type]
             tasks=[_dict_to_task(task) for task in pe["tasks"]],
             initial_sram={int(k): v for k, v in pe["initial_sram"].items()},
+            sram_capacity_bytes=pe.get("sram_capacity_bytes"),
         )
         for pe in raw["pe_programs"]
     ]

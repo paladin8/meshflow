@@ -18,3 +18,4 @@ class CompilerConfig:
     routing: RoutingStrategy = RoutingStrategy.DIMENSION_ORDERED_XY
     mesh_width: int | None = None
     mesh_height: int | None = None
+    sram_capacity_bytes: int = 65536  # 64 KB per PE

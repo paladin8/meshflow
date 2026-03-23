@@ -71,3 +71,27 @@ class TestLowering:
         assert program.mesh_config.hop_latency == 1
         assert program.mesh_config.task_base_latency == 1
         assert program.mesh_config.max_events == 100_000
+
+    def test_lower_sram_capacity_from_config(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="a", op=OpType.COLLECT)],
+            edges=[],
+        )
+        config = CompilerConfig(sram_capacity_bytes=32768)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config)
+        program = lower(schedule, config)
+
+        for pe in program.pe_programs:
+            assert pe.sram_capacity_bytes == 32768
+
+    def test_lower_default_sram_capacity(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="a", op=OpType.COLLECT)],
+            edges=[],
+        )
+        program = compile(graph)
+
+        for pe in program.pe_programs:
+            assert pe.sram_capacity_bytes == 65536
