@@ -1,9 +1,15 @@
 """Expansion pass — expands operator nodes into physical PE group structures."""
 
+from typing import Any
+
 from meshflow.compiler.config import CompilerConfig
 from meshflow.compiler.expanded_ir import (
+    AttentionGroup,
     CollectSpec,
     ExpandedIR,
+    NodeExpansion,
+    PassthroughGroup,
+    RmsNormGroup,
     TiledComputeGroup,
     TileSpec,
 )
@@ -15,33 +21,129 @@ def expand(graph: GraphIR, config: CompilerConfig) -> ExpandedIR:
 
     LINEAR nodes become TiledComputeGroups (tiles + collect).
     Activation nodes following LINEAR are fused onto the collect spec.
-    FORWARD/COLLECT nodes pass through unchanged.
+    FORWARD/COLLECT nodes become PassthroughGroups.
+    Transformer ops (MATMUL, SOFTMAX, RMSNORM, ADD) expand into
+    their respective group types.
     """
     graph.validate()
     topo_order = graph.topological_order()
     node_map = {n.id: n for n in graph.nodes}
 
-    has_linear = any(node_map[nid].op == OpType.LINEAR for nid in topo_order)
+    # Detect fusion pairs
+    fused_activations = _detect_relu_fusions(graph, topo_order, node_map)
+    attention_chains = _detect_attention_chains(graph, topo_order, node_map)
+    fused_nodes: set[str] = set()
+    fused_nodes.update(fused_activations.values())
+    for chain_info in attention_chains.values():
+        if chain_info["softmax_id"]:
+            fused_nodes.add(chain_info["softmax_id"])
+        if chain_info["av_matmul_id"]:
+            fused_nodes.add(chain_info["av_matmul_id"])
 
-    if has_linear:
-        return _expand_linear(graph, config, topo_order, node_map)
-    else:
-        # Preserve topological order for deterministic placement
-        return ExpandedIR(
-            passthrough_nodes=[node_map[nid] for nid in topo_order],
-            passthrough_edges=list(graph.edges),
-        )
+    groups: list = []
+    node_expansions: dict[str, NodeExpansion] = {}
+
+    for nid in topo_order:
+        if nid in fused_nodes:
+            continue
+        node = node_map[nid]
+
+        if node.op in (OpType.FORWARD, OpType.COLLECT):
+            groups.append(PassthroughGroup(origin_id=nid, op=node.op))
+            node_expansions[nid] = NodeExpansion(input_pe_ids=[nid], output_pe_ids=[nid])
+
+        elif node.op == OpType.LINEAR:
+            group = _make_linear_group(node, config, graph, fused_activations, node_map)
+            tile_ids = [f"{nid}_tile_{t.tile_index}" for t in group.tiles]
+            collect_id = f"{nid}_collect"
+            node_expansions[nid] = NodeExpansion(input_pe_ids=tile_ids, output_pe_ids=[collect_id])
+            # If activation was fused, map the activation node too
+            if nid in fused_activations:
+                act_nid = fused_activations[nid]
+                node_expansions[act_nid] = NodeExpansion(
+                    input_pe_ids=[collect_id], output_pe_ids=[collect_id]
+                )
+            groups.append(group)
+
+        elif node.op == OpType.RELU:
+            # Standalone RELU not preceded by LINEAR — error
+            raise ValueError(f"RELU node {nid!r} is not preceded by a LINEAR node")
+
+        elif node.op == OpType.RMSNORM:
+            assert node.attrs is not None
+            feature_count = node.attrs["feature_count"]
+            eps = node.attrs["eps"]
+            num_tiles = _compute_tile_count(feature_count, config)
+            groups.append(
+                RmsNormGroup(
+                    origin_id=nid,
+                    num_tiles=num_tiles,
+                    feature_count=feature_count,
+                    eps=eps,
+                )
+            )
+            tile_ids = [f"{nid}_tile_{i}" for i in range(num_tiles)]
+            node_expansions[nid] = NodeExpansion(input_pe_ids=tile_ids, output_pe_ids=tile_ids)
+
+        elif node.op == OpType.MATMUL:
+            if nid in attention_chains:
+                chain = attention_chains[nid]
+                assert node.attrs is not None
+                seq_len = node.attrs["seq_len"]
+                attn_group = AttentionGroup(
+                    origin_id=nid,
+                    seq_len=seq_len,
+                    softmax_id=chain["softmax_id"],
+                    av_matmul_id=chain["av_matmul_id"],
+                )
+                pe_ids = [f"{nid}_attn_{i}" for i in range(seq_len)]
+                node_expansions[nid] = NodeExpansion(input_pe_ids=pe_ids, output_pe_ids=pe_ids)
+                if chain["softmax_id"]:
+                    node_expansions[chain["softmax_id"]] = NodeExpansion(
+                        input_pe_ids=pe_ids, output_pe_ids=pe_ids
+                    )
+                if chain["av_matmul_id"]:
+                    node_expansions[chain["av_matmul_id"]] = NodeExpansion(
+                        input_pe_ids=pe_ids, output_pe_ids=pe_ids
+                    )
+                groups.append(attn_group)
+            else:
+                assert node.attrs is not None
+                seq_len = node.attrs["seq_len"]
+                attn_group = AttentionGroup(origin_id=nid, seq_len=seq_len)
+                pe_ids = [f"{nid}_attn_{i}" for i in range(seq_len)]
+                node_expansions[nid] = NodeExpansion(input_pe_ids=pe_ids, output_pe_ids=pe_ids)
+                groups.append(attn_group)
+
+        elif node.op == OpType.ADD:
+            # ADD is a single-PE operation: receives two inputs, adds them,
+            # broadcasts to downstream tiles. No tiling needed — the upstream
+            # collect PE already gathers into a single vector.
+            groups.append(PassthroughGroup(origin_id=nid, op=node.op))
+            node_expansions[nid] = NodeExpansion(input_pe_ids=[nid], output_pe_ids=[nid])
+
+        elif node.op == OpType.SOFTMAX:
+            # Standalone SOFTMAX (not co-located on attention PE)
+            groups.append(PassthroughGroup(origin_id=nid, op=node.op))
+            node_expansions[nid] = NodeExpansion(input_pe_ids=[nid], output_pe_ids=[nid])
+
+    return ExpandedIR(
+        groups=groups,
+        node_expansions=node_expansions,
+        original_edges=list(graph.edges),
+    )
 
 
-def _expand_linear(
-    graph: GraphIR,
-    config: CompilerConfig,
-    topo_order: list[str],
-    node_map: dict,
-) -> ExpandedIR:
-    """Expand LINEAR graph into tiled compute groups."""
-    # Detect LINEAR → activation fusion pairs
-    fused_activations: set[str] = set()
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _detect_relu_fusions(graph: GraphIR, topo_order: list[str], node_map: dict) -> dict[str, str]:
+    """Detect LINEAR → RELU fusion pairs.
+
+    Returns a dict mapping LINEAR node ID → fused RELU node ID.
+    """
     activation_for_linear: dict[str, str] = {}
     for nid in topo_order:
         node = node_map[nid]
@@ -51,80 +153,122 @@ def _expand_linear(
         if len(outgoing) == 1:
             successor = node_map[outgoing[0].dst_node]
             if successor.op.is_activation:
-                fused_activations.add(successor.id)
                 activation_for_linear[nid] = successor.id
+    return activation_for_linear
 
-    groups: list[TiledComputeGroup] = []
 
+def _detect_attention_chains(
+    graph: GraphIR, topo_order: list[str], node_map: dict
+) -> dict[str, dict[str, str | None]]:
+    """Detect MATMUL → SOFTMAX → MATMUL attention chains.
+
+    Returns a dict mapping the first MATMUL ID → chain info:
+    {"softmax_id": str | None, "av_matmul_id": str | None}
+    """
+    chains: dict[str, dict[str, str | None]] = {}
     for nid in topo_order:
         node = node_map[nid]
-
-        if nid in fused_activations:
+        if node.op != OpType.MATMUL:
             continue
-        if node.op != OpType.LINEAR:
+        if nid in chains:
+            continue
+        already_claimed = any(c.get("av_matmul_id") == nid for c in chains.values())
+        if already_claimed:
             continue
 
-        if node.attrs is None:
-            raise ValueError(f"LINEAR node {nid!r} requires attrs")
-        out_f = node.attrs["out_features"]
-        in_f = node.attrs["in_features"]
+        outgoing = [e for e in graph.edges if e.src_node == nid]
+        softmax_id: str | None = None
+        av_matmul_id: str | None = None
+        if len(outgoing) == 1:
+            succ = node_map[outgoing[0].dst_node]
+            if succ.op == OpType.SOFTMAX:
+                softmax_id = succ.id
+                softmax_out = [e for e in graph.edges if e.src_node == succ.id]
+                if len(softmax_out) == 1:
+                    av = node_map[softmax_out[0].dst_node]
+                    if av.op == OpType.MATMUL:
+                        av_matmul_id = av.id
+        chains[nid] = {"softmax_id": softmax_id, "av_matmul_id": av_matmul_id}
 
-        # Determine tile count
-        if config.mesh_height is not None:
-            num_tiles = min(config.mesh_height - 1, out_f)
-        else:
-            num_tiles = out_f
+    return chains
 
-        if num_tiles < 1:
-            raise ValueError(
-                f"LINEAR node {nid!r}: need at least 1 tile, "
-                f"but mesh_height={config.mesh_height} is too small"
-            )
 
-        # Build tile specs
-        tiles: list[TileSpec] = []
-        base = out_f // num_tiles
-        remainder = out_f % num_tiles
-        for i in range(num_tiles):
-            tile_rows = base + 1 if i < remainder else base
-            frag_offset = i * base + min(i, remainder)
-            tiles.append(
-                TileSpec(
-                    tile_index=i,
-                    tile_rows=tile_rows,
-                    fragment_offset=frag_offset,
-                    in_features=in_f,
-                )
-            )
+def _compute_tile_count(feature_count: int, config: CompilerConfig, reserved_rows: int = 1) -> int:
+    """Compute the number of tiles for a given feature count.
 
-        # Activation from fused node
-        activation = None
-        if nid in activation_for_linear:
-            act_node = node_map[activation_for_linear[nid]]
-            activation = act_node.op.value
+    ``reserved_rows`` is the number of rows in the column reserved for
+    non-tile PEs (e.g. 1 for a collect or reduce PE).
+    """
+    if config.mesh_height is not None:
+        return min(config.mesh_height - reserved_rows, feature_count)
+    return feature_count
 
-        collect = CollectSpec(
-            num_fragments=num_tiles,
-            total_rows=out_f,
-            activation=activation,
+
+def _make_linear_group(
+    node: Any,
+    config: CompilerConfig,
+    graph: GraphIR,
+    fused_activations: dict[str, str],
+    node_map: dict,
+) -> TiledComputeGroup:
+    """Create a TiledComputeGroup for a LINEAR node."""
+    nid = node.id
+    attrs = node.attrs
+    if attrs is None:
+        raise ValueError(f"LINEAR node {nid!r} requires attrs")
+    out_f = attrs["out_features"]
+    in_f = attrs["in_features"]
+
+    num_tiles = _compute_tile_count(out_f, config)
+    if num_tiles < 1:
+        raise ValueError(
+            f"LINEAR node {nid!r}: need at least 1 tile, "
+            f"but mesh_height={config.mesh_height} is too small"
         )
 
-        # Determine next group: follow outgoing edges (possibly through fused activation)
-        effective_src = activation_for_linear.get(nid, nid)
-        next_outgoing = [e for e in graph.edges if e.src_node == effective_src]
-        next_group = None
-        if next_outgoing:
-            next_node = node_map[next_outgoing[0].dst_node]
-            if next_node.op == OpType.LINEAR:
-                next_group = next_node.id
+    tiles = _make_tiles(out_f, num_tiles, in_f)
 
-        groups.append(
-            TiledComputeGroup(
-                origin_id=nid,
-                tiles=tiles,
-                collect=collect,
-                next_group=next_group,
+    activation = None
+    if nid in fused_activations:
+        act_node = node_map[fused_activations[nid]]
+        activation = act_node.op.value
+    collect = CollectSpec(
+        num_fragments=num_tiles,
+        total_rows=out_f,
+        activation=activation,
+    )
+
+    # Determine next group (LINEAR → LINEAR chain)
+    effective_src = fused_activations.get(nid, nid)
+    next_outgoing = [e for e in graph.edges if e.src_node == effective_src]
+    next_group = None
+    if next_outgoing:
+        next_node = node_map[next_outgoing[0].dst_node]
+        if next_node.op == OpType.LINEAR:
+            next_group = next_node.id
+
+    return TiledComputeGroup(
+        origin_id=nid,
+        tiles=tiles,
+        collect=collect,
+        next_group=next_group,
+    )
+
+
+def _make_tiles(out_features: int, num_tiles: int, in_features: int) -> list[TileSpec]:
+    """Build tile specs with even distribution of output rows."""
+    tiles: list[TileSpec] = []
+    base = out_features // num_tiles
+    remainder = out_features % num_tiles
+    for i in range(num_tiles):
+        tile_rows = base + 1 if i < remainder else base
+        frag_offset = i * base + min(i, remainder)
+        tiles.append(
+            TileSpec(
+                tile_index=i,
+                tile_rows=tile_rows,
+                fragment_offset=frag_offset,
+                in_features=in_features,
             )
         )
-
-    return ExpandedIR(groups=groups)
+    return tiles

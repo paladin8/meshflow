@@ -5,7 +5,13 @@ from meshflow.compiler import CompilerConfig
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
 from meshflow.compiler.passes.expand import expand
 from meshflow.compiler.passes.place import place
-from meshflow.compiler.spatial_ir import PlacedCollectData, PlacedTileData
+from meshflow.compiler.spatial_ir import (
+    PlacedAttentionPeData,
+    PlacedCollectData,
+    PlacedRmsNormReduceData,
+    PlacedRmsNormTileData,
+    PlacedTileData,
+)
 
 
 class TestPlacement:
@@ -423,3 +429,135 @@ class TestMultiLayerPlacement:
         assert len(inter_group_edges) == 3
         dest_ids = sorted(e.dst_node for e in inter_group_edges)
         assert dest_ids == ["l2_tile_0", "l2_tile_1", "l2_tile_2"]
+
+
+class TestRmsNormPlacement:
+    def test_rmsnorm_column_layout(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"eps": 1e-6, "feature_count": 4})],
+            edges=[],
+        )
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
+
+        # 4 tile PEs + 1 reduce PE = 5 nodes
+        assert len(spatial.nodes) == 5
+        coords = {n.id: n.coord for n in spatial.nodes}
+        for i in range(4):
+            assert coords[f"rn_tile_{i}"] == (0, i)
+        assert coords["rn_reduce"] == (0, 4)
+
+    def test_rmsnorm_data_types(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"eps": 1e-6, "feature_count": 4})],
+            edges=[],
+        )
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
+
+        tile = next(n for n in spatial.nodes if n.id == "rn_tile_0")
+        assert isinstance(tile.data, PlacedRmsNormTileData)
+        assert tile.data.tile_index == 0
+        assert tile.data.origin_id == "rn"
+
+        reduce_pe = next(n for n in spatial.nodes if n.id == "rn_reduce")
+        assert isinstance(reduce_pe.data, PlacedRmsNormReduceData)
+        assert reduce_pe.data.num_tiles == 4
+        assert reduce_pe.data.feature_count == 4
+        assert reduce_pe.data.eps == 1e-6
+
+    def test_rmsnorm_internal_edges(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"eps": 1e-6, "feature_count": 3})],
+            edges=[],
+        )
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
+
+        # 3 internal edges: tile → reduce
+        internal = [e for e in spatial.edges if e.dst_node == "rn_reduce"]
+        assert len(internal) == 3
+        for i, edge in enumerate(internal):
+            assert edge.src_node == f"rn_tile_{i}"
+            assert edge.dst_slot == i
+
+
+class TestAttentionPlacement:
+    def test_attention_column_layout(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="mm", op=OpType.MATMUL, attrs={"seq_len": 4})],
+            edges=[],
+        )
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
+
+        assert len(spatial.nodes) == 4
+        coords = {n.id: n.coord for n in spatial.nodes}
+        for i in range(4):
+            assert coords[f"mm_attn_{i}"] == (0, i)
+
+    def test_attention_data_type(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="qkt", op=OpType.MATMUL, attrs={"seq_len": 2}),
+                Node(id="sm", op=OpType.SOFTMAX),
+                Node(id="av", op=OpType.MATMUL, attrs={"seq_len": 2}),
+            ],
+            edges=[
+                Edge(src_node="qkt", src_slot=0, dst_node="sm", dst_slot=0),
+                Edge(src_node="sm", src_slot=0, dst_node="av", dst_slot=0),
+            ],
+        )
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
+
+        # Only 2 PEs (co-located)
+        assert len(spatial.nodes) == 2
+        pe0 = spatial.nodes[0]
+        assert isinstance(pe0.data, PlacedAttentionPeData)
+        assert pe0.data.softmax_id == "sm"
+        assert pe0.data.av_matmul_id == "av"
+
+
+class TestAddPlacement:
+    def test_add_single_pe(self) -> None:
+        """ADD is a single-PE passthrough — placed in its own column."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="a", op=OpType.FORWARD),
+                Node(id="b", op=OpType.FORWARD),
+                Node(id="add", op=OpType.ADD),
+            ],
+            edges=[
+                Edge(src_node="a", src_slot=0, dst_node="add", dst_slot=0),
+                Edge(src_node="b", src_slot=0, dst_node="add", dst_slot=1),
+            ],
+        )
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
+
+        add_node = next(n for n in spatial.nodes if n.id == "add")
+        assert add_node.op == OpType.ADD
+        assert add_node.data is None  # passthrough, no typed data
+
+    def test_add_inter_group_edges(self) -> None:
+        """FORWARD → ADD: 1:1 edges (both single PE)."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="a", op=OpType.FORWARD),
+                Node(id="b", op=OpType.FORWARD),
+                Node(id="add", op=OpType.ADD),
+            ],
+            edges=[
+                Edge(src_node="a", src_slot=0, dst_node="add", dst_slot=0),
+                Edge(src_node="b", src_slot=0, dst_node="add", dst_slot=1),
+            ],
+        )
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
+
+        # Both a→add and b→add are 1:1 edges
+        add_edges = [e for e in spatial.edges if e.dst_node == "add"]
+        assert len(add_edges) == 2
+        src_nodes = {e.src_node for e in add_edges}
+        assert src_nodes == {"a", "b"}

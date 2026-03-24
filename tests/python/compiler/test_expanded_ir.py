@@ -3,9 +3,11 @@
 from meshflow.compiler.expanded_ir import (
     CollectSpec,
     ExpandedIR,
+    PassthroughGroup,
     TiledComputeGroup,
     TileSpec,
 )
+from meshflow.compiler.graph_ir import Edge, OpType
 
 
 class TestTileSpec:
@@ -58,17 +60,17 @@ class TestTiledComputeGroup:
 
 class TestExpandedIR:
     def test_empty(self):
-        ir = ExpandedIR(groups=[], passthrough_nodes=[], passthrough_edges=[])
+        ir = ExpandedIR()
         assert len(ir.groups) == 0
 
     def test_passthrough(self):
-        from meshflow.compiler.graph_ir import Edge, Node, OpType
-
-        nodes = [Node(id="fwd", op=OpType.FORWARD)]
         edges = [Edge(src_node="fwd", src_slot=0, dst_node="col", dst_slot=0)]
-        ir = ExpandedIR(groups=[], passthrough_nodes=nodes, passthrough_edges=edges)
-        assert len(ir.passthrough_nodes) == 1
-        assert len(ir.passthrough_edges) == 1
+        ir = ExpandedIR(
+            groups=[PassthroughGroup(origin_id="fwd", op=OpType.FORWARD)],
+            original_edges=edges,
+        )
+        assert len(ir.groups) == 1
+        assert len(ir.original_edges) == 1
 
     def test_with_groups(self):
         group = TiledComputeGroup(
@@ -79,6 +81,6 @@ class TestExpandedIR:
             ],
             collect=CollectSpec(num_fragments=2, total_rows=4),
         )
-        ir = ExpandedIR(groups=[group], passthrough_nodes=[], passthrough_edges=[])
+        ir = ExpandedIR(groups=[group])
         assert len(ir.groups) == 1
-        assert ir.groups[0].collect.num_fragments == 2
+        assert ir.groups[0].collect.num_fragments == 2  # type: ignore[union-attr]

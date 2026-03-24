@@ -192,10 +192,10 @@ New TaskEntry variants for the new task kinds. Same structure as today: task kin
 
 ### graph_ir.py — validation updates
 
-- **RMSNORM**: Requires `eps` attr. Weights must include `gamma`.
-- **ADD**: Requires exactly two incoming edges.
+- **RMSNORM**: Requires `eps` and `feature_count` attrs. Weights must include `gamma`.
+- **ADD**: Requires exactly two incoming edges. `num_tiles` attr set by model helper.
 - **SOFTMAX**: Requires exactly one incoming edge.
-- **MATMUL**: Requires at least one incoming edge. Specific connectivity validated by the model helper's graph construction rather than generic validation (since QK^T and AV have different input patterns).
+- **MATMUL**: Requires `seq_len` attr. Specific connectivity validated by the model helper's graph construction rather than generic validation (since QK^T and AV have different input patterns).
 
 ### No new IR stages
 

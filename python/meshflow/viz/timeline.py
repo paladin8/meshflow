@@ -50,7 +50,9 @@ def event_timeline(
         idx_list.append(y * max_x + x)
 
     max_pe_idx = max(idx for _, indices in by_kind.values() for idx in indices)
-    fig, ax = plt.subplots(figsize=(min(20, max(8, len(events) * 0.05)), max(4, (max_pe_idx + 1) * 0.5)))
+    fig, ax = plt.subplots(
+        figsize=(min(20, max(8, len(events) * 0.05)), max(4, (max_pe_idx + 1) * 0.5))
+    )
     for kind, (timestamps, indices) in sorted(by_kind.items()):
         color = _KIND_COLORS.get(kind, "gray")
         ax.scatter(timestamps, indices, c=color, label=kind, s=20, alpha=0.7)

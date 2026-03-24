@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from meshflow.compiler.graph_ir import Edge, Node
+from meshflow.compiler.graph_ir import Edge, OpType
 
 
 @dataclass
@@ -39,13 +39,56 @@ class TiledComputeGroup:
 
 
 @dataclass
+class RmsNormGroup:
+    """RMSNORM expanded into tile PEs + a reduce PE."""
+
+    origin_id: str
+    num_tiles: int
+    feature_count: int
+    eps: float
+
+
+@dataclass
+class AttentionGroup:
+    """MATMUL attention PEs for row-parallel attention.
+
+    SOFTMAX and AV MATMUL are co-located on the same PEs.
+    """
+
+    origin_id: str
+    seq_len: int
+    softmax_id: str | None = None
+    av_matmul_id: str | None = None
+
+
+@dataclass
+class PassthroughGroup:
+    """A single-PE group for FORWARD, COLLECT, or standalone SOFTMAX nodes."""
+
+    origin_id: str
+    op: OpType
+
+
+@dataclass
+class NodeExpansion:
+    """Tracks how an original GraphIR node was expanded into PE IDs."""
+
+    input_pe_ids: list[str]
+    output_pe_ids: list[str]
+
+
+OperatorGroup = TiledComputeGroup | RmsNormGroup | AttentionGroup | PassthroughGroup
+
+
+@dataclass
 class ExpandedIR:
     """IR after operator expansion, before coordinate assignment.
 
-    For LINEAR graphs: groups contain the tiled structure.
-    For FORWARD/COLLECT graphs: passthrough_nodes/edges carry the original graph.
+    ``groups`` is an ordered list of operator groups in topological order.
+    ``node_expansions`` maps original GraphIR node IDs to their expanded PE IDs.
+    ``original_edges`` preserves the GraphIR edges for inter-group connectivity.
     """
 
-    groups: list[TiledComputeGroup] = field(default_factory=list)
-    passthrough_nodes: list[Node] = field(default_factory=list)
-    passthrough_edges: list[Edge] = field(default_factory=list)
+    groups: list[OperatorGroup] = field(default_factory=list)
+    node_expansions: dict[str, NodeExpansion] = field(default_factory=dict)
+    original_edges: list[Edge] = field(default_factory=list)

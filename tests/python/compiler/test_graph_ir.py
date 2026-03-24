@@ -211,6 +211,103 @@ class TestReluValidation:
         graph.validate()  # should not raise
 
 
+class TestRmsNormValidation:
+    def test_rmsnorm_valid(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"eps": 1e-6, "feature_count": 8})],
+            edges=[],
+        )
+        graph.validate()
+
+    def test_rmsnorm_missing_eps(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"feature_count": 8})],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="requires 'eps'"):
+            graph.validate()
+
+    def test_rmsnorm_missing_feature_count(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"eps": 1e-6})],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="requires 'feature_count'"):
+            graph.validate()
+
+    def test_rmsnorm_no_attrs(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="rn", op=OpType.RMSNORM)],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="requires 'eps'"):
+            graph.validate()
+
+
+class TestMatMulValidation:
+    def test_matmul_valid(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="mm", op=OpType.MATMUL, attrs={"seq_len": 4})],
+            edges=[],
+        )
+        graph.validate()
+
+    def test_matmul_missing_seq_len(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="mm", op=OpType.MATMUL)],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="requires 'seq_len'"):
+            graph.validate()
+
+
+class TestAddValidation:
+    def test_add_valid(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="a", op=OpType.FORWARD),
+                Node(id="b", op=OpType.FORWARD),
+                Node(id="add", op=OpType.ADD),
+            ],
+            edges=[
+                Edge(src_node="a", src_slot=0, dst_node="add", dst_slot=0),
+                Edge(src_node="b", src_slot=0, dst_node="add", dst_slot=1),
+            ],
+        )
+        graph.validate()
+
+    def test_add_wrong_edge_count(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="a", op=OpType.FORWARD),
+                Node(id="add", op=OpType.ADD),
+            ],
+            edges=[Edge(src_node="a", src_slot=0, dst_node="add", dst_slot=0)],
+        )
+        with pytest.raises(ValueError, match="exactly 2 incoming edges"):
+            graph.validate()
+
+
+class TestSoftmaxValidation:
+    def test_softmax_valid(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="mm", op=OpType.MATMUL, attrs={"seq_len": 4}),
+                Node(id="sm", op=OpType.SOFTMAX),
+            ],
+            edges=[Edge(src_node="mm", src_slot=0, dst_node="sm", dst_slot=0)],
+        )
+        graph.validate()
+
+    def test_softmax_no_incoming(self) -> None:
+        graph = GraphIR(
+            nodes=[Node(id="sm", op=OpType.SOFTMAX)],
+            edges=[],
+        )
+        with pytest.raises(ValueError, match="exactly 1 incoming edge"):
+            graph.validate()
+
+
 class TestTopologicalOrder:
     def test_simple_chain(self) -> None:
         graph = GraphIR(

@@ -11,6 +11,10 @@ class OpType(Enum):
     COLLECT = "collect"
     LINEAR = "linear"
     RELU = "relu"
+    MATMUL = "matmul"
+    SOFTMAX = "softmax"
+    RMSNORM = "rmsnorm"
+    ADD = "add"
 
     @property
     def is_activation(self) -> bool:
@@ -48,6 +52,10 @@ class GraphIR:
         self._check_acyclic()
         self._check_linear_attrs()
         self._check_activation_connectivity()
+        self._check_rmsnorm_attrs()
+        self._check_matmul_attrs()
+        self._check_add_connectivity()
+        self._check_softmax_connectivity()
 
     def _check_linear_attrs(self) -> None:
         for node in self.nodes:
@@ -140,6 +148,40 @@ class GraphIR:
                     f"{kind} node {node.id!r} must have at most one outgoing edge, "
                     f"got {len(outgoing)}"
                 )
+
+    def _check_rmsnorm_attrs(self) -> None:
+        for node in self.nodes:
+            if node.op == OpType.RMSNORM:
+                if node.attrs is None or "eps" not in node.attrs:
+                    raise ValueError(f"RMSNORM node {node.id!r} requires 'eps' attr")
+                if node.attrs.get("feature_count") is None:
+                    raise ValueError(f"RMSNORM node {node.id!r} requires 'feature_count' attr")
+
+    def _check_matmul_attrs(self) -> None:
+        for node in self.nodes:
+            if node.op == OpType.MATMUL:
+                if node.attrs is None or "seq_len" not in node.attrs:
+                    raise ValueError(f"MATMUL node {node.id!r} requires 'seq_len' attr")
+
+    def _check_add_connectivity(self) -> None:
+        for node in self.nodes:
+            if node.op == OpType.ADD:
+                incoming = [e for e in self.edges if e.dst_node == node.id]
+                if len(incoming) != 2:
+                    raise ValueError(
+                        f"ADD node {node.id!r} must have exactly 2 incoming edges, "
+                        f"got {len(incoming)}"
+                    )
+
+    def _check_softmax_connectivity(self) -> None:
+        for node in self.nodes:
+            if node.op == OpType.SOFTMAX:
+                incoming = [e for e in self.edges if e.dst_node == node.id]
+                if len(incoming) != 1:
+                    raise ValueError(
+                        f"SOFTMAX node {node.id!r} must have exactly 1 incoming edge, "
+                        f"got {len(incoming)}"
+                    )
 
     def _check_acyclic(self) -> None:
         self.topological_order()  # raises ValueError if cyclic
