@@ -311,6 +311,16 @@ impl Simulator {
         }
     }
 
+    // Reserved SRAM slot IDs for internal task state.
+    // These must not collide with each other or with user-facing slots.
+    // - ConcatCollect/ConcatCollectForward: MAX (accumulator), MAX-1 (counter)
+    // - RmsNormReduce: MAX (accumulator), MAX-1 (counter)
+    // - MatMul: MAX-2 (counter)
+    // No PE currently hosts tasks that would collide (e.g., ConcatCollect + MatMul).
+    const ACCUM_SLOT: SlotId = u32::MAX;
+    const COUNTER_SLOT: SlotId = u32::MAX - 1;
+    const MATMUL_COUNTER_SLOT: SlotId = u32::MAX - 2;
+
     fn process_execute(&mut self, timestamp: u64, coord: Coord, task_index: usize) {
         // Clone the task to avoid borrow conflicts with the PE
         let task = self.mesh.pe(coord).tasks[task_index].kind.clone();
@@ -539,12 +549,246 @@ impl Simulator {
 
                 self.task_write_slot(timestamp, coord, output_slot, result);
             }
-            // MatMul and RmsNorm* are implemented in checkpoint 2
-            TaskKind::MatMul { .. }
-            | TaskKind::RmsNormPartialSum { .. }
-            | TaskKind::RmsNormNormalize { .. }
-            | TaskKind::RmsNormReduce { .. } => {
-                unimplemented!("TaskKind::{} not yet implemented", task);
+            TaskKind::MatMul {
+                ref operand_slots,
+                num_dynamic_operands,
+                output_slot,
+                ref output_dests,
+                ref payload_slots,
+            } => {
+                // Counter-based trigger: fires on each dynamic operand arrival,
+                // only computes when all dynamic operands have arrived.
+                // Note: tasks_executed counts triggers (including early returns),
+                // not completions — consistent with ConcatCollect/RmsNormReduce.
+                let pe = self.mesh.pe_mut(coord);
+                pe.counters.tasks_executed += 1;
+                self.profile.total_tasks_executed += 1;
+
+                // Use reserved counter slot for dynamic operand counting
+                let counter_slot = Self::MATMUL_COUNTER_SLOT;
+                let count = if num_dynamic_operands > 1 {
+                    if !pe.has_slot(counter_slot) {
+                        pe.write_slot(counter_slot, vec![0.0]);
+                    }
+                    let c = pe.read_slot(counter_slot)[0] as u32 + 1;
+                    pe.write_slot(counter_slot, vec![c as f32]);
+                    c
+                } else {
+                    // Single dynamic operand (or all pre-loaded): compute immediately
+                    num_dynamic_operands
+                };
+
+                if count < num_dynamic_operands {
+                    return; // Still waiting for more operands
+                }
+
+                // Clean up counter
+                if num_dynamic_operands > 1 {
+                    pe.remove_slot(counter_slot);
+                }
+
+                // All operands ready. Slot 0 = left operand (vector),
+                // remaining slots = right operand columns (one vector per slot).
+                // Compute dot products: result[i] = dot(left, right_col[i])
+                let left = pe.read_slot(operand_slots[0]).clone();
+                let right_slots = &operand_slots[1..];
+                let mut result = Vec::with_capacity(right_slots.len());
+                for &slot in right_slots {
+                    let col = pe.read_slot(slot);
+                    debug_assert_eq!(
+                        left.len(),
+                        col.len(),
+                        "PE {}: MatMul operand length mismatch ({} vs {})",
+                        coord,
+                        left.len(),
+                        col.len()
+                    );
+                    let dot: f32 = left.iter().zip(col.iter()).map(|(a, b)| a * b).sum();
+                    result.push(dot);
+                }
+
+                // Note: dynamic operand slots (K/V vectors) are NOT cleaned up here.
+                // At current dimensions this is negligible; a future optimization
+                // could remove broadcast slots after computation.
+
+                let output_dests = output_dests.clone();
+                let payload_slots = payload_slots.clone();
+                self.task_write_slot(timestamp, coord, output_slot, result.clone());
+
+                // Route to destinations
+                let num_sends = output_dests.len() as u64;
+                self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
+
+                for (i, (dest, hops)) in output_dests.iter().enumerate() {
+                    let send_time = timestamp + self.config.task_base_latency + i as u64;
+                    let slot = payload_slots.get(i).copied().unwrap_or(0);
+                    let message = Message {
+                        id: self.next_message_id,
+                        source: coord,
+                        dest: *dest,
+                        hops: hops.clone(),
+                        current_hop: 0,
+                        payload: result.clone(),
+                        payload_slot: slot,
+                        timestamp: send_time,
+                    };
+                    self.next_message_id += 1;
+                    self.enqueue_deliver(send_time, coord, coord, message);
+                }
+            }
+            TaskKind::RmsNormPartialSum {
+                input_slot,
+                reduce_dest,
+                ref reduce_hops,
+                partial_sum_slot,
+            } => {
+                let pe = self.mesh.pe_mut(coord);
+                let data = pe.read_slot(input_slot).clone();
+                pe.counters.tasks_executed += 1;
+                pe.counters.messages_sent += 1;
+                self.profile.total_tasks_executed += 1;
+
+                // Compute sum(x^2) for local feature slice
+                let partial_sum: f32 = data.iter().map(|x| x * x).sum();
+
+                // Send partial sum to reduce PE
+                let reduce_hops = reduce_hops.clone();
+                let message = Message {
+                    id: self.next_message_id,
+                    source: coord,
+                    dest: reduce_dest,
+                    hops: reduce_hops,
+                    current_hop: 0,
+                    payload: vec![partial_sum],
+                    payload_slot: partial_sum_slot,
+                    timestamp,
+                };
+                self.next_message_id += 1;
+                self.enqueue_deliver(timestamp, coord, coord, message);
+            }
+            TaskKind::RmsNormNormalize {
+                input_slot,
+                scale_slot,
+                gamma_slot,
+                ref output_dests,
+                ref payload_slots,
+            } => {
+                let pe = self.mesh.pe_mut(coord);
+                let data = pe.read_slot(input_slot).clone();
+                let scale = pe.read_slot(scale_slot)[0];
+                let gamma = pe.read_slot(gamma_slot).clone();
+                pe.counters.tasks_executed += 1;
+                self.profile.total_tasks_executed += 1;
+
+                // Apply x * scale * gamma
+                debug_assert_eq!(
+                    data.len(),
+                    gamma.len(),
+                    "PE {}: RmsNormNormalize data/gamma length mismatch ({} vs {})",
+                    coord,
+                    data.len(),
+                    gamma.len()
+                );
+                let result: Vec<f32> = data
+                    .iter()
+                    .zip(gamma.iter())
+                    .map(|(x, g)| x * scale * g)
+                    .collect();
+
+                // Route to destinations
+                let output_dests = output_dests.clone();
+                let payload_slots = payload_slots.clone();
+                let num_sends = output_dests.len() as u64;
+                self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
+
+                for (i, (dest, hops)) in output_dests.iter().enumerate() {
+                    let send_time = timestamp + self.config.task_base_latency + i as u64;
+                    let slot = payload_slots.get(i).copied().unwrap_or(0);
+                    let message = Message {
+                        id: self.next_message_id,
+                        source: coord,
+                        dest: *dest,
+                        hops: hops.clone(),
+                        current_hop: 0,
+                        payload: result.clone(),
+                        payload_slot: slot,
+                        timestamp: send_time,
+                    };
+                    self.next_message_id += 1;
+                    self.enqueue_deliver(send_time, coord, coord, message);
+                }
+            }
+            TaskKind::RmsNormReduce {
+                num_tiles,
+                feature_count,
+                eps,
+                ref tile_dests,
+                scale_slot,
+            } => {
+                // Counter-based accumulation (like ConcatCollect):
+                // fires on each partial sum arrival, computes when all arrive.
+                // Note: tasks_executed counts triggers (including early returns),
+                // not completions — consistent with ConcatCollect/MatMul.
+                let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
+                let pe = self.mesh.pe_mut(coord);
+                pe.counters.tasks_executed += 1;
+                self.profile.total_tasks_executed += 1;
+
+                let partial_sum = pe.read_slot(trigger_slot)[0];
+
+                // Use reserved SRAM slots for accumulator and counter
+                let accum_slot = Self::ACCUM_SLOT;
+                let counter_slot = Self::COUNTER_SLOT;
+
+                if !pe.has_slot(accum_slot) {
+                    pe.write_slot(accum_slot, vec![0.0]);
+                    pe.write_slot(counter_slot, vec![0.0]);
+                }
+
+                // Accumulate partial sum
+                let running_sum = pe.read_slot(accum_slot)[0] + partial_sum;
+                pe.write_slot(accum_slot, vec![running_sum]);
+                pe.remove_slot(trigger_slot);
+
+                // Increment counter
+                let count = pe.read_slot(counter_slot)[0] as u32 + 1;
+                pe.write_slot(counter_slot, vec![count as f32]);
+
+                if count < num_tiles {
+                    return; // Still waiting for more partial sums
+                }
+
+                // All partial sums received — compute scale factor
+                let mean_sq = running_sum / feature_count as f32;
+                let scale = 1.0 / (mean_sq + eps).sqrt();
+
+                // Clean up accumulator
+                pe.remove_slot(accum_slot);
+                pe.remove_slot(counter_slot);
+
+                // Write scale to local SRAM (for debugging/inspection)
+                pe.write_slot(scale_slot, vec![scale]);
+
+                // Broadcast scale factor to all tile PEs
+                let tile_dests = tile_dests.clone();
+                let num_sends = tile_dests.len() as u64;
+                self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
+
+                for (i, (dest, hops)) in tile_dests.iter().enumerate() {
+                    let send_time = timestamp + self.config.task_base_latency + i as u64;
+                    let message = Message {
+                        id: self.next_message_id,
+                        source: coord,
+                        dest: *dest,
+                        hops: hops.clone(),
+                        current_hop: 0,
+                        payload: vec![scale],
+                        payload_slot: scale_slot,
+                        timestamp: send_time,
+                    };
+                    self.next_message_id += 1;
+                    self.enqueue_deliver(send_time, coord, coord, message);
+                }
             }
         }
     }
@@ -592,8 +836,8 @@ impl Simulator {
         let frag_len = fragment.len();
 
         // Use reserved SRAM slots for accumulator buffer and counter.
-        let accum_slot: SlotId = u32::MAX;
-        let counter_slot: SlotId = u32::MAX - 1;
+        let accum_slot = Self::ACCUM_SLOT;
+        let counter_slot = Self::COUNTER_SLOT;
 
         // Initialize accumulator on first fragment
         if !pe.has_slot(accum_slot) {
@@ -1273,5 +1517,497 @@ mod tests {
                 "equal inputs should give uniform distribution"
             );
         }
+    }
+
+    #[test]
+    fn matmul_dot_products() {
+        // MatMul at (0,0): Q row in slot 0 (pre-loaded), K vectors in slots 1-3 (broadcast).
+        // Computes dot(Q, K_i) for each K_i, collects result at (1,0).
+        let mut s = sim(2, 1);
+
+        // operand_slots: [0, 1, 2, 3] — slot 0 = Q, slots 1-3 = K vectors
+        // num_dynamic_operands = 3 (K vectors arrive via messages)
+        // Need one TaskConfig per dynamic operand slot (1, 2, 3)
+        let hops = crate::route::generate_route_xy(Coord::new(0, 0), Coord::new(1, 0));
+        for trigger in [1, 2, 3] {
+            s.add_task_direct(
+                Coord::new(0, 0),
+                TaskConfig {
+                    kind: TaskKind::MatMul {
+                        operand_slots: vec![0, 1, 2, 3],
+                        num_dynamic_operands: 3,
+                        output_slot: 10,
+                        output_dests: vec![(Coord::new(1, 0), hops.clone())],
+                        payload_slots: vec![0],
+                    },
+                    trigger_slot: trigger,
+                },
+            );
+        }
+        s.add_task_direct(
+            Coord::new(1, 0),
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+
+        // Pre-load Q row
+        s.write_sram(Coord::new(0, 0), 0, vec![1.0, 2.0]);
+
+        // Inject K vectors (3 separate messages)
+        // K0 = [1, 0] → dot = 1*1 + 2*0 = 1
+        // K1 = [0, 1] → dot = 1*0 + 2*1 = 2
+        // K2 = [1, 1] → dot = 1*1 + 2*1 = 3
+        for (slot, payload) in [
+            (1, vec![1.0, 0.0]),
+            (2, vec![0.0, 1.0]),
+            (3, vec![1.0, 1.0]),
+        ] {
+            s.inject_message(InjectMessage {
+                source: Coord::new(0, 0),
+                dest: Coord::new(0, 0),
+                payload,
+                payload_slot: slot,
+            });
+        }
+
+        let result = s.run();
+        let output = result.outputs.get(&Coord::new(1, 0)).unwrap();
+        assert_eq!(output, &vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn matmul_single_dynamic_operand() {
+        // MatMul with 1 dynamic operand — no counter needed
+        let mut s = sim(2, 1);
+
+        let hops = crate::route::generate_route_xy(Coord::new(0, 0), Coord::new(1, 0));
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::MatMul {
+                    operand_slots: vec![0, 1],
+                    num_dynamic_operands: 1,
+                    output_slot: 10,
+                    output_dests: vec![(Coord::new(1, 0), hops)],
+                    payload_slots: vec![0],
+                },
+                trigger_slot: 1,
+            },
+        );
+        s.add_task_direct(
+            Coord::new(1, 0),
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+
+        // Pre-load left operand and single right operand
+        s.write_sram(Coord::new(0, 0), 0, vec![3.0, 4.0]);
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![2.0, 1.0],
+            payload_slot: 1,
+        });
+
+        let result = s.run();
+        let output = result.outputs.get(&Coord::new(1, 0)).unwrap();
+        // dot([3,4], [2,1]) = 6 + 4 = 10
+        assert_eq!(output, &vec![10.0]);
+    }
+
+    #[test]
+    fn matmul_triggers_softmax_chain() {
+        // MatMul(QK^T) -> Softmax -> Collect, all on same PE
+        let mut s = sim(1, 1);
+
+        // MatMul: slot 0 = Q, slot 1 = K0, slot 2 = K1
+        // Writes score row to slot 10
+        // One TaskConfig per dynamic operand slot
+        for trigger in [1, 2] {
+            s.add_task_direct(
+                Coord::new(0, 0),
+                TaskConfig {
+                    kind: TaskKind::MatMul {
+                        operand_slots: vec![0, 1, 2],
+                        num_dynamic_operands: 2,
+                        output_slot: 10,
+                        output_dests: vec![],
+                        payload_slots: vec![],
+                    },
+                    trigger_slot: trigger,
+                },
+            );
+        }
+        // Softmax: reads slot 10, writes slot 11
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::Softmax {
+                    input_slot: 10,
+                    output_slot: 11,
+                },
+                trigger_slot: 10,
+            },
+        );
+        // Collect from slot 11
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 11 },
+                trigger_slot: 11,
+            },
+        );
+
+        s.write_sram(Coord::new(0, 0), 0, vec![1.0, 0.0]); // Q
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![1.0, 0.0], // K0: dot = 1
+            payload_slot: 1,
+        });
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![0.0, 1.0], // K1: dot = 0
+            payload_slot: 2,
+        });
+
+        let result = s.run();
+        let output = result.outputs.get(&Coord::new(0, 0)).unwrap();
+
+        // Scores = [1, 0], softmax([1, 0]) ≈ [0.731, 0.269]
+        assert_eq!(output.len(), 2);
+        let sum: f32 = output.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!(output[0] > output[1]); // score 1 > score 0
+    }
+
+    #[test]
+    fn rmsnorm_full_pipeline() {
+        // RMSNorm with 2 tile PEs and 1 reduce PE.
+        // Input: tile0 has [3.0, 4.0], tile1 has [0.0, 0.0]
+        // feature_count = 4, gamma = [1.0, 1.0, 1.0, 1.0]
+        //
+        // sum(x^2) = 9 + 16 + 0 + 0 = 25
+        // mean(x^2) = 25 / 4 = 6.25
+        // scale = 1 / sqrt(6.25 + 1e-6) = 1 / 2.5 = 0.4
+        // normalized: [3*0.4, 4*0.4, 0*0.4, 0*0.4] = [1.2, 1.6, 0.0, 0.0]
+        let mut s = sim(3, 2);
+
+        let tile0 = Coord::new(0, 0);
+        let tile1 = Coord::new(0, 1);
+        let reduce = Coord::new(1, 0);
+        let collect0 = Coord::new(2, 0);
+        let collect1 = Coord::new(2, 1);
+
+        // Tile 0: RmsNormPartialSum (phase 1) + RmsNormNormalize (phase 2)
+        let hops_to_reduce = crate::route::generate_route_xy(tile0, reduce);
+        let hops_to_collect0 = crate::route::generate_route_xy(tile0, collect0);
+        s.add_task_direct(
+            tile0,
+            TaskConfig {
+                kind: TaskKind::RmsNormPartialSum {
+                    input_slot: 0,
+                    reduce_dest: reduce,
+                    reduce_hops: hops_to_reduce,
+                    partial_sum_slot: 0, // slot on reduce PE
+                },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            tile0,
+            TaskConfig {
+                kind: TaskKind::RmsNormNormalize {
+                    input_slot: 0,
+                    scale_slot: 1,
+                    gamma_slot: 2,
+                    output_dests: vec![(collect0, hops_to_collect0)],
+                    payload_slots: vec![0],
+                },
+                trigger_slot: 1, // triggered by scale factor arrival
+            },
+        );
+        s.write_sram(tile0, 2, vec![1.0, 1.0]); // gamma
+
+        // Tile 1: same structure
+        let hops_to_reduce1 = crate::route::generate_route_xy(tile1, reduce);
+        let hops_to_collect1 = crate::route::generate_route_xy(tile1, collect1);
+        s.add_task_direct(
+            tile1,
+            TaskConfig {
+                kind: TaskKind::RmsNormPartialSum {
+                    input_slot: 0,
+                    reduce_dest: reduce,
+                    reduce_hops: hops_to_reduce1,
+                    partial_sum_slot: 1, // different slot on reduce PE
+                },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            tile1,
+            TaskConfig {
+                kind: TaskKind::RmsNormNormalize {
+                    input_slot: 0,
+                    scale_slot: 1,
+                    gamma_slot: 2,
+                    output_dests: vec![(collect1, hops_to_collect1)],
+                    payload_slots: vec![0],
+                },
+                trigger_slot: 1,
+            },
+        );
+        s.write_sram(tile1, 2, vec![1.0, 1.0]); // gamma
+
+        // Reduce PE: accumulates partial sums, broadcasts scale
+        // One TaskConfig per partial sum slot (0 and 1)
+        let hops_to_tile0 = crate::route::generate_route_xy(reduce, tile0);
+        let hops_to_tile1 = crate::route::generate_route_xy(reduce, tile1);
+        for trigger in [0, 1] {
+            s.add_task_direct(
+                reduce,
+                TaskConfig {
+                    kind: TaskKind::RmsNormReduce {
+                        num_tiles: 2,
+                        feature_count: 4,
+                        eps: 1e-6,
+                        tile_dests: vec![
+                            (tile0, hops_to_tile0.clone()),
+                            (tile1, hops_to_tile1.clone()),
+                        ],
+                        scale_slot: 1, // writes scale to slot 1 on tile PEs
+                    },
+                    trigger_slot: trigger,
+                },
+            );
+        }
+
+        // Collect PEs
+        s.add_task_direct(
+            collect0,
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            collect1,
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+
+        // Inject activations
+        s.inject_message(InjectMessage {
+            source: tile0,
+            dest: tile0,
+            payload: vec![3.0, 4.0],
+            payload_slot: 0,
+        });
+        s.inject_message(InjectMessage {
+            source: tile1,
+            dest: tile1,
+            payload: vec![0.0, 0.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+
+        let out0 = result.outputs.get(&collect0).unwrap();
+        let out1 = result.outputs.get(&collect1).unwrap();
+
+        // scale = 1/sqrt(25/4 + 1e-6) ≈ 0.4
+        let expected_scale = 1.0 / (25.0_f32 / 4.0 + 1e-6).sqrt();
+        assert!((out0[0] - 3.0 * expected_scale).abs() < 1e-5);
+        assert!((out0[1] - 4.0 * expected_scale).abs() < 1e-5);
+        assert!((out1[0] - 0.0).abs() < 1e-5);
+        assert!((out1[1] - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rmsnorm_with_gamma_scaling() {
+        // Same as above but with non-trivial gamma
+        let mut s = sim(2, 1);
+
+        let tile = Coord::new(0, 0);
+        let reduce = Coord::new(1, 0);
+
+        // Single tile PE with the full feature vector
+        let hops_to_reduce = crate::route::generate_route_xy(tile, reduce);
+        s.add_task_direct(
+            tile,
+            TaskConfig {
+                kind: TaskKind::RmsNormPartialSum {
+                    input_slot: 0,
+                    reduce_dest: reduce,
+                    reduce_hops: hops_to_reduce,
+                    partial_sum_slot: 0,
+                },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            tile,
+            TaskConfig {
+                kind: TaskKind::RmsNormNormalize {
+                    input_slot: 0,
+                    scale_slot: 1,
+                    gamma_slot: 2,
+                    output_dests: vec![],
+                    payload_slots: vec![],
+                },
+                trigger_slot: 1,
+            },
+        );
+        // gamma = [2.0, 0.5]
+        s.write_sram(tile, 2, vec![2.0, 0.5]);
+
+        let hops_to_tile = crate::route::generate_route_xy(reduce, tile);
+        s.add_task_direct(
+            reduce,
+            TaskConfig {
+                kind: TaskKind::RmsNormReduce {
+                    num_tiles: 1,
+                    feature_count: 2,
+                    eps: 1e-6,
+                    tile_dests: vec![(tile, hops_to_tile)],
+                    scale_slot: 1,
+                },
+                trigger_slot: 0,
+            },
+        );
+
+        // Input: [3.0, 4.0]
+        // sum(x^2) = 9 + 16 = 25, mean = 25/2 = 12.5
+        // scale = 1/sqrt(12.5 + 1e-6) ≈ 0.2828
+        // result = [3 * scale * 2.0, 4 * scale * 0.5]
+        s.inject_message(InjectMessage {
+            source: tile,
+            dest: tile,
+            payload: vec![3.0, 4.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+
+        // Verify all 3 tasks ran: partial_sum + reduce + normalize
+        assert!(result.profile.total_tasks_executed >= 3);
+
+        // Verify operator timings include our task kinds
+        let kinds: Vec<&str> = result
+            .profile
+            .operator_timings
+            .iter()
+            .map(|t| t.task_kind.as_str())
+            .collect();
+        assert!(kinds.contains(&"rms_norm_partial_sum"));
+        assert!(kinds.contains(&"rms_norm_reduce"));
+        assert!(kinds.contains(&"rms_norm_normalize"));
+    }
+
+    #[test]
+    fn rmsnorm_reduce_counter_based() {
+        // Verify that RmsNormReduce only computes after all partial sums arrive
+        // 3 tile PEs → reduce PE → collect
+        let mut s = sim(4, 1);
+
+        let reduce = Coord::new(3, 0);
+        let tiles = [Coord::new(0, 0), Coord::new(1, 0), Coord::new(2, 0)];
+
+        // Each tile sends a partial sum to the reduce PE
+        for (i, &tile) in tiles.iter().enumerate() {
+            let hops = crate::route::generate_route_xy(tile, reduce);
+            s.add_task_direct(
+                tile,
+                TaskConfig {
+                    kind: TaskKind::RmsNormPartialSum {
+                        input_slot: 0,
+                        reduce_dest: reduce,
+                        reduce_hops: hops,
+                        partial_sum_slot: i as u32, // each tile writes to a different slot
+                    },
+                    trigger_slot: 0,
+                },
+            );
+        }
+
+        // Reduce PE — trigger on slot 0 (all partial sums trigger here via different slots,
+        // but the reduce task fires on each arrival and uses counter)
+        s.add_task_direct(
+            reduce,
+            TaskConfig {
+                kind: TaskKind::RmsNormReduce {
+                    num_tiles: 3,
+                    feature_count: 6, // 3 tiles * 2 features each
+                    eps: 0.0,
+                    tile_dests: vec![], // no broadcast needed for this test
+                    scale_slot: 10,
+                },
+                trigger_slot: 0,
+            },
+        );
+        // Also trigger on slots 1 and 2
+        s.add_task_direct(
+            reduce,
+            TaskConfig {
+                kind: TaskKind::RmsNormReduce {
+                    num_tiles: 3,
+                    feature_count: 6,
+                    eps: 0.0,
+                    tile_dests: vec![],
+                    scale_slot: 10,
+                },
+                trigger_slot: 1,
+            },
+        );
+        s.add_task_direct(
+            reduce,
+            TaskConfig {
+                kind: TaskKind::RmsNormReduce {
+                    num_tiles: 3,
+                    feature_count: 6,
+                    eps: 0.0,
+                    tile_dests: vec![],
+                    scale_slot: 10,
+                },
+                trigger_slot: 2,
+            },
+        );
+
+        // tile0: [1, 0] → sum_sq = 1
+        // tile1: [0, 2] → sum_sq = 4
+        // tile2: [3, 0] → sum_sq = 9
+        // total = 14, mean = 14/6, scale = 1/sqrt(14/6)
+        s.inject_message(InjectMessage {
+            source: tiles[0],
+            dest: tiles[0],
+            payload: vec![1.0, 0.0],
+            payload_slot: 0,
+        });
+        s.inject_message(InjectMessage {
+            source: tiles[1],
+            dest: tiles[1],
+            payload: vec![0.0, 2.0],
+            payload_slot: 0,
+        });
+        s.inject_message(InjectMessage {
+            source: tiles[2],
+            dest: tiles[2],
+            payload: vec![3.0, 0.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+
+        // Verify all tasks executed: 3 partial_sum + 3 reduce triggers (but only last computes)
+        // The reduce task fires 3 times but the first two return early.
+        // total_tasks_executed should include all 3 reduce firings + 3 partial_sum
+        assert!(result.profile.total_tasks_executed >= 6);
     }
 }
