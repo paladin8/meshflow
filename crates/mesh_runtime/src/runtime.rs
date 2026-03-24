@@ -474,6 +474,101 @@ impl Simulator {
                     }
                 }
             }
+            TaskKind::Add {
+                input_slot_a,
+                input_slot_b,
+                output_slot,
+                ref output_dests,
+                ref payload_slots,
+            } => {
+                let pe = self.mesh.pe_mut(coord);
+                let a = pe.read_slot(input_slot_a).clone();
+                let b = pe.read_slot(input_slot_b).clone();
+                pe.counters.tasks_executed += 1;
+                self.profile.total_tasks_executed += 1;
+
+                // Element-wise addition
+                debug_assert_eq!(
+                    a.len(),
+                    b.len(),
+                    "PE {}: Add inputs have mismatched lengths ({} vs {})",
+                    coord,
+                    a.len(),
+                    b.len()
+                );
+                let result: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+                self.task_write_slot(timestamp, coord, output_slot, result.clone());
+
+                // Route to destinations
+                let output_dests = output_dests.clone();
+                let payload_slots = payload_slots.clone();
+                let num_sends = output_dests.len() as u64;
+                self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
+
+                for (i, (dest, hops)) in output_dests.iter().enumerate() {
+                    let send_time = timestamp + self.config.task_base_latency + i as u64;
+                    let slot = payload_slots.get(i).copied().unwrap_or(0);
+                    let message = Message {
+                        id: self.next_message_id,
+                        source: coord,
+                        dest: *dest,
+                        hops: hops.clone(),
+                        current_hop: 0,
+                        payload: result.clone(),
+                        payload_slot: slot,
+                        timestamp: send_time,
+                    };
+                    self.next_message_id += 1;
+                    self.enqueue_deliver(send_time, coord, coord, message);
+                }
+            }
+            TaskKind::Softmax {
+                input_slot,
+                output_slot,
+            } => {
+                let pe = self.mesh.pe_mut(coord);
+                let data = pe.read_slot(input_slot).clone();
+                pe.counters.tasks_executed += 1;
+                self.profile.total_tasks_executed += 1;
+
+                // Numerically stable softmax: exp(x - max) / sum(exp(x - max))
+                let max_val = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_vals: Vec<f32> = data.iter().map(|x| (x - max_val).exp()).collect();
+                let sum: f32 = exp_vals.iter().sum();
+                let result: Vec<f32> = exp_vals.iter().map(|x| x / sum).collect();
+
+                self.task_write_slot(timestamp, coord, output_slot, result);
+            }
+            // MatMul and RmsNorm* are implemented in checkpoint 2
+            TaskKind::MatMul { .. }
+            | TaskKind::RmsNormPartialSum { .. }
+            | TaskKind::RmsNormNormalize { .. }
+            | TaskKind::RmsNormReduce { .. } => {
+                unimplemented!("TaskKind::{} not yet implemented", task);
+            }
+        }
+    }
+
+    /// Write data to a PE's SRAM slot during task execution, then schedule
+    /// any co-located tasks triggered by that slot.
+    ///
+    /// Use this in `process_execute` whenever a task writes a result to local
+    /// SRAM that another task on the same PE should react to (e.g., Softmax
+    /// writing scores that trigger MatMul).
+    ///
+    /// Do NOT use this for:
+    /// - `process_deliver` (already handles its own trigger check)
+    /// - `write_sram` (setup-time weight loading, no triggers)
+    /// - `process_concat_fragment` (internal accumulator writes)
+    fn task_write_slot(&mut self, timestamp: u64, coord: Coord, slot: SlotId, data: Vec<f32>) {
+        self.mesh.pe_mut(coord).write_slot(slot, data);
+        let triggered = self.mesh.pe(coord).triggered_tasks(slot);
+        for task_index in triggered {
+            self.queue.push(
+                timestamp + self.config.task_base_latency,
+                coord,
+                EventKind::ExecuteTask { task_index },
+            );
         }
     }
 
@@ -958,5 +1053,225 @@ mod tests {
         assert_eq!(r1.profile.final_timestamp, r2.profile.final_timestamp);
         assert_eq!(r1.profile.total_hops, r2.profile.total_hops);
         assert_eq!(r1.outputs, r2.outputs);
+    }
+
+    #[test]
+    fn add_element_wise() {
+        // Two inputs arrive at (0,0), Add produces sum, collected at (1,0)
+        let mut s = sim(2, 1);
+
+        // Add task: slot 0 + slot 1 -> slot 2, route to (1,0)
+        let hops = crate::route::generate_route_xy(Coord::new(0, 0), Coord::new(1, 0));
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::Add {
+                    input_slot_a: 0,
+                    input_slot_b: 1,
+                    output_slot: 2,
+                    output_dests: vec![(Coord::new(1, 0), hops)],
+                    payload_slots: vec![0],
+                },
+                trigger_slot: 1, // trigger when second input arrives
+            },
+        );
+        s.add_task_direct(
+            Coord::new(1, 0),
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+
+        // Pre-load first input (skip connection)
+        s.write_sram(Coord::new(0, 0), 0, vec![1.0, 2.0, 3.0]);
+        // Inject second input (main path)
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![10.0, 20.0, 30.0],
+            payload_slot: 1,
+        });
+
+        let result = s.run();
+        let output = result.outputs.get(&Coord::new(1, 0)).unwrap();
+        assert_eq!(output, &vec![11.0, 22.0, 33.0]);
+    }
+
+    #[test]
+    fn add_fan_out_to_multiple_dests() {
+        // Add at (0,0) sends result to (1,0) and (2,0)
+        let mut s = sim(3, 1);
+
+        let hops1 = crate::route::generate_route_xy(Coord::new(0, 0), Coord::new(1, 0));
+        let hops2 = crate::route::generate_route_xy(Coord::new(0, 0), Coord::new(2, 0));
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::Add {
+                    input_slot_a: 0,
+                    input_slot_b: 1,
+                    output_slot: 2,
+                    output_dests: vec![(Coord::new(1, 0), hops1), (Coord::new(2, 0), hops2)],
+                    payload_slots: vec![0, 0],
+                },
+                trigger_slot: 1,
+            },
+        );
+        s.add_task_direct(
+            Coord::new(1, 0),
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            Coord::new(2, 0),
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+
+        s.write_sram(Coord::new(0, 0), 0, vec![1.0, 2.0]);
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![3.0, 4.0],
+            payload_slot: 1,
+        });
+
+        let result = s.run();
+        assert_eq!(result.outputs.get(&Coord::new(1, 0)), Some(&vec![4.0, 6.0]));
+        assert_eq!(result.outputs.get(&Coord::new(2, 0)), Some(&vec![4.0, 6.0]));
+    }
+
+    #[test]
+    fn softmax_basic() {
+        // Softmax at (0,0): reads slot 0, writes slot 1, triggers collect at slot 1
+        let mut s = sim(1, 1);
+
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::Softmax {
+                    input_slot: 0,
+                    output_slot: 1,
+                },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 1 },
+                trigger_slot: 1,
+            },
+        );
+
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![1.0, 2.0, 3.0, 4.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+        let output = result.outputs.get(&Coord::new(0, 0)).unwrap();
+
+        // Verify softmax properties
+        assert_eq!(output.len(), 4);
+        let sum: f32 = output.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "softmax should sum to 1.0");
+
+        // Values should be monotonically increasing
+        for i in 1..output.len() {
+            assert!(output[i] > output[i - 1]);
+        }
+    }
+
+    #[test]
+    fn softmax_numerical_stability() {
+        // Large values that would overflow without max subtraction
+        let mut s = sim(1, 1);
+
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::Softmax {
+                    input_slot: 0,
+                    output_slot: 1,
+                },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 1 },
+                trigger_slot: 1,
+            },
+        );
+
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![1000.0, 1001.0, 1002.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+        let output = result.outputs.get(&Coord::new(0, 0)).unwrap();
+
+        let sum: f32 = output.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "softmax should sum to 1.0 even with large inputs"
+        );
+        // No NaN or Inf
+        for v in output {
+            assert!(v.is_finite(), "softmax output should be finite");
+        }
+    }
+
+    #[test]
+    fn softmax_uniform_input() {
+        // Equal inputs → uniform distribution
+        let mut s = sim(1, 1);
+
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::Softmax {
+                    input_slot: 0,
+                    output_slot: 1,
+                },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 1 },
+                trigger_slot: 1,
+            },
+        );
+
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![5.0, 5.0, 5.0, 5.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+        let output = result.outputs.get(&Coord::new(0, 0)).unwrap();
+
+        for v in output {
+            assert!(
+                (v - 0.25).abs() < 1e-6,
+                "equal inputs should give uniform distribution"
+            );
+        }
     }
 }

@@ -80,6 +80,59 @@ enum TaskProgram {
         activation: Option<String>,
         route_dests: Vec<((u32, u32), Vec<String>)>,
     },
+    #[serde(rename = "add")]
+    Add {
+        trigger_slot: u32,
+        input_slot_a: u32,
+        input_slot_b: u32,
+        output_slot: u32,
+        output_dests: Vec<((u32, u32), Vec<String>)>,
+        #[serde(default)]
+        payload_slots: Vec<u32>,
+    },
+    #[serde(rename = "softmax")]
+    Softmax {
+        trigger_slot: u32,
+        input_slot: u32,
+        output_slot: u32,
+    },
+    #[serde(rename = "mat_mul")]
+    MatMul {
+        trigger_slot: u32,
+        operand_slots: Vec<u32>,
+        num_dynamic_operands: u32,
+        output_slot: u32,
+        output_dests: Vec<((u32, u32), Vec<String>)>,
+        #[serde(default)]
+        payload_slots: Vec<u32>,
+    },
+    #[serde(rename = "rms_norm_partial_sum")]
+    RmsNormPartialSum {
+        trigger_slot: u32,
+        input_slot: u32,
+        reduce_dest: (u32, u32),
+        reduce_hops: Vec<String>,
+        partial_sum_slot: u32,
+    },
+    #[serde(rename = "rms_norm_normalize")]
+    RmsNormNormalize {
+        trigger_slot: u32,
+        input_slot: u32,
+        scale_slot: u32,
+        gamma_slot: u32,
+        output_dests: Vec<((u32, u32), Vec<String>)>,
+        #[serde(default)]
+        payload_slots: Vec<u32>,
+    },
+    #[serde(rename = "rms_norm_reduce")]
+    RmsNormReduce {
+        trigger_slot: u32,
+        num_tiles: u32,
+        feature_count: u32,
+        eps: f32,
+        tile_dests: Vec<((u32, u32), Vec<String>)>,
+        scale_slot: u32,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +345,25 @@ fn parse_direction(s: &str) -> Result<Direction, ProgramError> {
     }
 }
 
+fn convert_route_dests(
+    dests: &[((u32, u32), Vec<String>)],
+    width: u32,
+    height: u32,
+) -> Result<Vec<(Coord, Vec<Direction>)>, ProgramError> {
+    dests
+        .iter()
+        .map(|(coord, hops)| {
+            let c = Coord::new(coord.0, coord.1);
+            validate_coord(c, width, height)?;
+            let h: Vec<Direction> = hops
+                .iter()
+                .map(|s| parse_direction(s))
+                .collect::<Result<_, _>>()?;
+            Ok((c, h))
+        })
+        .collect()
+}
+
 fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfig, ProgramError> {
     match task {
         TaskProgram::ForwardActivation {
@@ -379,18 +451,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             route_dests,
         } => {
             let act = activation.as_deref().map(parse_activation).transpose()?;
-            let dests: Vec<(Coord, Vec<Direction>)> = route_dests
-                .iter()
-                .map(|(coord, hops)| {
-                    let c = Coord::new(coord.0, coord.1);
-                    validate_coord(c, width, height)?;
-                    let h: Vec<Direction> = hops
-                        .iter()
-                        .map(|s| parse_direction(s))
-                        .collect::<Result<_, _>>()?;
-                    Ok((c, h))
-                })
-                .collect::<Result<_, ProgramError>>()?;
+            let dests = convert_route_dests(route_dests, width, height)?;
             Ok(TaskConfig {
                 kind: TaskKind::ConcatCollectForward {
                     num_fragments: *num_fragments,
@@ -398,6 +459,120 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     fragment_offset: *fragment_offset,
                     activation: act,
                     route_dests: dests,
+                },
+                trigger_slot: *trigger_slot,
+            })
+        }
+        TaskProgram::Add {
+            trigger_slot,
+            input_slot_a,
+            input_slot_b,
+            output_slot,
+            output_dests,
+            payload_slots,
+        } => {
+            let dests = convert_route_dests(output_dests, width, height)?;
+            Ok(TaskConfig {
+                kind: TaskKind::Add {
+                    input_slot_a: *input_slot_a,
+                    input_slot_b: *input_slot_b,
+                    output_slot: *output_slot,
+                    output_dests: dests,
+                    payload_slots: payload_slots.clone(),
+                },
+                trigger_slot: *trigger_slot,
+            })
+        }
+        TaskProgram::Softmax {
+            trigger_slot,
+            input_slot,
+            output_slot,
+        } => Ok(TaskConfig {
+            kind: TaskKind::Softmax {
+                input_slot: *input_slot,
+                output_slot: *output_slot,
+            },
+            trigger_slot: *trigger_slot,
+        }),
+        TaskProgram::MatMul {
+            trigger_slot,
+            operand_slots,
+            num_dynamic_operands,
+            output_slot,
+            output_dests,
+            payload_slots,
+        } => {
+            let dests = convert_route_dests(output_dests, width, height)?;
+            Ok(TaskConfig {
+                kind: TaskKind::MatMul {
+                    operand_slots: operand_slots.clone(),
+                    num_dynamic_operands: *num_dynamic_operands,
+                    output_slot: *output_slot,
+                    output_dests: dests,
+                    payload_slots: payload_slots.clone(),
+                },
+                trigger_slot: *trigger_slot,
+            })
+        }
+        TaskProgram::RmsNormPartialSum {
+            trigger_slot,
+            input_slot,
+            reduce_dest,
+            reduce_hops,
+            partial_sum_slot,
+        } => {
+            let dest = Coord::new(reduce_dest.0, reduce_dest.1);
+            validate_coord(dest, width, height)?;
+            let hops: Vec<Direction> = reduce_hops
+                .iter()
+                .map(|s| parse_direction(s))
+                .collect::<Result<_, _>>()?;
+            Ok(TaskConfig {
+                kind: TaskKind::RmsNormPartialSum {
+                    input_slot: *input_slot,
+                    reduce_dest: dest,
+                    reduce_hops: hops,
+                    partial_sum_slot: *partial_sum_slot,
+                },
+                trigger_slot: *trigger_slot,
+            })
+        }
+        TaskProgram::RmsNormNormalize {
+            trigger_slot,
+            input_slot,
+            scale_slot,
+            gamma_slot,
+            output_dests,
+            payload_slots,
+        } => {
+            let dests = convert_route_dests(output_dests, width, height)?;
+            Ok(TaskConfig {
+                kind: TaskKind::RmsNormNormalize {
+                    input_slot: *input_slot,
+                    scale_slot: *scale_slot,
+                    gamma_slot: *gamma_slot,
+                    output_dests: dests,
+                    payload_slots: payload_slots.clone(),
+                },
+                trigger_slot: *trigger_slot,
+            })
+        }
+        TaskProgram::RmsNormReduce {
+            trigger_slot,
+            num_tiles,
+            feature_count,
+            eps,
+            tile_dests,
+            scale_slot,
+        } => {
+            let dests = convert_route_dests(tile_dests, width, height)?;
+            Ok(TaskConfig {
+                kind: TaskKind::RmsNormReduce {
+                    num_tiles: *num_tiles,
+                    feature_count: *feature_count,
+                    eps: *eps,
+                    tile_dests: dests,
+                    scale_slot: *scale_slot,
                 },
                 trigger_slot: *trigger_slot,
             })

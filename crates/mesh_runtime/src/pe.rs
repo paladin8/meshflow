@@ -94,6 +94,50 @@ pub enum TaskKind {
         activation: Option<Activation>,
         route_dests: Vec<(Coord, Vec<Direction>)>,
     },
+    /// Element-wise addition of two SRAM slots.
+    Add {
+        input_slot_a: SlotId,
+        input_slot_b: SlotId,
+        output_slot: SlotId,
+        output_dests: Vec<(Coord, Vec<Direction>)>,
+        payload_slots: Vec<SlotId>,
+    },
+    /// Numerically stable row-wise softmax (in-place on a single PE).
+    Softmax {
+        input_slot: SlotId,
+        output_slot: SlotId,
+    },
+    /// Local dot-product / vector-matrix multiply.
+    MatMul {
+        operand_slots: Vec<SlotId>,
+        num_dynamic_operands: u32,
+        output_slot: SlotId,
+        output_dests: Vec<(Coord, Vec<Direction>)>,
+        payload_slots: Vec<SlotId>,
+    },
+    /// RMSNorm phase 1: compute sum(x^2) for local slice, send to reduce PE.
+    RmsNormPartialSum {
+        input_slot: SlotId,
+        reduce_dest: Coord,
+        reduce_hops: Vec<Direction>,
+        partial_sum_slot: SlotId,
+    },
+    /// RMSNorm phase 2: apply x * scale * gamma using scale from reduce PE.
+    RmsNormNormalize {
+        input_slot: SlotId,
+        scale_slot: SlotId,
+        gamma_slot: SlotId,
+        output_dests: Vec<(Coord, Vec<Direction>)>,
+        payload_slots: Vec<SlotId>,
+    },
+    /// RMSNorm reduce: accumulate partial sums, compute scale, broadcast.
+    RmsNormReduce {
+        num_tiles: u32,
+        feature_count: u32,
+        eps: f32,
+        tile_dests: Vec<(Coord, Vec<Direction>)>,
+        scale_slot: SlotId,
+    },
 }
 
 impl std::fmt::Display for TaskKind {
@@ -104,6 +148,12 @@ impl std::fmt::Display for TaskKind {
             TaskKind::Linear { .. } => write!(f, "linear"),
             TaskKind::ConcatCollect { .. } => write!(f, "concat_collect"),
             TaskKind::ConcatCollectForward { .. } => write!(f, "concat_collect_forward"),
+            TaskKind::Add { .. } => write!(f, "add"),
+            TaskKind::Softmax { .. } => write!(f, "softmax"),
+            TaskKind::MatMul { .. } => write!(f, "mat_mul"),
+            TaskKind::RmsNormPartialSum { .. } => write!(f, "rms_norm_partial_sum"),
+            TaskKind::RmsNormNormalize { .. } => write!(f, "rms_norm_normalize"),
+            TaskKind::RmsNormReduce { .. } => write!(f, "rms_norm_reduce"),
         }
     }
 }
