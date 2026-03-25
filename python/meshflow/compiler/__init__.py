@@ -47,35 +47,52 @@ def _validate_weights(
     graph: GraphIR,
     weights: dict[str, dict[str, np.ndarray]] | None,
 ) -> None:
-    """Validate that weights are provided for all LINEAR nodes with correct shapes."""
+    """Validate that weights are provided for LINEAR and RMSNORM nodes."""
     for node in graph.nodes:
-        if node.op != OpType.LINEAR:
-            continue
-        if node.attrs is None:
-            raise ValueError(f"LINEAR node {node.id!r} requires attrs")
-        in_f = node.attrs["in_features"]
-        out_f = node.attrs["out_features"]
+        if node.op == OpType.LINEAR:
+            if node.attrs is None:
+                raise ValueError(f"LINEAR node {node.id!r} requires attrs")
+            in_f = node.attrs["in_features"]
+            out_f = node.attrs["out_features"]
 
-        if weights is None or node.id not in weights:
-            raise ValueError(f"LINEAR node {node.id!r} requires weights")
+            if weights is None or node.id not in weights:
+                raise ValueError(f"LINEAR node {node.id!r} requires weights")
 
-        w_dict = weights[node.id]
-        if "weight" not in w_dict:
-            raise ValueError(f"LINEAR node {node.id!r} missing 'weight' in weights")
-        if "bias" not in w_dict:
-            raise ValueError(f"LINEAR node {node.id!r} missing 'bias' in weights")
+            w_dict = weights[node.id]
+            if "weight" not in w_dict:
+                raise ValueError(f"LINEAR node {node.id!r} missing 'weight' in weights")
+            if "bias" not in w_dict:
+                raise ValueError(f"LINEAR node {node.id!r} missing 'bias' in weights")
 
-        w = w_dict["weight"]
-        if w.shape != (out_f, in_f):
-            raise ValueError(
-                f"LINEAR node {node.id!r}: weight shape {w.shape} doesn't match ({out_f}, {in_f})"
-            )
+            w = w_dict["weight"]
+            if w.shape != (out_f, in_f):
+                raise ValueError(
+                    f"LINEAR node {node.id!r}: weight shape {w.shape} doesn't match ({out_f}, {in_f})"
+                )
 
-        b = w_dict["bias"]
-        if b.shape != (out_f,):
-            raise ValueError(
-                f"LINEAR node {node.id!r}: bias shape {b.shape} doesn't match ({out_f},)"
-            )
+            b = w_dict["bias"]
+            if b.shape != (out_f,):
+                raise ValueError(
+                    f"LINEAR node {node.id!r}: bias shape {b.shape} doesn't match ({out_f},)"
+                )
+
+        elif node.op == OpType.RMSNORM:
+            if node.attrs is None:
+                raise ValueError(f"RMSNORM node {node.id!r} requires attrs")
+            fc = node.attrs["feature_count"]
+
+            if weights is None or node.id not in weights:
+                raise ValueError(f"RMSNORM node {node.id!r} requires weights")
+
+            w_dict = weights[node.id]
+            if "gamma" not in w_dict:
+                raise ValueError(f"RMSNORM node {node.id!r} missing 'gamma' in weights")
+
+            g = w_dict["gamma"]
+            if g.shape != (fc,):
+                raise ValueError(
+                    f"RMSNORM node {node.id!r}: gamma shape {g.shape} doesn't match ({fc},)"
+                )
 
 
 def _validate_shape_chaining(graph: GraphIR) -> None:

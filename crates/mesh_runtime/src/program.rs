@@ -82,6 +82,8 @@ enum TaskProgram {
         activation: Option<String>,
         route_dests: Vec<((u32, u32), Vec<String>)>,
         #[serde(default)]
+        payload_slots: Vec<u32>,
+        #[serde(default)]
         num_positions: u32,
         #[serde(default)]
         scatter: bool,
@@ -471,6 +473,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             fragment_offset,
             activation,
             route_dests,
+            payload_slots,
             num_positions,
             scatter,
         } => {
@@ -483,6 +486,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     fragment_offset: *fragment_offset,
                     activation: act,
                     route_dests: dests,
+                    payload_slots: payload_slots.clone(),
                     num_positions: *num_positions,
                     scatter: *scatter,
                 },

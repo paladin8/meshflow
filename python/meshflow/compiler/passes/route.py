@@ -133,10 +133,25 @@ def _route_xy(
 
             if is_intermediate:
                 route_dests: list[tuple[tuple[int, int], list[Direction]]] = []
+                collect_payload_slots: list[int] = []
                 for edge in outgoing:
                     dst = node_map[edge.dst_node]
                     tile_hops = _generate_route_xy(node.coord, dst.coord)
                     route_dests.append((dst.coord, tile_hops))
+                    collect_payload_slots.append(edge.dst_slot)
+
+                # Detect scatter: when routing to multiple attention PEs
+                # and delivering to the Q slot (0), scatter Q rows instead
+                # of broadcasting the full matrix.
+                use_scatter = False
+                if len(outgoing) > 1:
+                    all_attn = all(
+                        node_map[e.dst_node].kind == PlacedNodeKind.ATTENTION_PE for e in outgoing
+                    )
+                    # Q slot = 0 on attention PEs
+                    all_q_slot = all(e.dst_slot == 0 for e in outgoing)
+                    if all_attn and all_q_slot:
+                        use_scatter = True
 
                 for i in range(collect.num_fragments):
                     frag_offset = i * base + min(i, remainder)
@@ -148,6 +163,8 @@ def _route_xy(
                             fragment_offset=frag_offset,
                             activation=collect.activation,
                             route_dests=list(route_dests),
+                            payload_slots=list(collect_payload_slots),
+                            scatter=use_scatter,
                         )
                     )
             else:
@@ -264,6 +281,10 @@ def _route_rmsnorm_tile(
     reduce_node = node_map[reduce_edge.dst_node]
     reduce_hops = _generate_route_xy(node.coord, reduce_node.coord)
 
+    # Get feature_count from reduce PE data
+    assert isinstance(reduce_node.data, PlacedRmsNormReduceData)
+    feature_count = reduce_node.data.feature_count
+
     # Phase 1: RmsNormPartialSum
     pe_tasks[node.coord].append(
         RmsNormPartialSumEntry(
@@ -274,6 +295,7 @@ def _route_rmsnorm_tile(
             partial_sum_slot=tile.tile_index,
             slice_offset=tile.feature_slice_offset,
             slice_size=tile.feature_slice_size,
+            feature_count=feature_count,
         )
     )
 

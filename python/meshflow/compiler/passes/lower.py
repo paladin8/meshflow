@@ -81,6 +81,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             scatter=task.scatter,
             activation=task.activation,
             route_dests=[(coord, [d.value for d in hops]) for coord, hops in task.route_dests],
+            payload_slots=list(task.payload_slots),
         )
     if isinstance(task, AddEntry):
         return AddTask(
@@ -118,6 +119,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             partial_sum_slot=task.partial_sum_slot,
             slice_offset=task.slice_offset,
             slice_size=task.slice_size,
+            feature_count=task.feature_count,
         )
     if isinstance(task, RmsNormNormalizeEntry):
         return RmsNormNormalizeTask(

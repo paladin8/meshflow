@@ -73,7 +73,9 @@ def expand(graph: GraphIR, config: CompilerConfig) -> ExpandedIR:
             assert node.attrs is not None
             feature_count = node.attrs["feature_count"]
             eps = node.attrs["eps"]
-            num_tiles = _compute_tile_count(feature_count, config)
+            num_tiles = _compute_tile_count(
+                feature_count, config, reserved_rows=2
+            )  # reduce + collect
             groups.append(
                 RmsNormGroup(
                     origin_id=nid,
@@ -107,9 +109,17 @@ def expand(graph: GraphIR, config: CompilerConfig) -> ExpandedIR:
                         input_pe_ids=pe_ids, output_pe_ids=pe_ids
                     )
                 if chain["av_matmul_id"]:
-                    node_expansions[chain["av_matmul_id"]] = NodeExpansion(
-                        input_pe_ids=pe_ids, output_pe_ids=pe_ids
-                    )
+                    if seq_len > 1:
+                        # Multi-PE: AV output goes through attention collect PE
+                        collect_id = f"{nid}_collect"
+                        node_expansions[chain["av_matmul_id"]] = NodeExpansion(
+                            input_pe_ids=pe_ids, output_pe_ids=[collect_id]
+                        )
+                    else:
+                        # Single PE: AV output goes directly downstream
+                        node_expansions[chain["av_matmul_id"]] = NodeExpansion(
+                            input_pe_ids=pe_ids, output_pe_ids=pe_ids
+                        )
                 groups.append(attn_group)
             else:
                 assert node.attrs is not None

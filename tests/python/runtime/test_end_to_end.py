@@ -241,8 +241,8 @@ class TestLinearEndToEnd:
 
         # 3 broadcast input messages + 3 fragment messages from tile PEs
         assert result.total_messages == 6
-        # 3 linear tasks + 3 concat_collect tasks
-        assert result.total_tasks_executed == 6
+        # 3 linear completions + 1 concat_collect completion
+        assert result.total_tasks_executed == 4
         # Fragment hops: tile 0 -> collect = 3 north, tile 1 -> 2 north, tile 2 -> 1 north = 6
         assert result.total_hops == 6
 
@@ -404,10 +404,10 @@ class TestMLPEndToEnd:
         # Total = 6 + 3 + 3 = 12
         assert result.total_messages == 12
 
-        # Layer 1: 3 linear + 3 concat_collect_forward = 6
-        # Layer 2: 3 linear + 3 concat_collect = 6
-        # Total = 12
-        assert result.total_tasks_executed == 12
+        # Layer 1: 3 linear completions + 1 concat_collect_forward completion = 4
+        # Layer 2: 3 linear completions + 1 concat_collect completion = 4
+        # Total = 8
+        assert result.total_tasks_executed == 8
 
 
 class TestMLPValidationErrors:

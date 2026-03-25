@@ -315,8 +315,10 @@ impl Simulator {
     // These must not collide with each other or with user-facing slots.
     // - ConcatCollect/ConcatCollectForward: MAX (accumulator), MAX-1 (counter)
     // - RmsNormReduce: MAX (accumulator), MAX-1 (counter)
+    // - ConcatCollect auto-detect: MAX-2 (stored num_positions)
     const ACCUM_SLOT: SlotId = u32::MAX;
     const COUNTER_SLOT: SlotId = u32::MAX - 1;
+    const NUM_POS_SLOT: SlotId = u32::MAX - 2;
 
     fn process_execute(&mut self, timestamp: u64, coord: Coord, task_index: usize) {
         // Clone the task to avoid borrow conflicts with the PE
@@ -451,11 +453,13 @@ impl Simulator {
                 fragment_offset,
                 ref activation,
                 ref route_dests,
+                ref payload_slots,
                 num_positions,
                 scatter,
             } => {
                 let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
                 let activation = activation.clone();
+                let payload_slots = payload_slots.clone();
                 let route_dests = route_dests.clone();
                 let completed = self.process_concat_fragment(
                     coord,
@@ -488,7 +492,7 @@ impl Simulator {
                                 hops: hops.clone(),
                                 current_hop: 0,
                                 payload: row,
-                                payload_slot: 0,
+                                payload_slot: payload_slots.get(i).copied().unwrap_or(0),
                                 timestamp: send_time,
                             };
                             self.next_message_id += 1;
@@ -498,6 +502,7 @@ impl Simulator {
                         // Broadcast: send full result to all destinations
                         for (i, (dest, hops)) in route_dests.iter().enumerate() {
                             let send_time = timestamp + self.config.task_base_latency + i as u64;
+                            let slot = payload_slots.get(i).copied().unwrap_or(0);
                             let message = Message {
                                 id: self.next_message_id,
                                 source: coord,
@@ -505,7 +510,7 @@ impl Simulator {
                                 hops: hops.clone(),
                                 current_hop: 0,
                                 payload: result.clone(),
-                                payload_slot: 0,
+                                payload_slot: slot,
                                 timestamp: send_time,
                             };
                             self.next_message_id += 1;
@@ -522,18 +527,20 @@ impl Simulator {
                 ref payload_slots,
             } => {
                 let pe = self.mesh.pe_mut(coord);
-                pe.counters.tasks_executed += 1;
-                self.profile.total_tasks_executed += 1;
 
                 // Guard: both inputs must be present before computing.
-                // The task triggers on each input arrival; only the second
-                // trigger finds both slots populated.
                 if !pe.has_slot(input_slot_a) || !pe.has_slot(input_slot_b) {
                     return;
                 }
 
+                pe.counters.tasks_executed += 1;
+                self.profile.total_tasks_executed += 1;
+
                 let a = pe.read_slot(input_slot_a).clone();
                 let b = pe.read_slot(input_slot_b).clone();
+                // Consume both slots to prevent double execution
+                pe.remove_slot(input_slot_a);
+                pe.remove_slot(input_slot_b);
 
                 // Element-wise addition
                 debug_assert_eq!(
@@ -598,16 +605,20 @@ impl Simulator {
                 ref payload_slots,
             } => {
                 let pe = self.mesh.pe_mut(coord);
-                pe.counters.tasks_executed += 1;
-                self.profile.total_tasks_executed += 1;
 
                 // has_slot guard: both inputs must be present
                 if !pe.has_slot(matrix_slot) || !pe.has_slot(vector_slot) {
                     return;
                 }
 
+                pe.counters.tasks_executed += 1;
+                self.profile.total_tasks_executed += 1;
+
                 let matrix = pe.read_slot(matrix_slot).clone();
                 let vector = pe.read_slot(vector_slot).clone();
+                // Consume both slots to prevent double execution
+                pe.remove_slot(matrix_slot);
+                pe.remove_slot(vector_slot);
                 let r = rows as usize;
                 let c = cols as usize;
 
@@ -740,7 +751,7 @@ impl Simulator {
                 // vector. Extract this PE's feature slice for each position,
                 // apply per-position scale * gamma, and produce a position-major
                 // output of the normalized slices.
-                let result = if num_positions > 1 && ss > 0 {
+                let result = if ss > 0 && data.len() > ss {
                     // Total features per position = data.len() / num_positions
                     debug_assert_eq!(
                         data.len() % num_positions,
@@ -749,12 +760,14 @@ impl Simulator {
                         coord
                     );
                     let fc = data.len() / num_positions;
+                    // Output in row-major: for each feature in the slice,
+                    // emit all positions' values. This matches the LINEAR
+                    // tile output layout for correct ConcatCollect placement.
                     let mut out = Vec::with_capacity(num_positions * ss);
-                    for p in 0..num_positions {
-                        let start = p * fc + so;
-                        let slice = &data[start..start + ss];
-                        let scale = scales[p];
-                        for (j, &x) in slice.iter().enumerate() {
+                    for j in 0..ss {
+                        for (p, &scale) in scales.iter().enumerate() {
+                            let start = p * fc + so;
+                            let x = data[start + j];
                             out.push(x * scale * gamma[j]);
                         }
                     }
@@ -806,14 +819,10 @@ impl Simulator {
                 ref tile_dests,
                 scale_slot,
             } => {
-                // Counter-based accumulation (like ConcatCollect):
-                // fires on each partial sum arrival, computes when all arrive.
-                // Note: tasks_executed counts triggers (including early returns),
-                // not completions — consistent with ConcatCollect/MatMul.
+                // Counter-based accumulation: fires on each partial sum arrival,
+                // computes when all arrive. Only counts as executed on completion.
                 let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
                 let pe = self.mesh.pe_mut(coord);
-                pe.counters.tasks_executed += 1;
-                self.profile.total_tasks_executed += 1;
 
                 let partial_sums = pe.read_slot(trigger_slot).clone();
                 let num_positions = partial_sums.len(); // 1 for single-position
@@ -843,7 +852,11 @@ impl Simulator {
                     return; // Still waiting for more partial sums
                 }
 
-                // All partial sums received — compute per-position scale factors.
+                // All partial sums received — count as a completion.
+                pe.counters.tasks_executed += 1;
+                self.profile.total_tasks_executed += 1;
+
+                // Compute per-position scale factors.
                 // Accumulator has one sum per position.
                 let running = pe.read_slot(accum_slot).clone();
                 let fc = feature_count as f32;
@@ -926,21 +939,36 @@ impl Simulator {
     ) -> Option<Vec<f32>> {
         let pe = self.mesh.pe_mut(coord);
         let fragment = pe.read_slot(trigger_slot).clone();
-        pe.counters.tasks_executed += 1;
-        self.profile.total_tasks_executed += 1;
 
+        let frag_len = fragment.len();
+
+        // Use reserved SRAM slots for accumulator buffer, counter, and num_positions.
+        let accum_slot = Self::ACCUM_SLOT;
+        let counter_slot = Self::COUNTER_SLOT;
+        let num_pos_slot = Self::NUM_POS_SLOT;
+
+        // Determine num_positions. If set explicitly, use it. Otherwise, auto-detect
+        // from the first fragment's size: fragment has (tile_rows * num_positions) values.
+        // We compute: expected_tile_rows = total_rows / num_fragments (base), and
+        // if fragment is larger, infer num_positions = frag_len / expected_base.
         let num_pos = if num_positions > 0 {
             num_positions as usize
+        } else if pe.has_slot(num_pos_slot) {
+            // Use previously detected value
+            pe.read_slot(num_pos_slot)[0] as usize
         } else {
-            1
+            // Auto-detect from first fragment
+            let base = (total_rows as usize) / (num_fragments as usize).max(1);
+            let detected = if base > 0 && frag_len > base {
+                frag_len / base
+            } else {
+                1
+            };
+            pe.write_slot(num_pos_slot, vec![detected as f32]);
+            detected
         };
         let total_size = total_rows as usize * num_pos;
         let offset = fragment_offset as usize * num_pos;
-        let frag_len = fragment.len();
-
-        // Use reserved SRAM slots for accumulator buffer and counter.
-        let accum_slot = Self::ACCUM_SLOT;
-        let counter_slot = Self::COUNTER_SLOT;
 
         // Initialize accumulator on first fragment
         if !pe.has_slot(accum_slot) {
@@ -952,6 +980,22 @@ impl Simulator {
         // remove the fragment slot to keep SRAM usage at O(1).
         {
             let mut buf = pe.read_slot(accum_slot).clone();
+            if offset + frag_len > buf.len() {
+                panic!(
+                    "PE {}: concat_fragment overflow: buf.len()={}, offset={}, frag_len={}, \
+                     total_rows={}, num_fragments={}, fragment_offset={}, num_pos={}, \
+                     num_positions_param={}",
+                    coord,
+                    buf.len(),
+                    offset,
+                    frag_len,
+                    total_rows,
+                    num_fragments,
+                    fragment_offset,
+                    num_pos,
+                    num_positions
+                );
+            }
             buf[offset..offset + frag_len].copy_from_slice(&fragment);
             pe.write_slot(accum_slot, buf);
             pe.remove_slot(trigger_slot);
@@ -964,10 +1008,14 @@ impl Simulator {
             c
         };
 
-        // All fragments collected — return completed buffer
+        // All fragments collected — count as a completion and return buffer
         if count == num_fragments {
+            pe.counters.tasks_executed += 1;
+            self.profile.total_tasks_executed += 1;
+
             let mut result = pe.remove_slot(accum_slot).unwrap();
             pe.remove_slot(counter_slot);
+            pe.remove_slot(num_pos_slot);
 
             // Transpose from row-major (total_rows, num_pos) to
             // position-major (num_pos, total_rows) when multi-position.
@@ -2119,10 +2167,8 @@ mod tests {
 
         let result = s.run();
 
-        // Verify all tasks executed: 3 partial_sum + 3 reduce triggers (but only last computes)
-        // The reduce task fires 3 times but the first two return early.
-        // total_tasks_executed should include all 3 reduce firings + 3 partial_sum
-        assert!(result.profile.total_tasks_executed >= 6);
+        // Completions only: 3 partial_sum completions + 1 reduce completion = 4
+        assert!(result.profile.total_tasks_executed >= 4);
     }
 
     #[test]
@@ -2323,6 +2369,7 @@ mod tests {
                         fragment_offset: i,
                         activation: None,
                         route_dests: vec![(dest0, hops0.clone()), (dest1, hops1.clone())],
+                        payload_slots: vec![0, 0],
                         num_positions: 2,
                         scatter: true,
                     },
@@ -2466,12 +2513,11 @@ mod tests {
         let scale0 = 1.0 / (25.0_f32 / 2.0 + 1e-6).sqrt();
         let scale1 = 1.0 / (1.0_f32 / 2.0 + 1e-6).sqrt();
 
-        // Position 0: [3*scale0, 4*scale0]
-        assert!((output[0] - 3.0 * scale0).abs() < 1e-5);
-        assert!((output[1] - 4.0 * scale0).abs() < 1e-5);
-        // Position 1: [0*scale1, 1*scale1]
-        assert!((output[2] - 0.0).abs() < 1e-5);
-        assert!((output[3] - 1.0 * scale1).abs() < 1e-5);
+        // Row-major output: [feat0_pos0, feat0_pos1, feat1_pos0, feat1_pos1]
+        assert!((output[0] - 3.0 * scale0).abs() < 1e-5); // feat0_pos0
+        assert!((output[1] - 0.0).abs() < 1e-5); // feat0_pos1
+        assert!((output[2] - 4.0 * scale0).abs() < 1e-5); // feat1_pos0
+        assert!((output[3] - 1.0 * scale1).abs() < 1e-5); // feat1_pos1
     }
 
     #[test]
@@ -2638,7 +2684,7 @@ mod tests {
         let scale0 = 1.0 / (30.0_f32 / 4.0 + 1e-6).sqrt();
         let scale1 = 1.0 / (174.0_f32 / 4.0 + 1e-6).sqrt();
 
-        // Tile 0 output: position-major slices of features [0..2]
+        // Tile 0 output: row-major [feat0_pos0, feat0_pos1, feat1_pos0, feat1_pos1]
         let out0 = result.outputs.get(&collect0).unwrap();
         assert_eq!(out0.len(), 4);
         assert!(
@@ -2648,16 +2694,16 @@ mod tests {
             1.0 * scale0
         );
         assert!(
-            (out0[1] - 2.0 * scale0).abs() < 1e-5,
+            (out0[1] - 5.0 * scale1).abs() < 1e-5,
             "out0[1]: {} vs {}",
             out0[1],
-            2.0 * scale0
+            5.0 * scale1
         );
         assert!(
-            (out0[2] - 5.0 * scale1).abs() < 1e-5,
+            (out0[2] - 2.0 * scale0).abs() < 1e-5,
             "out0[2]: {} vs {}",
             out0[2],
-            5.0 * scale1
+            2.0 * scale0
         );
         assert!(
             (out0[3] - 6.0 * scale1).abs() < 1e-5,
@@ -2666,7 +2712,7 @@ mod tests {
             6.0 * scale1
         );
 
-        // Tile 1 output: position-major slices of features [2..4]
+        // Tile 1 output: row-major [feat2_pos0, feat2_pos1, feat3_pos0, feat3_pos1]
         let out1 = result.outputs.get(&collect1).unwrap();
         assert_eq!(out1.len(), 4);
         assert!(
@@ -2676,16 +2722,16 @@ mod tests {
             3.0 * scale0
         );
         assert!(
-            (out1[1] - 4.0 * scale0).abs() < 1e-5,
+            (out1[1] - 7.0 * scale1).abs() < 1e-5,
             "out1[1]: {} vs {}",
             out1[1],
-            4.0 * scale0
+            7.0 * scale1
         );
         assert!(
-            (out1[2] - 7.0 * scale1).abs() < 1e-5,
+            (out1[2] - 4.0 * scale0).abs() < 1e-5,
             "out1[2]: {} vs {}",
             out1[2],
-            7.0 * scale1
+            4.0 * scale0
         );
         assert!(
             (out1[3] - 8.0 * scale1).abs() < 1e-5,

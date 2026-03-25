@@ -95,6 +95,8 @@ pub enum TaskKind {
         fragment_offset: u32,
         activation: Option<Activation>,
         route_dests: Vec<(Coord, Vec<Direction>)>,
+        /// Per-destination payload slots (which SRAM slot to deliver into).
+        payload_slots: Vec<SlotId>,
         /// Number of sequence positions (0 = infer as 1 for backward compat).
         num_positions: u32,
         /// When true, scatter row i to destination i instead of broadcasting.

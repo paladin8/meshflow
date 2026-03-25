@@ -250,11 +250,11 @@ class TestExpandRmsNorm:
             nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"eps": 1e-6, "feature_count": 16})],
             edges=[],
         )
-        config = CompilerConfig(mesh_height=5)  # 4 tiles + 1 reduce
+        config = CompilerConfig(mesh_height=5)  # 3 tiles + 1 reduce + 1 collect
         expanded = expand(graph, config)
 
         rn_group = next(g for g in expanded.groups if isinstance(g, RmsNormGroup))
-        assert rn_group.num_tiles == 4
+        assert rn_group.num_tiles == 3
 
     def test_rmsnorm_node_expansions(self):
         graph = GraphIR(

@@ -516,8 +516,8 @@ class TestAttentionPlacement:
         expanded = expand(graph, CompilerConfig())
         spatial = place(expanded, CompilerConfig())
 
-        # Only 2 PEs (co-located)
-        assert len(spatial.nodes) == 2
+        # 2 attention PEs + 1 collect PE = 3 nodes
+        assert len(spatial.nodes) == 3
         pe0 = spatial.nodes[0]
         assert isinstance(pe0.data, PlacedAttentionPeData)
         assert pe0.data.softmax_id == "sm"

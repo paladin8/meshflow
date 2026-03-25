@@ -78,14 +78,23 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
             node_pe_map[group.origin_id] = tile_ids + [reduce_id, collect_id]
 
         elif isinstance(group, AttentionGroup):
-            nodes, height = _place_attention_group(group, col)
+            nodes, edges_attn, height = _place_attention_group(group, col)
             placed_nodes.extend(nodes)
+            placed_edges.extend(edges_attn)
             pe_ids = [f"{group.origin_id}_attn_{i}" for i in range(group.seq_len)]
-            node_pe_map[group.origin_id] = pe_ids
+            has_collect = group.av_matmul_id is not None and group.seq_len > 1
+            if has_collect:
+                collect_id = f"{group.origin_id}_collect"
+                node_pe_map[group.origin_id] = pe_ids + [collect_id]
+            else:
+                node_pe_map[group.origin_id] = pe_ids
             if group.softmax_id:
                 node_pe_map[group.softmax_id] = pe_ids
             if group.av_matmul_id:
-                node_pe_map[group.av_matmul_id] = pe_ids
+                if has_collect:
+                    node_pe_map[group.av_matmul_id] = pe_ids + [collect_id]
+                else:
+                    node_pe_map[group.av_matmul_id] = pe_ids
 
         elif isinstance(group, PassthroughGroup):
             node = PlacedNode(
@@ -273,9 +282,12 @@ def _place_rmsnorm_group(
     return nodes, edges, collect_row + 1
 
 
-def _place_attention_group(group: AttentionGroup, col: int) -> tuple[list[PlacedNode], int]:
-    """Place attention PEs in a column."""
+def _place_attention_group(
+    group: AttentionGroup, col: int
+) -> tuple[list[PlacedNode], list[PlacedEdge], int]:
+    """Place attention PEs + collect PE in a column."""
     nodes: list[PlacedNode] = []
+    edges: list[PlacedEdge] = []
 
     for i in range(group.seq_len):
         pe_id = f"{group.origin_id}_attn_{i}"
@@ -295,7 +307,37 @@ def _place_attention_group(group: AttentionGroup, col: int) -> tuple[list[Placed
             )
         )
 
-    return nodes, group.seq_len
+    # Collect PE gathers attention outputs (only needed for attention chains)
+    if group.av_matmul_id is not None and group.seq_len > 1:
+        collect_row = group.seq_len
+        collect_id = f"{group.origin_id}_collect"
+        nodes.append(
+            PlacedNode(
+                id=collect_id,
+                kind=PlacedNodeKind.LINEAR_COLLECT,
+                coord=(col, collect_row),
+                data=PlacedCollectData(
+                    num_fragments=group.seq_len,
+                    total_rows=group.seq_len * group.d_model,
+                    origin_id=group.origin_id,
+                    activation=None,
+                ),
+            )
+        )
+
+        for i in range(group.seq_len):
+            edges.append(
+                PlacedEdge(
+                    src_node=f"{group.origin_id}_attn_{i}",
+                    src_slot=0,
+                    dst_node=collect_id,
+                    dst_slot=i,
+                )
+            )
+
+        return nodes, edges, collect_row + 1
+
+    return nodes, edges, group.seq_len
 
 
 def _generate_inter_group_edges(
