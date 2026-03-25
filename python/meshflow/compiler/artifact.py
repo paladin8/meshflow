@@ -72,12 +72,80 @@ class ConcatCollectForwardTask:
     route_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
 
 
+@dataclass
+class AddTask:
+    kind: str = field(default="add", init=False)
+    trigger_slot: int = 0
+    input_slot_a: int = 0
+    input_slot_b: int = 1
+    output_slot: int = 2
+    output_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
+    payload_slots: list[int] = field(default_factory=list)
+
+
+@dataclass
+class SoftmaxTask:
+    kind: str = field(default="softmax", init=False)
+    trigger_slot: int = 0
+    input_slot: int = 0
+    output_slot: int = 1
+
+
+@dataclass
+class MatMulTask:
+    kind: str = field(default="mat_mul", init=False)
+    trigger_slot: int = 0
+    operand_slots: list[int] = field(default_factory=list)
+    num_dynamic_operands: int = 0
+    output_slot: int = 0
+    output_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
+    payload_slots: list[int] = field(default_factory=list)
+
+
+@dataclass
+class RmsNormPartialSumTask:
+    kind: str = field(default="rms_norm_partial_sum", init=False)
+    trigger_slot: int = 0
+    input_slot: int = 0
+    reduce_dest: tuple[int, int] = (0, 0)
+    reduce_hops: list[str] = field(default_factory=list)
+    partial_sum_slot: int = 0
+
+
+@dataclass
+class RmsNormNormalizeTask:
+    kind: str = field(default="rms_norm_normalize", init=False)
+    trigger_slot: int = 1
+    input_slot: int = 0
+    scale_slot: int = 1
+    gamma_slot: int = 2
+    output_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
+    payload_slots: list[int] = field(default_factory=list)
+
+
+@dataclass
+class RmsNormReduceTask:
+    kind: str = field(default="rms_norm_reduce", init=False)
+    trigger_slot: int = 0
+    num_tiles: int = 0
+    feature_count: int = 0
+    eps: float = 1e-6
+    tile_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
+    scale_slot: int = 1
+
+
 TaskProgram = (
     ForwardActivationTask
     | CollectOutputTask
     | LinearTask
     | ConcatCollectTask
     | ConcatCollectForwardTask
+    | AddTask
+    | SoftmaxTask
+    | MatMulTask
+    | RmsNormPartialSumTask
+    | RmsNormNormalizeTask
+    | RmsNormReduceTask
 )
 """Union of all task types that can appear in a PEProgram."""
 
@@ -160,9 +228,17 @@ def _task_to_dict(task: TaskProgram) -> dict[str, Any]:
     # Convert tuples to lists for msgpack
     if "route_dest" in d and d["route_dest"] is not None:
         d["route_dest"] = list(d["route_dest"])
+    if "reduce_dest" in d and d["reduce_dest"] is not None:
+        d["reduce_dest"] = list(d["reduce_dest"])
     # Convert route_dests list of (coord_tuple, hops) for ConcatCollectForwardTask
     if "route_dests" in d:
         d["route_dests"] = [[list(coord), hops] for coord, hops in d["route_dests"]]
+    # Convert output_dests for Add, MatMul, RmsNormNormalize
+    if "output_dests" in d:
+        d["output_dests"] = [[list(coord), hops] for coord, hops in d["output_dests"]]
+    # Convert tile_dests for RmsNormReduce
+    if "tile_dests" in d:
+        d["tile_dests"] = [[list(coord), hops] for coord, hops in d["tile_dests"]]
     return d
 
 
@@ -187,6 +263,34 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
         if "route_dests" in fields:
             fields["route_dests"] = [(tuple(coord), hops) for coord, hops in fields["route_dests"]]
         return ConcatCollectForwardTask(**fields)
+    if kind == "add":
+        if "output_dests" in fields:
+            fields["output_dests"] = [
+                (tuple(coord), hops) for coord, hops in fields["output_dests"]
+            ]
+        return AddTask(**fields)
+    if kind == "softmax":
+        return SoftmaxTask(**fields)
+    if kind == "mat_mul":
+        if "output_dests" in fields:
+            fields["output_dests"] = [
+                (tuple(coord), hops) for coord, hops in fields["output_dests"]
+            ]
+        return MatMulTask(**fields)
+    if kind == "rms_norm_partial_sum":
+        if fields.get("reduce_dest") is not None:
+            fields["reduce_dest"] = tuple(fields["reduce_dest"])
+        return RmsNormPartialSumTask(**fields)
+    if kind == "rms_norm_normalize":
+        if "output_dests" in fields:
+            fields["output_dests"] = [
+                (tuple(coord), hops) for coord, hops in fields["output_dests"]
+            ]
+        return RmsNormNormalizeTask(**fields)
+    if kind == "rms_norm_reduce":
+        if "tile_dests" in fields:
+            fields["tile_dests"] = [(tuple(coord), hops) for coord, hops in fields["tile_dests"]]
+        return RmsNormReduceTask(**fields)
     raise ValueError(f"unknown task kind: {kind!r}")
 
 

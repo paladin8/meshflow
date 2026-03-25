@@ -1,8 +1,21 @@
 """Spatial IR — graph with placement (each node assigned a PE coordinate)."""
 
 from dataclasses import dataclass, field
+from enum import Enum
 
-from meshflow.compiler.graph_ir import OpType
+
+class PlacedNodeKind(Enum):
+    """Granular kind for placed PEs — disambiguates subtypes within an OpType."""
+
+    FORWARD = "forward"
+    COLLECT_SIMPLE = "collect_simple"
+    LINEAR_TILE = "linear_tile"
+    LINEAR_COLLECT = "linear_collect"
+    RMSNORM_TILE = "rmsnorm_tile"
+    RMSNORM_REDUCE = "rmsnorm_reduce"
+    ATTENTION_PE = "attention_pe"
+    ADD = "add"
+    SOFTMAX = "softmax"
 
 
 @dataclass
@@ -70,7 +83,7 @@ PlacedNodeData = (
 @dataclass
 class PlacedNode:
     id: str
-    op: OpType
+    kind: PlacedNodeKind
     coord: tuple[int, int]
     data: PlacedNodeData = None
 
@@ -89,6 +102,4 @@ class SpatialIR:
     height: int
     nodes: list[PlacedNode]
     edges: list[PlacedEdge]
-    # Mapping from original GraphIR node IDs to expanded PE IDs.
-    # Populated for transformer/mixed graphs.
     node_pe_map: dict[str, list[str]] = field(default_factory=dict)

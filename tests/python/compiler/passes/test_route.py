@@ -7,7 +7,16 @@ from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
 from meshflow.compiler.passes.expand import expand
 from meshflow.compiler.passes.place import place
 from meshflow.compiler.passes.route import _generate_route_xy, route
-from meshflow.compiler.schedule_ir import ConcatCollectForwardEntry, Direction
+from meshflow.compiler.schedule_ir import (
+    AddEntry,
+    ConcatCollectForwardEntry,
+    Direction,
+    MatMulEntry,
+    RmsNormNormalizeEntry,
+    RmsNormPartialSumEntry,
+    RmsNormReduceEntry,
+    SoftmaxEntry,
+)
 
 
 class TestRouting:
@@ -456,3 +465,351 @@ class TestMultiLayerRouting:
         task = l1_collect.tasks[0]
         assert isinstance(task, ConcatCollectForwardEntry)
         assert task.activation is None
+
+
+class TestRmsNormRouting:
+    def _make_rmsnorm_graph(self, feature_count: int = 4) -> GraphIR:
+        return GraphIR(
+            nodes=[
+                Node(id="fwd", op=OpType.FORWARD),
+                Node(
+                    id="rn",
+                    op=OpType.RMSNORM,
+                    attrs={"eps": 1e-6, "feature_count": feature_count},
+                ),
+                Node(id="col", op=OpType.COLLECT),
+            ],
+            edges=[
+                Edge(src_node="fwd", src_slot=0, dst_node="rn", dst_slot=0),
+                Edge(src_node="rn", src_slot=0, dst_node="col", dst_slot=0),
+            ],
+        )
+
+    def _make_rmsnorm_weights(self, feature_count: int = 4) -> dict[str, dict[str, np.ndarray]]:
+        return {
+            "rn": {
+                "gamma": np.ones(feature_count, dtype=np.float32),
+            }
+        }
+
+    def test_rmsnorm_tile_pe_has_partial_sum_and_normalize(self) -> None:
+        graph = self._make_rmsnorm_graph()
+        config = CompilerConfig()
+        weights = self._make_rmsnorm_weights()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config, weights)
+
+        # Tile PE at (1, 0) should have 2 tasks: partial_sum + normalize
+        tile_pe = next(p for p in schedule.pe_schedules if p.coord == (1, 0))
+        assert len(tile_pe.tasks) == 2
+
+        ps_task = tile_pe.tasks[0]
+        assert isinstance(ps_task, RmsNormPartialSumEntry)
+        assert ps_task.kind == "rms_norm_partial_sum"
+        assert ps_task.trigger_slot == 0
+        assert ps_task.input_slot == 0
+        assert ps_task.partial_sum_slot == 0
+
+        norm_task = tile_pe.tasks[1]
+        assert isinstance(norm_task, RmsNormNormalizeEntry)
+        assert norm_task.kind == "rms_norm_normalize"
+        assert norm_task.trigger_slot == 1
+        assert norm_task.input_slot == 0
+        assert norm_task.scale_slot == 1
+        assert norm_task.gamma_slot == 2
+
+    def test_rmsnorm_tile_has_correct_reduce_dest(self) -> None:
+        graph = self._make_rmsnorm_graph()
+        config = CompilerConfig()
+        weights = self._make_rmsnorm_weights()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config, weights)
+
+        # Reduce PE is at (1, 4) (4 tile PEs + reduce)
+        tile_pe = next(p for p in schedule.pe_schedules if p.coord == (1, 0))
+        ps_task = tile_pe.tasks[0]
+        assert isinstance(ps_task, RmsNormPartialSumEntry)
+        assert ps_task.reduce_dest == (1, 4)
+
+    def test_rmsnorm_reduce_pe_has_reduce_entries(self) -> None:
+        graph = self._make_rmsnorm_graph()
+        config = CompilerConfig()
+        weights = self._make_rmsnorm_weights()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config, weights)
+
+        # Reduce PE at (1, 4) has 4 tasks (one per partial sum slot)
+        reduce_pe = next(p for p in schedule.pe_schedules if p.coord == (1, 4))
+        assert len(reduce_pe.tasks) == 4
+        for i, task in enumerate(reduce_pe.tasks):
+            assert isinstance(task, RmsNormReduceEntry)
+            assert task.trigger_slot == i
+            assert task.num_tiles == 4
+            assert task.feature_count == 4
+            assert abs(task.eps - 1e-6) < 1e-10
+            assert task.scale_slot == 1
+            # tile_dests should point back to the 4 tile PEs
+            assert len(task.tile_dests) == 4
+
+    def test_rmsnorm_gamma_in_sram(self) -> None:
+        graph = self._make_rmsnorm_graph()
+        config = CompilerConfig()
+        gamma = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        weights = {"rn": {"gamma": gamma}}
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config, weights)
+
+        # Each tile PE gets a slice of gamma in SRAM slot 2
+        tile_pe0 = next(p for p in schedule.pe_schedules if p.coord == (1, 0))
+        assert 2 in tile_pe0.initial_sram
+        assert tile_pe0.initial_sram[2] == pytest.approx([1.0])
+
+        tile_pe3 = next(p for p in schedule.pe_schedules if p.coord == (1, 3))
+        assert 2 in tile_pe3.initial_sram
+        assert tile_pe3.initial_sram[2] == pytest.approx([4.0])
+
+    def test_rmsnorm_normalize_routes_to_collect(self) -> None:
+        graph = self._make_rmsnorm_graph()
+        config = CompilerConfig()
+        weights = self._make_rmsnorm_weights()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config, weights)
+
+        # Normalize output should route to collect PE
+        tile_pe = next(p for p in schedule.pe_schedules if p.coord == (1, 0))
+        norm_task = tile_pe.tasks[1]
+        assert isinstance(norm_task, RmsNormNormalizeEntry)
+        assert len(norm_task.output_dests) >= 1
+        # The collect PE is at (2, 0)
+        dest_coords = [coord for coord, _ in norm_task.output_dests]
+        assert (2, 0) in dest_coords
+
+
+class TestAttentionRouting:
+    def test_attention_pe_has_matmul_softmax_matmul(self) -> None:
+        """QK^T MatMul → Softmax → AV MatMul chain on attention PEs."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="qkt", op=OpType.MATMUL, attrs={"seq_len": 2}),
+                Node(id="sm", op=OpType.SOFTMAX),
+                Node(id="av", op=OpType.MATMUL, attrs={"seq_len": 2}),
+                Node(id="col", op=OpType.COLLECT),
+            ],
+            edges=[
+                Edge(src_node="qkt", src_slot=0, dst_node="sm", dst_slot=0),
+                Edge(src_node="sm", src_slot=0, dst_node="av", dst_slot=0),
+                Edge(src_node="av", src_slot=0, dst_node="col", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config)
+
+        # seq_len=2: 2 QK^T entries + 1 Softmax + 3 AV entries = 6 tasks
+        attn_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 0))
+        matmul_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulEntry)]
+        softmax_tasks = [t for t in attn_pe.tasks if isinstance(t, SoftmaxEntry)]
+
+        # QK^T: one entry per K slot (1, 2)
+        qkt_tasks = [t for t in matmul_tasks if t.output_slot == 5]  # 2*2+1
+        assert len(qkt_tasks) == 2
+        assert {t.trigger_slot for t in qkt_tasks} == {1, 2}
+        assert qkt_tasks[0].num_dynamic_operands == 2
+
+        # Softmax
+        assert len(softmax_tasks) == 1
+        sm = softmax_tasks[0]
+        assert sm.trigger_slot == 5
+        assert sm.input_slot == 5
+        assert sm.output_slot == 6  # 2*2+2
+
+        # AV: one entry per V slot (3, 4) + softmax output (6) = 3 entries
+        av_tasks = [t for t in matmul_tasks if t.output_slot == 7]  # 2*2+3
+        assert len(av_tasks) == 3
+        assert {t.trigger_slot for t in av_tasks} == {3, 4, 6}
+        assert av_tasks[0].num_dynamic_operands == 3  # seq_len + 1
+
+    def test_attention_slot_layout(self) -> None:
+        """Verify SRAM slot assignments follow the spec for seq_len=4."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="qkt", op=OpType.MATMUL, attrs={"seq_len": 4}),
+                Node(id="sm", op=OpType.SOFTMAX),
+                Node(id="av", op=OpType.MATMUL, attrs={"seq_len": 4}),
+            ],
+            edges=[
+                Edge(src_node="qkt", src_slot=0, dst_node="sm", dst_slot=0),
+                Edge(src_node="sm", src_slot=0, dst_node="av", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config)
+
+        attn_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 0))
+        matmul_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulEntry)]
+
+        # QK^T: 4 entries (one per K slot), all with same operand_slots
+        qkt_tasks = [t for t in matmul_tasks if t.output_slot == 9]
+        assert len(qkt_tasks) == 4
+        assert qkt_tasks[0].operand_slots == [0, 1, 2, 3, 4]
+
+        sm = next(t for t in attn_pe.tasks if isinstance(t, SoftmaxEntry))
+        assert sm.input_slot == 9
+        assert sm.output_slot == 10  # 2*4+2
+
+        # AV: 5 entries (4 V slots + softmax output)
+        av_tasks = [t for t in matmul_tasks if t.output_slot == 11]
+        assert len(av_tasks) == 5
+        assert av_tasks[0].operand_slots == [10, 5, 6, 7, 8]
+
+    def test_attention_av_routes_to_downstream(self) -> None:
+        """AV result routes to downstream PEs."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="qkt", op=OpType.MATMUL, attrs={"seq_len": 2}),
+                Node(id="sm", op=OpType.SOFTMAX),
+                Node(id="av", op=OpType.MATMUL, attrs={"seq_len": 2}),
+                Node(id="col", op=OpType.COLLECT),
+            ],
+            edges=[
+                Edge(src_node="qkt", src_slot=0, dst_node="sm", dst_slot=0),
+                Edge(src_node="sm", src_slot=0, dst_node="av", dst_slot=0),
+                Edge(src_node="av", src_slot=0, dst_node="col", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config)
+
+        attn_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 0))
+        av_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulEntry) and t.output_slot == 7]
+        assert len(av_tasks) > 0
+        # All AV entries share the same output_dests
+        av = av_tasks[0]
+        assert len(av.output_dests) >= 1
+        dest_coords = [coord for coord, _ in av.output_dests]
+        assert (1, 0) in dest_coords
+
+
+class TestAddRouting:
+    def test_add_creates_add_entry(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="a", op=OpType.FORWARD),
+                Node(id="b", op=OpType.FORWARD),
+                Node(id="add", op=OpType.ADD),
+                Node(id="col", op=OpType.COLLECT),
+            ],
+            edges=[
+                Edge(src_node="a", src_slot=0, dst_node="add", dst_slot=0),
+                Edge(src_node="b", src_slot=0, dst_node="add", dst_slot=1),
+                Edge(src_node="add", src_slot=0, dst_node="col", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config)
+
+        add_pe = next(p for p in schedule.pe_schedules if p.coord == (2, 0))
+        # Two AddEntry tasks — one per trigger slot (has_slot guard in runtime)
+        add_tasks = [t for t in add_pe.tasks if isinstance(t, AddEntry)]
+        assert len(add_tasks) == 2
+        assert {t.trigger_slot for t in add_tasks} == {0, 1}
+        for task in add_tasks:
+            assert task.input_slot_a == 0
+            assert task.input_slot_b == 1
+            assert task.output_slot == 2
+
+    def test_add_routes_to_downstream(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="a", op=OpType.FORWARD),
+                Node(id="b", op=OpType.FORWARD),
+                Node(id="add", op=OpType.ADD),
+                Node(id="col", op=OpType.COLLECT),
+            ],
+            edges=[
+                Edge(src_node="a", src_slot=0, dst_node="add", dst_slot=0),
+                Edge(src_node="b", src_slot=0, dst_node="add", dst_slot=1),
+                Edge(src_node="add", src_slot=0, dst_node="col", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config)
+
+        add_pe = next(p for p in schedule.pe_schedules if p.coord == (2, 0))
+        task = add_pe.tasks[0]
+        assert isinstance(task, AddEntry)
+        assert len(task.output_dests) >= 1
+        # collect PE is at (3, 0)
+        dest_coords = [coord for coord, _ in task.output_dests]
+        assert (3, 0) in dest_coords
+
+
+class TestSoftmaxRouting:
+    def test_standalone_softmax(self) -> None:
+        graph = GraphIR(
+            nodes=[
+                Node(id="fwd", op=OpType.FORWARD),
+                Node(id="sm", op=OpType.SOFTMAX),
+                Node(id="col", op=OpType.COLLECT),
+            ],
+            edges=[
+                Edge(src_node="fwd", src_slot=0, dst_node="sm", dst_slot=0),
+                Edge(src_node="sm", src_slot=0, dst_node="col", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config)
+
+        sm_pe = next(p for p in schedule.pe_schedules if p.coord == (1, 0))
+        assert len(sm_pe.tasks) == 1
+        task = sm_pe.tasks[0]
+        assert isinstance(task, SoftmaxEntry)
+        assert task.kind == "softmax"
+        assert task.trigger_slot == 0
+        assert task.input_slot == 0
+        assert task.output_slot == 1
+
+
+class TestForwardBroadcast:
+    def test_forward_broadcast_multiple_destinations(self) -> None:
+        """FORWARD node with multiple outgoing edges generates multiple tasks."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="fwd", op=OpType.FORWARD),
+                Node(id="a", op=OpType.FORWARD),
+                Node(id="b", op=OpType.FORWARD),
+                Node(id="col", op=OpType.COLLECT),
+            ],
+            edges=[
+                Edge(src_node="fwd", src_slot=0, dst_node="a", dst_slot=0),
+                Edge(src_node="fwd", src_slot=0, dst_node="b", dst_slot=0),
+                Edge(src_node="a", src_slot=0, dst_node="col", dst_slot=0),
+                Edge(src_node="b", src_slot=0, dst_node="col", dst_slot=1),
+            ],
+        )
+        config = CompilerConfig()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config)
+
+        fwd_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 0))
+        # Should have 2 ForwardActivation tasks (broadcast)
+        assert len(fwd_pe.tasks) == 2
+        for task in fwd_pe.tasks:
+            assert task.kind == "forward_activation"

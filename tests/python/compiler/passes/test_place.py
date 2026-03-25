@@ -8,6 +8,7 @@ from meshflow.compiler.passes.place import place
 from meshflow.compiler.spatial_ir import (
     PlacedAttentionPeData,
     PlacedCollectData,
+    PlacedNodeKind,
     PlacedRmsNormReduceData,
     PlacedRmsNormTileData,
     PlacedTileData,
@@ -154,7 +155,7 @@ class TestLinearPlacement:
         for i in range(3):
             tile = spatial.nodes[i]
             assert tile.id == f"linear1_tile_{i}"
-            assert tile.op == OpType.LINEAR
+            assert tile.kind == PlacedNodeKind.LINEAR_TILE
             assert tile.coord == (0, i)
             assert isinstance(tile.data, PlacedTileData)
             assert tile.data.tile_index == i
@@ -165,7 +166,7 @@ class TestLinearPlacement:
         # Last is collect PE at top of column
         collect = spatial.nodes[3]
         assert collect.id == "linear1_collect"
-        assert collect.op == OpType.COLLECT
+        assert collect.kind == PlacedNodeKind.LINEAR_COLLECT
         assert collect.coord == (0, 3)
         assert isinstance(collect.data, PlacedCollectData)
         assert collect.data.num_fragments == 3
@@ -300,7 +301,10 @@ class TestMultiLayerPlacement:
         expanded = expand(graph, CompilerConfig(mesh_height=4))
         spatial = place(expanded, CompilerConfig(mesh_height=4))
         # Only LINEAR tiles + collect PEs, no RELU PE
-        assert all(n.op in (OpType.LINEAR, OpType.COLLECT) for n in spatial.nodes)
+        assert all(
+            n.kind in (PlacedNodeKind.LINEAR_TILE, PlacedNodeKind.LINEAR_COLLECT)
+            for n in spatial.nodes
+        )
 
     def test_three_layer_mlp_placement(self) -> None:
         """Linear → ReLU → Linear → ReLU → Linear."""
@@ -537,7 +541,7 @@ class TestAddPlacement:
         spatial = place(expanded, CompilerConfig())
 
         add_node = next(n for n in spatial.nodes if n.id == "add")
-        assert add_node.op == OpType.ADD
+        assert add_node.kind == PlacedNodeKind.ADD
         assert add_node.data is None  # passthrough, no typed data
 
     def test_add_inter_group_edges(self) -> None:

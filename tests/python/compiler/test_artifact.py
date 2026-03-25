@@ -8,13 +8,19 @@ from pathlib import Path
 import pytest
 from meshflow.compiler import compile
 from meshflow.compiler.artifact import (
+    AddTask,
     CollectOutputTask,
     ConcatCollectForwardTask,
     ConcatCollectTask,
     LinearTask,
+    MatMulTask,
     MeshProgramConfig,
     PEProgram,
+    RmsNormNormalizeTask,
+    RmsNormPartialSumTask,
+    RmsNormReduceTask,
     RuntimeProgram,
+    SoftmaxTask,
     deserialize,
     serialize,
 )
@@ -224,6 +230,200 @@ class TestSerializationRoundTrip:
         assert task.route_dests[0] == ((1, 0), ["east", "south", "south", "south"])
         assert task.route_dests[1] == ((1, 1), ["east", "south", "south"])
         assert task.route_dests[2] == ((1, 2), ["east", "south"])
+
+    def test_round_trip_add_task(self) -> None:
+        program = RuntimeProgram(
+            version=1,
+            mesh_config=MeshProgramConfig(width=3, height=1),
+            pe_programs=[
+                PEProgram(
+                    coord=(1, 0),
+                    tasks=[
+                        AddTask(
+                            trigger_slot=1,
+                            input_slot_a=0,
+                            input_slot_b=1,
+                            output_slot=2,
+                            output_dests=[((2, 0), ["east"])],
+                            payload_slots=[0, 1],
+                        ),
+                    ],
+                    initial_sram={},
+                ),
+            ],
+            input_slots=[],
+        )
+        restored = deserialize(serialize(program))
+
+        task = restored.pe_programs[0].tasks[0]
+        assert isinstance(task, AddTask)
+        assert task.kind == "add"
+        assert task.trigger_slot == 1
+        assert task.input_slot_a == 0
+        assert task.input_slot_b == 1
+        assert task.output_slot == 2
+        assert task.output_dests == [((2, 0), ["east"])]
+        assert task.payload_slots == [0, 1]
+
+    def test_round_trip_softmax_task(self) -> None:
+        program = RuntimeProgram(
+            version=1,
+            mesh_config=MeshProgramConfig(width=1, height=1),
+            pe_programs=[
+                PEProgram(
+                    coord=(0, 0),
+                    tasks=[
+                        SoftmaxTask(trigger_slot=5, input_slot=5, output_slot=6),
+                    ],
+                    initial_sram={},
+                ),
+            ],
+            input_slots=[],
+        )
+        restored = deserialize(serialize(program))
+
+        task = restored.pe_programs[0].tasks[0]
+        assert isinstance(task, SoftmaxTask)
+        assert task.kind == "softmax"
+        assert task.trigger_slot == 5
+        assert task.input_slot == 5
+        assert task.output_slot == 6
+
+    def test_round_trip_mat_mul_task(self) -> None:
+        program = RuntimeProgram(
+            version=1,
+            mesh_config=MeshProgramConfig(width=2, height=1),
+            pe_programs=[
+                PEProgram(
+                    coord=(0, 0),
+                    tasks=[
+                        MatMulTask(
+                            trigger_slot=4,
+                            operand_slots=[0, 1, 2, 3, 4],
+                            num_dynamic_operands=4,
+                            output_slot=9,
+                            output_dests=[((1, 0), ["east"])],
+                            payload_slots=[],
+                        ),
+                    ],
+                    initial_sram={},
+                ),
+            ],
+            input_slots=[],
+        )
+        restored = deserialize(serialize(program))
+
+        task = restored.pe_programs[0].tasks[0]
+        assert isinstance(task, MatMulTask)
+        assert task.kind == "mat_mul"
+        assert task.trigger_slot == 4
+        assert task.operand_slots == [0, 1, 2, 3, 4]
+        assert task.num_dynamic_operands == 4
+        assert task.output_slot == 9
+        assert task.output_dests == [((1, 0), ["east"])]
+
+    def test_round_trip_rms_norm_partial_sum_task(self) -> None:
+        program = RuntimeProgram(
+            version=1,
+            mesh_config=MeshProgramConfig(width=1, height=2),
+            pe_programs=[
+                PEProgram(
+                    coord=(0, 0),
+                    tasks=[
+                        RmsNormPartialSumTask(
+                            trigger_slot=0,
+                            input_slot=0,
+                            reduce_dest=(0, 1),
+                            reduce_hops=["north"],
+                            partial_sum_slot=0,
+                        ),
+                    ],
+                    initial_sram={},
+                ),
+            ],
+            input_slots=[],
+        )
+        restored = deserialize(serialize(program))
+
+        task = restored.pe_programs[0].tasks[0]
+        assert isinstance(task, RmsNormPartialSumTask)
+        assert task.kind == "rms_norm_partial_sum"
+        assert task.trigger_slot == 0
+        assert task.input_slot == 0
+        assert task.reduce_dest == (0, 1)
+        assert task.reduce_hops == ["north"]
+        assert task.partial_sum_slot == 0
+
+    def test_round_trip_rms_norm_normalize_task(self) -> None:
+        program = RuntimeProgram(
+            version=1,
+            mesh_config=MeshProgramConfig(width=2, height=1),
+            pe_programs=[
+                PEProgram(
+                    coord=(0, 0),
+                    tasks=[
+                        RmsNormNormalizeTask(
+                            trigger_slot=1,
+                            input_slot=0,
+                            scale_slot=1,
+                            gamma_slot=2,
+                            output_dests=[((1, 0), ["east"])],
+                            payload_slots=[0, 1, 2],
+                        ),
+                    ],
+                    initial_sram={2: [1.0, 1.0, 1.0]},
+                ),
+            ],
+            input_slots=[],
+        )
+        restored = deserialize(serialize(program))
+
+        task = restored.pe_programs[0].tasks[0]
+        assert isinstance(task, RmsNormNormalizeTask)
+        assert task.kind == "rms_norm_normalize"
+        assert task.trigger_slot == 1
+        assert task.input_slot == 0
+        assert task.scale_slot == 1
+        assert task.gamma_slot == 2
+        assert task.output_dests == [((1, 0), ["east"])]
+        assert task.payload_slots == [0, 1, 2]
+
+    def test_round_trip_rms_norm_reduce_task(self) -> None:
+        program = RuntimeProgram(
+            version=1,
+            mesh_config=MeshProgramConfig(width=1, height=3),
+            pe_programs=[
+                PEProgram(
+                    coord=(0, 2),
+                    tasks=[
+                        RmsNormReduceTask(
+                            trigger_slot=0,
+                            num_tiles=2,
+                            feature_count=8,
+                            eps=1e-6,
+                            tile_dests=[
+                                ((0, 0), ["south", "south"]),
+                                ((0, 1), ["south"]),
+                            ],
+                            scale_slot=1,
+                        ),
+                    ],
+                    initial_sram={},
+                ),
+            ],
+            input_slots=[],
+        )
+        restored = deserialize(serialize(program))
+
+        task = restored.pe_programs[0].tasks[0]
+        assert isinstance(task, RmsNormReduceTask)
+        assert task.kind == "rms_norm_reduce"
+        assert task.trigger_slot == 0
+        assert task.num_tiles == 2
+        assert task.feature_count == 8
+        assert abs(task.eps - 1e-6) < 1e-10
+        assert task.tile_dests == [((0, 0), ["south", "south"]), ((0, 1), ["south"])]
+        assert task.scale_slot == 1
 
 
 class TestDeserializeErrors:

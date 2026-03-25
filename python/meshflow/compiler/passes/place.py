@@ -14,6 +14,7 @@ from meshflow.compiler.spatial_ir import (
     PlacedCollectData,
     PlacedEdge,
     PlacedNode,
+    PlacedNodeKind,
     PlacedRmsNormReduceData,
     PlacedRmsNormTileData,
     PlacedTileData,
@@ -86,7 +87,11 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
                 node_pe_map[group.av_matmul_id] = pe_ids
 
         elif isinstance(group, PassthroughGroup):
-            node = PlacedNode(id=group.origin_id, op=group.op, coord=(col, 0))
+            node = PlacedNode(
+                id=group.origin_id,
+                kind=_passthrough_kind(group.op),
+                coord=(col, 0),
+            )
             placed_nodes.append(node)
             node_pe_map[group.origin_id] = [group.origin_id]
             height = 1
@@ -127,7 +132,7 @@ def _place_tiled_compute_group(
         nodes.append(
             PlacedNode(
                 id=tile_id,
-                op=OpType.LINEAR,
+                kind=PlacedNodeKind.LINEAR_TILE,
                 coord=(col, spec.tile_index),
                 data=PlacedTileData(
                     tile_index=spec.tile_index,
@@ -144,7 +149,7 @@ def _place_tiled_compute_group(
     nodes.append(
         PlacedNode(
             id=collect_id,
-            op=OpType.COLLECT,
+            kind=PlacedNodeKind.LINEAR_COLLECT,
             coord=(col, collect_row),
             data=PlacedCollectData(
                 num_fragments=group.collect.num_fragments,
@@ -186,7 +191,7 @@ def _place_rmsnorm_group(
         nodes.append(
             PlacedNode(
                 id=tile_id,
-                op=OpType.RMSNORM,
+                kind=PlacedNodeKind.RMSNORM_TILE,
                 coord=(col, i),
                 data=PlacedRmsNormTileData(
                     tile_index=i,
@@ -203,7 +208,7 @@ def _place_rmsnorm_group(
     nodes.append(
         PlacedNode(
             id=reduce_id,
-            op=OpType.RMSNORM,
+            kind=PlacedNodeKind.RMSNORM_REDUCE,
             coord=(col, reduce_row),
             data=PlacedRmsNormReduceData(
                 num_tiles=group.num_tiles,
@@ -248,7 +253,7 @@ def _place_attention_group(group: AttentionGroup, col: int) -> tuple[list[Placed
         nodes.append(
             PlacedNode(
                 id=pe_id,
-                op=OpType.MATMUL,
+                kind=PlacedNodeKind.ATTENTION_PE,
                 coord=(col, i),
                 data=PlacedAttentionPeData(
                     pe_index=i,
@@ -348,6 +353,22 @@ def _generate_inter_group_edges(
     return edges
 
 
+_PASSTHROUGH_KIND_MAP = {
+    OpType.FORWARD: PlacedNodeKind.FORWARD,
+    OpType.COLLECT: PlacedNodeKind.COLLECT_SIMPLE,
+    OpType.ADD: PlacedNodeKind.ADD,
+    OpType.SOFTMAX: PlacedNodeKind.SOFTMAX,
+}
+
+
+def _passthrough_kind(op: OpType) -> PlacedNodeKind:
+    """Map an OpType to the corresponding PlacedNodeKind for passthrough nodes."""
+    kind = _PASSTHROUGH_KIND_MAP.get(op)
+    if kind is None:
+        raise ValueError(f"no passthrough PlacedNodeKind for {op!r}")
+    return kind
+
+
 # ---------------------------------------------------------------------------
 # Row-major placement for passthrough-only graphs
 # ---------------------------------------------------------------------------
@@ -366,6 +387,7 @@ def _place_row_major(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
 
     placed_nodes: list[PlacedNode] = []
     placed_edges: list[PlacedEdge] = []
+    node_pe_map: dict[str, list[str]] = {}
 
     for idx, group in enumerate(passthrough_nodes):
         x = idx % width
@@ -374,7 +396,10 @@ def _place_row_major(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
             raise ValueError(
                 f"node {group.origin_id!r} at index {idx} does not fit in {width}x{height} mesh"
             )
-        placed_nodes.append(PlacedNode(id=group.origin_id, op=group.op, coord=(x, y)))
+        placed_nodes.append(
+            PlacedNode(id=group.origin_id, kind=_passthrough_kind(group.op), coord=(x, y))
+        )
+        node_pe_map[group.origin_id] = [group.origin_id]
 
     # Map original edges directly
     for e in expanded.original_edges:
@@ -387,4 +412,10 @@ def _place_row_major(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
             )
         )
 
-    return SpatialIR(width=width, height=height, nodes=placed_nodes, edges=placed_edges)
+    return SpatialIR(
+        width=width,
+        height=height,
+        nodes=placed_nodes,
+        edges=placed_edges,
+        node_pe_map=node_pe_map,
+    )

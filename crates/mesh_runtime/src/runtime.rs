@@ -492,10 +492,18 @@ impl Simulator {
                 ref payload_slots,
             } => {
                 let pe = self.mesh.pe_mut(coord);
-                let a = pe.read_slot(input_slot_a).clone();
-                let b = pe.read_slot(input_slot_b).clone();
                 pe.counters.tasks_executed += 1;
                 self.profile.total_tasks_executed += 1;
+
+                // Guard: both inputs must be present before computing.
+                // The task triggers on each input arrival; only the second
+                // trigger finds both slots populated.
+                if !pe.has_slot(input_slot_a) || !pe.has_slot(input_slot_b) {
+                    return;
+                }
+
+                let a = pe.read_slot(input_slot_a).clone();
+                let b = pe.read_slot(input_slot_b).clone();
 
                 // Element-wise addition
                 debug_assert_eq!(

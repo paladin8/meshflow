@@ -1,27 +1,39 @@
 """Lowering pass — mechanical translation from ScheduleIR to RuntimeProgram."""
 
 from meshflow.compiler.artifact import (
+    AddTask,
     CollectOutputTask,
     ConcatCollectForwardTask,
     ConcatCollectTask,
     ForwardActivationTask,
     InputSlotProgram,
     LinearTask,
+    MatMulTask,
     MeshProgramConfig,
     PEProgram,
+    RmsNormNormalizeTask,
+    RmsNormPartialSumTask,
+    RmsNormReduceTask,
     RuntimeProgram,
+    SoftmaxTask,
     TaskProgram,
 )
 from meshflow.compiler.config import CompilerConfig
 from meshflow.compiler.schedule_ir import (
+    AddEntry,
     CollectOutputEntry,
     ConcatCollectEntry,
     ConcatCollectForwardEntry,
     ForwardActivationEntry,
     LinearEntry,
+    MatMulEntry,
+    RmsNormNormalizeEntry,
+    RmsNormPartialSumEntry,
+    RmsNormReduceEntry,
+    ScheduleIR,
+    SoftmaxEntry,
     TaskEntry,
 )
-from meshflow.compiler.schedule_ir import ScheduleIR
 
 
 def _lower_task(task: TaskEntry) -> TaskProgram:
@@ -66,6 +78,56 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             fragment_offset=task.fragment_offset,
             activation=task.activation,
             route_dests=[(coord, [d.value for d in hops]) for coord, hops in task.route_dests],
+        )
+    if isinstance(task, AddEntry):
+        return AddTask(
+            trigger_slot=task.trigger_slot,
+            input_slot_a=task.input_slot_a,
+            input_slot_b=task.input_slot_b,
+            output_slot=task.output_slot,
+            output_dests=[(coord, [d.value for d in hops]) for coord, hops in task.output_dests],
+            payload_slots=list(task.payload_slots),
+        )
+    if isinstance(task, SoftmaxEntry):
+        return SoftmaxTask(
+            trigger_slot=task.trigger_slot,
+            input_slot=task.input_slot,
+            output_slot=task.output_slot,
+        )
+    if isinstance(task, MatMulEntry):
+        return MatMulTask(
+            trigger_slot=task.trigger_slot,
+            operand_slots=list(task.operand_slots),
+            num_dynamic_operands=task.num_dynamic_operands,
+            output_slot=task.output_slot,
+            output_dests=[(coord, [d.value for d in hops]) for coord, hops in task.output_dests],
+            payload_slots=list(task.payload_slots),
+        )
+    if isinstance(task, RmsNormPartialSumEntry):
+        return RmsNormPartialSumTask(
+            trigger_slot=task.trigger_slot,
+            input_slot=task.input_slot,
+            reduce_dest=task.reduce_dest,
+            reduce_hops=[d.value for d in task.reduce_hops],
+            partial_sum_slot=task.partial_sum_slot,
+        )
+    if isinstance(task, RmsNormNormalizeEntry):
+        return RmsNormNormalizeTask(
+            trigger_slot=task.trigger_slot,
+            input_slot=task.input_slot,
+            scale_slot=task.scale_slot,
+            gamma_slot=task.gamma_slot,
+            output_dests=[(coord, [d.value for d in hops]) for coord, hops in task.output_dests],
+            payload_slots=list(task.payload_slots),
+        )
+    if isinstance(task, RmsNormReduceEntry):
+        return RmsNormReduceTask(
+            trigger_slot=task.trigger_slot,
+            num_tiles=task.num_tiles,
+            feature_count=task.feature_count,
+            eps=task.eps,
+            tile_dests=[(coord, [d.value for d in hops]) for coord, hops in task.tile_dests],
+            scale_slot=task.scale_slot,
         )
     raise ValueError(f"unknown task entry type: {type(task)!r}")
 

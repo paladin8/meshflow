@@ -67,12 +67,80 @@ class ConcatCollectForwardEntry:
     route_dests: list[tuple[tuple[int, int], list[Direction]]] = field(default_factory=list)
 
 
+@dataclass
+class AddEntry:
+    kind: str = field(default="add", init=False)
+    trigger_slot: int = 0
+    input_slot_a: int = 0
+    input_slot_b: int = 1
+    output_slot: int = 2
+    output_dests: list[tuple[tuple[int, int], list[Direction]]] = field(default_factory=list)
+    payload_slots: list[int] = field(default_factory=list)
+
+
+@dataclass
+class SoftmaxEntry:
+    kind: str = field(default="softmax", init=False)
+    trigger_slot: int = 0
+    input_slot: int = 0
+    output_slot: int = 1
+
+
+@dataclass
+class MatMulEntry:
+    kind: str = field(default="mat_mul", init=False)
+    trigger_slot: int = 0
+    operand_slots: list[int] = field(default_factory=list)
+    num_dynamic_operands: int = 0
+    output_slot: int = 0
+    output_dests: list[tuple[tuple[int, int], list[Direction]]] = field(default_factory=list)
+    payload_slots: list[int] = field(default_factory=list)
+
+
+@dataclass
+class RmsNormPartialSumEntry:
+    kind: str = field(default="rms_norm_partial_sum", init=False)
+    trigger_slot: int = 0
+    input_slot: int = 0
+    reduce_dest: tuple[int, int] = (0, 0)
+    reduce_hops: list[Direction] = field(default_factory=list)
+    partial_sum_slot: int = 0
+
+
+@dataclass
+class RmsNormNormalizeEntry:
+    kind: str = field(default="rms_norm_normalize", init=False)
+    trigger_slot: int = 1
+    input_slot: int = 0
+    scale_slot: int = 1
+    gamma_slot: int = 2
+    output_dests: list[tuple[tuple[int, int], list[Direction]]] = field(default_factory=list)
+    payload_slots: list[int] = field(default_factory=list)
+
+
+@dataclass
+class RmsNormReduceEntry:
+    kind: str = field(default="rms_norm_reduce", init=False)
+    trigger_slot: int = 0
+    num_tiles: int = 0
+    feature_count: int = 0
+    eps: float = 1e-6
+    tile_dests: list[tuple[tuple[int, int], list[Direction]]] = field(default_factory=list)
+    scale_slot: int = 1
+
+
 TaskEntry = (
     ForwardActivationEntry
     | CollectOutputEntry
     | LinearEntry
     | ConcatCollectEntry
     | ConcatCollectForwardEntry
+    | AddEntry
+    | SoftmaxEntry
+    | MatMulEntry
+    | RmsNormPartialSumEntry
+    | RmsNormNormalizeEntry
+    | RmsNormReduceEntry
 )
 
 
