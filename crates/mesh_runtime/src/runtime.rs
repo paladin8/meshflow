@@ -315,11 +315,8 @@ impl Simulator {
     // These must not collide with each other or with user-facing slots.
     // - ConcatCollect/ConcatCollectForward: MAX (accumulator), MAX-1 (counter)
     // - RmsNormReduce: MAX (accumulator), MAX-1 (counter)
-    // - MatMul: MAX-2 (counter)
-    // No PE currently hosts tasks that would collide (e.g., ConcatCollect + MatMul).
     const ACCUM_SLOT: SlotId = u32::MAX;
     const COUNTER_SLOT: SlotId = u32::MAX - 1;
-    const MATMUL_COUNTER_SLOT: SlotId = u32::MAX - 2;
 
     fn process_execute(&mut self, timestamp: u64, coord: Coord, task_index: usize) {
         // Clone the task to avoid borrow conflicts with the PE
@@ -591,70 +588,49 @@ impl Simulator {
                 self.task_write_slot(timestamp, coord, output_slot, result);
             }
             TaskKind::MatMul {
-                ref operand_slots,
-                num_dynamic_operands,
+                matrix_slot,
+                vector_slot,
+                rows,
+                cols,
+                transpose,
                 output_slot,
                 ref output_dests,
                 ref payload_slots,
             } => {
-                // Counter-based trigger: fires on each dynamic operand arrival,
-                // only computes when all dynamic operands have arrived.
-                // Note: tasks_executed counts triggers (including early returns),
-                // not completions — consistent with ConcatCollect/RmsNormReduce.
                 let pe = self.mesh.pe_mut(coord);
                 pe.counters.tasks_executed += 1;
                 self.profile.total_tasks_executed += 1;
 
-                // Use reserved counter slot for dynamic operand counting
-                let counter_slot = Self::MATMUL_COUNTER_SLOT;
-                let count = if num_dynamic_operands > 1 {
-                    if !pe.has_slot(counter_slot) {
-                        pe.write_slot(counter_slot, vec![0.0]);
-                    }
-                    let c = pe.read_slot(counter_slot)[0] as u32 + 1;
-                    pe.write_slot(counter_slot, vec![c as f32]);
-                    c
+                // has_slot guard: both inputs must be present
+                if !pe.has_slot(matrix_slot) || !pe.has_slot(vector_slot) {
+                    return;
+                }
+
+                let matrix = pe.read_slot(matrix_slot).clone();
+                let vector = pe.read_slot(vector_slot).clone();
+                let r = rows as usize;
+                let c = cols as usize;
+
+                let result: Vec<f32> = if !transpose {
+                    // M @ v → (rows,)
+                    (0..r)
+                        .map(|i| (0..c).map(|j| matrix[i * c + j] * vector[j]).sum::<f32>())
+                        .collect()
                 } else {
-                    // Single dynamic operand (or all pre-loaded): compute immediately
-                    num_dynamic_operands
+                    // M^T @ v → (cols,)
+                    let mut out = vec![0.0f32; c];
+                    for i in 0..r {
+                        for j in 0..c {
+                            out[j] += matrix[i * c + j] * vector[i];
+                        }
+                    }
+                    out
                 };
 
-                if count < num_dynamic_operands {
-                    return; // Still waiting for more operands
-                }
-
-                // Clean up counter
-                if num_dynamic_operands > 1 {
-                    pe.remove_slot(counter_slot);
-                }
-
-                // All operands ready. Slot 0 = left operand (vector),
-                // remaining slots = right operand columns (one vector per slot).
-                // Compute dot products: result[i] = dot(left, right_col[i])
-                let left = pe.read_slot(operand_slots[0]).clone();
-                let right_slots = &operand_slots[1..];
-                let mut result = Vec::with_capacity(right_slots.len());
-                for &slot in right_slots {
-                    let col = pe.read_slot(slot);
-                    debug_assert_eq!(
-                        left.len(),
-                        col.len(),
-                        "PE {}: MatMul operand length mismatch ({} vs {})",
-                        coord,
-                        left.len(),
-                        col.len()
-                    );
-                    let dot: f32 = left.iter().zip(col.iter()).map(|(a, b)| a * b).sum();
-                    result.push(dot);
-                }
-
-                // Note: dynamic operand slots (K/V vectors) are NOT cleaned up here.
-                // At current dimensions this is negligible; a future optimization
-                // could remove broadcast slots after computation.
+                self.task_write_slot(timestamp, coord, output_slot, result.clone());
 
                 let output_dests = output_dests.clone();
                 let payload_slots = payload_slots.clone();
-                self.task_write_slot(timestamp, coord, output_slot, result.clone());
 
                 // Route to destinations
                 let num_sends = output_dests.len() as u64;
@@ -682,8 +658,9 @@ impl Simulator {
                 reduce_dest,
                 ref reduce_hops,
                 partial_sum_slot,
-                slice_offset: _,
-                slice_size: _,
+                slice_offset,
+                slice_size,
+                feature_count,
             } => {
                 let pe = self.mesh.pe_mut(coord);
                 let data = pe.read_slot(input_slot).clone();
@@ -691,10 +668,40 @@ impl Simulator {
                 pe.counters.messages_sent += 1;
                 self.profile.total_tasks_executed += 1;
 
-                // Compute sum(x^2) for local feature slice
-                let partial_sum: f32 = data.iter().map(|x| x * x).sum();
+                let fc = feature_count as usize;
+                let so = slice_offset as usize;
+                let ss = slice_size as usize;
 
-                // Send partial sum to reduce PE
+                // Compute per-position partial sums.
+                // Multi-position: feature_count > 0 and data is the full
+                // position-major broadcast vector (num_positions * feature_count).
+                // Each position's feature slice is at [p*fc + so .. p*fc + so + ss].
+                // Single-position / legacy (feature_count == 0): use entire data.
+                let payload = if fc > 0 && data.len() > fc {
+                    debug_assert_eq!(
+                        data.len() % fc,
+                        0,
+                        "PE {}: RmsNormPartialSum input not divisible by feature_count",
+                        coord
+                    );
+                    let num_positions = data.len() / fc;
+                    (0..num_positions)
+                        .map(|p| {
+                            let start = p * fc + so;
+                            let slice = &data[start..start + ss];
+                            slice.iter().map(|x| x * x).sum::<f32>()
+                        })
+                        .collect::<Vec<f32>>()
+                } else if ss > 0 {
+                    // Single position with slice
+                    let slice = &data[so..so + ss];
+                    vec![slice.iter().map(|x| x * x).sum::<f32>()]
+                } else {
+                    // Legacy: no slicing, single position
+                    vec![data.iter().map(|x| x * x).sum::<f32>()]
+                };
+
+                // Send partial sum(s) to reduce PE
                 let reduce_hops = reduce_hops.clone();
                 let message = Message {
                     id: self.next_message_id,
@@ -702,7 +709,7 @@ impl Simulator {
                     dest: reduce_dest,
                     hops: reduce_hops,
                     current_hop: 0,
-                    payload: vec![partial_sum],
+                    payload,
                     payload_slot: partial_sum_slot,
                     timestamp,
                 };
@@ -715,30 +722,59 @@ impl Simulator {
                 gamma_slot,
                 ref output_dests,
                 ref payload_slots,
-                slice_offset: _,
-                slice_size: _,
+                slice_offset,
+                slice_size,
             } => {
                 let pe = self.mesh.pe_mut(coord);
                 let data = pe.read_slot(input_slot).clone();
-                let scale = pe.read_slot(scale_slot)[0];
+                let scales = pe.read_slot(scale_slot).clone();
                 let gamma = pe.read_slot(gamma_slot).clone();
                 pe.counters.tasks_executed += 1;
                 self.profile.total_tasks_executed += 1;
 
-                // Apply x * scale * gamma
-                debug_assert_eq!(
-                    data.len(),
-                    gamma.len(),
-                    "PE {}: RmsNormNormalize data/gamma length mismatch ({} vs {})",
-                    coord,
-                    data.len(),
-                    gamma.len()
-                );
-                let result: Vec<f32> = data
-                    .iter()
-                    .zip(gamma.iter())
-                    .map(|(x, g)| x * scale * g)
-                    .collect();
+                let so = slice_offset as usize;
+                let ss = slice_size as usize;
+                let num_positions = scales.len();
+
+                // Multi-position: data is the full position-major broadcast
+                // vector. Extract this PE's feature slice for each position,
+                // apply per-position scale * gamma, and produce a position-major
+                // output of the normalized slices.
+                let result = if num_positions > 1 && ss > 0 {
+                    // Total features per position = data.len() / num_positions
+                    debug_assert_eq!(
+                        data.len() % num_positions,
+                        0,
+                        "PE {}: RmsNormNormalize input not divisible by num_positions",
+                        coord
+                    );
+                    let fc = data.len() / num_positions;
+                    let mut out = Vec::with_capacity(num_positions * ss);
+                    for p in 0..num_positions {
+                        let start = p * fc + so;
+                        let slice = &data[start..start + ss];
+                        let scale = scales[p];
+                        for (j, &x) in slice.iter().enumerate() {
+                            out.push(x * scale * gamma[j]);
+                        }
+                    }
+                    out
+                } else {
+                    // Single position (legacy or single-element scales)
+                    let scale = scales[0];
+                    debug_assert_eq!(
+                        data.len(),
+                        gamma.len(),
+                        "PE {}: RmsNormNormalize data/gamma length mismatch ({} vs {})",
+                        coord,
+                        data.len(),
+                        gamma.len()
+                    );
+                    data.iter()
+                        .zip(gamma.iter())
+                        .map(|(x, g)| x * scale * g)
+                        .collect()
+                };
 
                 // Route to destinations
                 let output_dests = output_dests.clone();
@@ -779,20 +815,24 @@ impl Simulator {
                 pe.counters.tasks_executed += 1;
                 self.profile.total_tasks_executed += 1;
 
-                let partial_sum = pe.read_slot(trigger_slot)[0];
+                let partial_sums = pe.read_slot(trigger_slot).clone();
+                let num_positions = partial_sums.len(); // 1 for single-position
 
                 // Use reserved SRAM slots for accumulator and counter
                 let accum_slot = Self::ACCUM_SLOT;
                 let counter_slot = Self::COUNTER_SLOT;
 
                 if !pe.has_slot(accum_slot) {
-                    pe.write_slot(accum_slot, vec![0.0]);
+                    pe.write_slot(accum_slot, vec![0.0; num_positions]);
                     pe.write_slot(counter_slot, vec![0.0]);
                 }
 
-                // Accumulate partial sum
-                let running_sum = pe.read_slot(accum_slot)[0] + partial_sum;
-                pe.write_slot(accum_slot, vec![running_sum]);
+                // Accumulate partial sums element-wise (per-position)
+                let mut running = pe.read_slot(accum_slot).clone();
+                for (r, &ps) in running.iter_mut().zip(partial_sums.iter()) {
+                    *r += ps;
+                }
+                pe.write_slot(accum_slot, running);
                 pe.remove_slot(trigger_slot);
 
                 // Increment counter
@@ -803,18 +843,26 @@ impl Simulator {
                     return; // Still waiting for more partial sums
                 }
 
-                // All partial sums received — compute scale factor
-                let mean_sq = running_sum / feature_count as f32;
-                let scale = 1.0 / (mean_sq + eps).sqrt();
+                // All partial sums received — compute per-position scale factors.
+                // Accumulator has one sum per position.
+                let running = pe.read_slot(accum_slot).clone();
+                let fc = feature_count as f32;
+                let scales: Vec<f32> = running
+                    .iter()
+                    .map(|&s| {
+                        let mean_sq = s / fc;
+                        1.0 / (mean_sq + eps).sqrt()
+                    })
+                    .collect();
 
                 // Clean up accumulator
                 pe.remove_slot(accum_slot);
                 pe.remove_slot(counter_slot);
 
-                // Write scale to local SRAM (for debugging/inspection)
-                pe.write_slot(scale_slot, vec![scale]);
+                // Write scale(s) to local SRAM (for debugging/inspection)
+                pe.write_slot(scale_slot, scales.clone());
 
-                // Broadcast scale factor to all tile PEs
+                // Broadcast scale factor(s) to all tile PEs
                 let tile_dests = tile_dests.clone();
                 let num_sends = tile_dests.len() as u64;
                 self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
@@ -827,7 +875,7 @@ impl Simulator {
                         dest: *dest,
                         hops: hops.clone(),
                         current_hop: 0,
-                        payload: vec![scale],
+                        payload: scales.clone(),
                         payload_slot: scale_slot,
                         timestamp: send_time,
                     };
@@ -1589,23 +1637,23 @@ mod tests {
     }
 
     #[test]
-    fn matmul_dot_products() {
-        // MatMul at (0,0): Q row in slot 0 (pre-loaded), K vectors in slots 1-3 (broadcast).
-        // Computes dot(Q, K_i) for each K_i, collects result at (1,0).
+    fn matmul_basic() {
+        // M = [[1,2],[3,4],[5,6]] (3x2), v = [1,1]
+        // M @ v = [3, 7, 11]
         let mut s = sim(2, 1);
 
-        // operand_slots: [0, 1, 2, 3] — slot 0 = Q, slots 1-3 = K vectors
-        // num_dynamic_operands = 3 (K vectors arrive via messages)
-        // Need one TaskConfig per dynamic operand slot (1, 2, 3)
         let hops = crate::route::generate_route_xy(Coord::new(0, 0), Coord::new(1, 0));
-        for trigger in [1, 2, 3] {
+        for trigger in [0, 1] {
             s.add_task_direct(
                 Coord::new(0, 0),
                 TaskConfig {
                     kind: TaskKind::MatMul {
-                        operand_slots: vec![0, 1, 2, 3],
-                        num_dynamic_operands: 3,
-                        output_slot: 10,
+                        matrix_slot: 0,
+                        vector_slot: 1,
+                        rows: 3,
+                        cols: 2,
+                        transpose: false,
+                        output_slot: 2,
                         output_dests: vec![(Coord::new(1, 0), hops.clone())],
                         payload_slots: vec![0],
                     },
@@ -1621,50 +1669,44 @@ mod tests {
             },
         );
 
-        // Pre-load Q row
-        s.write_sram(Coord::new(0, 0), 0, vec![1.0, 2.0]);
-
-        // Inject K vectors (3 separate messages)
-        // K0 = [1, 0] → dot = 1*1 + 2*0 = 1
-        // K1 = [0, 1] → dot = 1*0 + 2*1 = 2
-        // K2 = [1, 1] → dot = 1*1 + 2*1 = 3
-        for (slot, payload) in [
-            (1, vec![1.0, 0.0]),
-            (2, vec![0.0, 1.0]),
-            (3, vec![1.0, 1.0]),
-        ] {
-            s.inject_message(InjectMessage {
-                source: Coord::new(0, 0),
-                dest: Coord::new(0, 0),
-                payload,
-                payload_slot: slot,
-            });
-        }
+        s.write_sram(Coord::new(0, 0), 0, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![1.0, 1.0],
+            payload_slot: 1,
+        });
 
         let result = s.run();
         let output = result.outputs.get(&Coord::new(1, 0)).unwrap();
-        assert_eq!(output, &vec![1.0, 2.0, 3.0]);
+        assert_eq!(output, &vec![3.0, 7.0, 11.0]);
     }
 
     #[test]
-    fn matmul_single_dynamic_operand() {
-        // MatMul with 1 dynamic operand — no counter needed
+    fn matmul_transpose() {
+        // M = [[1,2],[3,4]] (2x2), v = [1, 0]
+        // M^T @ v = [1, 2] (col 0 of M)
         let mut s = sim(2, 1);
 
         let hops = crate::route::generate_route_xy(Coord::new(0, 0), Coord::new(1, 0));
-        s.add_task_direct(
-            Coord::new(0, 0),
-            TaskConfig {
-                kind: TaskKind::MatMul {
-                    operand_slots: vec![0, 1],
-                    num_dynamic_operands: 1,
-                    output_slot: 10,
-                    output_dests: vec![(Coord::new(1, 0), hops)],
-                    payload_slots: vec![0],
+        for trigger in [0, 1] {
+            s.add_task_direct(
+                Coord::new(0, 0),
+                TaskConfig {
+                    kind: TaskKind::MatMul {
+                        matrix_slot: 0,
+                        vector_slot: 1,
+                        rows: 2,
+                        cols: 2,
+                        transpose: true,
+                        output_slot: 2,
+                        output_dests: vec![(Coord::new(1, 0), hops.clone())],
+                        payload_slots: vec![0],
+                    },
+                    trigger_slot: trigger,
                 },
-                trigger_slot: 1,
-            },
-        );
+            );
+        }
         s.add_task_direct(
             Coord::new(1, 0),
             TaskConfig {
@@ -1673,86 +1715,71 @@ mod tests {
             },
         );
 
-        // Pre-load left operand and single right operand
-        s.write_sram(Coord::new(0, 0), 0, vec![3.0, 4.0]);
+        s.write_sram(Coord::new(0, 0), 0, vec![1.0, 2.0, 3.0, 4.0]);
         s.inject_message(InjectMessage {
             source: Coord::new(0, 0),
             dest: Coord::new(0, 0),
-            payload: vec![2.0, 1.0],
+            payload: vec![1.0, 0.0],
             payload_slot: 1,
         });
 
         let result = s.run();
         let output = result.outputs.get(&Coord::new(1, 0)).unwrap();
-        // dot([3,4], [2,1]) = 6 + 4 = 10
-        assert_eq!(output, &vec![10.0]);
+        assert_eq!(output, &vec![1.0, 2.0]);
     }
 
     #[test]
-    fn matmul_triggers_softmax_chain() {
-        // MatMul(QK^T) -> Softmax -> Collect, all on same PE
-        let mut s = sim(1, 1);
+    fn matmul_has_slot_guard() {
+        // Two inputs arrive at different times.
+        // First triggers task but returns early (other slot missing).
+        // Second triggers and computation proceeds.
+        let mut s = sim(2, 1);
 
-        // MatMul: slot 0 = Q, slot 1 = K0, slot 2 = K1
-        // Writes score row to slot 10
-        // One TaskConfig per dynamic operand slot
-        for trigger in [1, 2] {
+        let hops = crate::route::generate_route_xy(Coord::new(0, 0), Coord::new(1, 0));
+        for trigger in [0, 1] {
             s.add_task_direct(
                 Coord::new(0, 0),
                 TaskConfig {
                     kind: TaskKind::MatMul {
-                        operand_slots: vec![0, 1, 2],
-                        num_dynamic_operands: 2,
-                        output_slot: 10,
-                        output_dests: vec![],
-                        payload_slots: vec![],
+                        matrix_slot: 0,
+                        vector_slot: 1,
+                        rows: 2,
+                        cols: 2,
+                        transpose: false,
+                        output_slot: 2,
+                        output_dests: vec![(Coord::new(1, 0), hops.clone())],
+                        payload_slots: vec![0],
                     },
                     trigger_slot: trigger,
                 },
             );
         }
-        // Softmax: reads slot 10, writes slot 11
         s.add_task_direct(
-            Coord::new(0, 0),
+            Coord::new(1, 0),
             TaskConfig {
-                kind: TaskKind::Softmax {
-                    input_slot: 10,
-                    output_slot: 11,
-                },
-                trigger_slot: 10,
-            },
-        );
-        // Collect from slot 11
-        s.add_task_direct(
-            Coord::new(0, 0),
-            TaskConfig {
-                kind: TaskKind::CollectOutput { input_slot: 11 },
-                trigger_slot: 11,
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
             },
         );
 
-        s.write_sram(Coord::new(0, 0), 0, vec![1.0, 0.0]); // Q
+        // Inject vector first (slot 1) — matrix (slot 0) not yet present
         s.inject_message(InjectMessage {
             source: Coord::new(0, 0),
             dest: Coord::new(0, 0),
-            payload: vec![1.0, 0.0], // K0: dot = 1
+            payload: vec![1.0, 1.0],
             payload_slot: 1,
         });
+        // Inject matrix second (slot 0) — now both are present
         s.inject_message(InjectMessage {
             source: Coord::new(0, 0),
             dest: Coord::new(0, 0),
-            payload: vec![0.0, 1.0], // K1: dot = 0
-            payload_slot: 2,
+            payload: vec![1.0, 0.0, 0.0, 1.0], // identity 2x2
+            payload_slot: 0,
         });
 
         let result = s.run();
-        let output = result.outputs.get(&Coord::new(0, 0)).unwrap();
-
-        // Scores = [1, 0], softmax([1, 0]) ≈ [0.731, 0.269]
-        assert_eq!(output.len(), 2);
-        let sum: f32 = output.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-6);
-        assert!(output[0] > output[1]); // score 1 > score 0
+        let output = result.outputs.get(&Coord::new(1, 0)).unwrap();
+        assert_eq!(output, &vec![1.0, 1.0]);
     }
 
     #[test]
@@ -1786,6 +1813,7 @@ mod tests {
                     partial_sum_slot: 0, // slot on reduce PE
                     slice_offset: 0,
                     slice_size: 0,
+                    feature_count: 0,
                 },
                 trigger_slot: 0,
             },
@@ -1820,6 +1848,7 @@ mod tests {
                     partial_sum_slot: 1, // different slot on reduce PE
                     slice_offset: 0,
                     slice_size: 0,
+                    feature_count: 0,
                 },
                 trigger_slot: 0,
             },
@@ -1927,6 +1956,7 @@ mod tests {
                     partial_sum_slot: 0,
                     slice_offset: 0,
                     slice_size: 0,
+                    feature_count: 0,
                 },
                 trigger_slot: 0,
             },
@@ -2014,6 +2044,7 @@ mod tests {
                         partial_sum_slot: i as u32, // each tile writes to a different slot
                         slice_offset: 0,
                         slice_size: 0,
+                        feature_count: 0,
                     },
                     trigger_slot: 0,
                 },
@@ -2337,5 +2368,330 @@ mod tests {
         assert_eq!(result.outputs.get(&dest0), Some(&vec![1.0, 2.0]));
         // dest1 gets position 1: [p1r0, p1r1] = [10, 20]
         assert_eq!(result.outputs.get(&dest1), Some(&vec![10.0, 20.0]));
+    }
+
+    #[test]
+    fn rmsnorm_multi_position_single_tile() {
+        // Single tile PE, 1 reduce PE, 2 positions, feature_count=2.
+        // Input (position-major): [3.0, 4.0, 0.0, 1.0]
+        //   position 0: [3.0, 4.0], position 1: [0.0, 1.0]
+        //
+        // Position 0: sum(x^2) = 9 + 16 = 25, mean = 25/2 = 12.5
+        //   scale0 = 1/sqrt(12.5 + 1e-6)
+        // Position 1: sum(x^2) = 0 + 1 = 1, mean = 1/2 = 0.5
+        //   scale1 = 1/sqrt(0.5 + 1e-6)
+        //
+        // gamma = [1.0, 1.0]
+        // Output (position-major slices):
+        //   pos0: [3*scale0, 4*scale0]
+        //   pos1: [0*scale1, 1*scale1]
+        let mut s = sim(3, 1);
+
+        let tile = Coord::new(0, 0);
+        let reduce = Coord::new(1, 0);
+        let collect = Coord::new(2, 0);
+
+        // Tile PE: partial sum + normalize
+        let hops_to_reduce = crate::route::generate_route_xy(tile, reduce);
+        let hops_to_collect = crate::route::generate_route_xy(tile, collect);
+        s.add_task_direct(
+            tile,
+            TaskConfig {
+                kind: TaskKind::RmsNormPartialSum {
+                    input_slot: 0,
+                    reduce_dest: reduce,
+                    reduce_hops: hops_to_reduce,
+                    partial_sum_slot: 0,
+                    slice_offset: 0,
+                    slice_size: 2,
+                    feature_count: 2,
+                },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            tile,
+            TaskConfig {
+                kind: TaskKind::RmsNormNormalize {
+                    input_slot: 0,
+                    scale_slot: 1,
+                    gamma_slot: 2,
+                    output_dests: vec![(collect, hops_to_collect)],
+                    payload_slots: vec![0],
+                    slice_offset: 0,
+                    slice_size: 2,
+                },
+                trigger_slot: 1,
+            },
+        );
+        s.write_sram(tile, 2, vec![1.0, 1.0]); // gamma
+
+        // Reduce PE
+        let hops_to_tile = crate::route::generate_route_xy(reduce, tile);
+        s.add_task_direct(
+            reduce,
+            TaskConfig {
+                kind: TaskKind::RmsNormReduce {
+                    num_tiles: 1,
+                    feature_count: 2,
+                    eps: 1e-6,
+                    tile_dests: vec![(tile, hops_to_tile)],
+                    scale_slot: 1,
+                },
+                trigger_slot: 0,
+            },
+        );
+
+        // Collect PE
+        s.add_task_direct(
+            collect,
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+
+        // Inject position-major input: [pos0_f0, pos0_f1, pos1_f0, pos1_f1]
+        s.inject_message(InjectMessage {
+            source: tile,
+            dest: tile,
+            payload: vec![3.0, 4.0, 0.0, 1.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+        let output = result.outputs.get(&collect).unwrap();
+        assert_eq!(output.len(), 4);
+
+        let scale0 = 1.0 / (25.0_f32 / 2.0 + 1e-6).sqrt();
+        let scale1 = 1.0 / (1.0_f32 / 2.0 + 1e-6).sqrt();
+
+        // Position 0: [3*scale0, 4*scale0]
+        assert!((output[0] - 3.0 * scale0).abs() < 1e-5);
+        assert!((output[1] - 4.0 * scale0).abs() < 1e-5);
+        // Position 1: [0*scale1, 1*scale1]
+        assert!((output[2] - 0.0).abs() < 1e-5);
+        assert!((output[3] - 1.0 * scale1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rmsnorm_multi_position_two_tiles() {
+        // 2 tile PEs, 1 reduce PE, 2 positions, feature_count=4.
+        // Tile 0: slice_offset=0, slice_size=2 (features 0-1)
+        // Tile 1: slice_offset=2, slice_size=2 (features 2-3)
+        //
+        // Input (position-major, full 4-feature vector broadcast to both tiles):
+        //   [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        //   position 0: [1, 2, 3, 4], position 1: [5, 6, 7, 8]
+        //
+        // Tile 0 extracts features [0..2] per position:
+        //   pos0: [1, 2] → partial = 1+4 = 5
+        //   pos1: [5, 6] → partial = 25+36 = 61
+        //   sends [5.0, 61.0] to reduce
+        //
+        // Tile 1 extracts features [2..4] per position:
+        //   pos0: [3, 4] → partial = 9+16 = 25
+        //   pos1: [7, 8] → partial = 49+64 = 113
+        //   sends [25.0, 113.0] to reduce
+        //
+        // Reduce accumulates element-wise:
+        //   pos0: 5 + 25 = 30, mean = 30/4 = 7.5, scale0 = 1/sqrt(7.5 + 1e-6)
+        //   pos1: 61 + 113 = 174, mean = 174/4 = 43.5, scale1 = 1/sqrt(43.5 + 1e-6)
+        //
+        // gamma = [1.0, 1.0] for both tiles
+        // Tile 0 output: [pos0_f0*scale0, pos0_f1*scale0, pos1_f0*scale1, pos1_f1*scale1]
+        //              = [1*scale0, 2*scale0, 5*scale1, 6*scale1]
+        // Tile 1 output: [3*scale0, 4*scale0, 7*scale1, 8*scale1]
+        let mut s = sim(4, 2);
+
+        let tile0 = Coord::new(0, 0);
+        let tile1 = Coord::new(0, 1);
+        let reduce = Coord::new(1, 0);
+        let collect0 = Coord::new(2, 0);
+        let collect1 = Coord::new(2, 1);
+
+        // Tile 0: features [0..2]
+        let hops_to_reduce0 = crate::route::generate_route_xy(tile0, reduce);
+        let hops_to_collect0 = crate::route::generate_route_xy(tile0, collect0);
+        s.add_task_direct(
+            tile0,
+            TaskConfig {
+                kind: TaskKind::RmsNormPartialSum {
+                    input_slot: 0,
+                    reduce_dest: reduce,
+                    reduce_hops: hops_to_reduce0,
+                    partial_sum_slot: 0,
+                    slice_offset: 0,
+                    slice_size: 2,
+                    feature_count: 4,
+                },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            tile0,
+            TaskConfig {
+                kind: TaskKind::RmsNormNormalize {
+                    input_slot: 0,
+                    scale_slot: 1,
+                    gamma_slot: 2,
+                    output_dests: vec![(collect0, hops_to_collect0)],
+                    payload_slots: vec![0],
+                    slice_offset: 0,
+                    slice_size: 2,
+                },
+                trigger_slot: 1,
+            },
+        );
+        s.write_sram(tile0, 2, vec![1.0, 1.0]); // gamma for features 0-1
+
+        // Tile 1: features [2..4]
+        let hops_to_reduce1 = crate::route::generate_route_xy(tile1, reduce);
+        let hops_to_collect1 = crate::route::generate_route_xy(tile1, collect1);
+        s.add_task_direct(
+            tile1,
+            TaskConfig {
+                kind: TaskKind::RmsNormPartialSum {
+                    input_slot: 0,
+                    reduce_dest: reduce,
+                    reduce_hops: hops_to_reduce1,
+                    partial_sum_slot: 1,
+                    slice_offset: 2,
+                    slice_size: 2,
+                    feature_count: 4,
+                },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            tile1,
+            TaskConfig {
+                kind: TaskKind::RmsNormNormalize {
+                    input_slot: 0,
+                    scale_slot: 1,
+                    gamma_slot: 2,
+                    output_dests: vec![(collect1, hops_to_collect1)],
+                    payload_slots: vec![0],
+                    slice_offset: 2,
+                    slice_size: 2,
+                },
+                trigger_slot: 1,
+            },
+        );
+        s.write_sram(tile1, 2, vec![1.0, 1.0]); // gamma for features 2-3
+
+        // Reduce PE — trigger on both partial sum slots
+        let hops_to_tile0 = crate::route::generate_route_xy(reduce, tile0);
+        let hops_to_tile1 = crate::route::generate_route_xy(reduce, tile1);
+        for trigger in [0, 1] {
+            s.add_task_direct(
+                reduce,
+                TaskConfig {
+                    kind: TaskKind::RmsNormReduce {
+                        num_tiles: 2,
+                        feature_count: 4,
+                        eps: 1e-6,
+                        tile_dests: vec![
+                            (tile0, hops_to_tile0.clone()),
+                            (tile1, hops_to_tile1.clone()),
+                        ],
+                        scale_slot: 1,
+                    },
+                    trigger_slot: trigger,
+                },
+            );
+        }
+
+        // Collect PEs
+        s.add_task_direct(
+            collect0,
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            collect1,
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+
+        // Inject same position-major vector to both tiles (broadcast)
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        s.inject_message(InjectMessage {
+            source: tile0,
+            dest: tile0,
+            payload: input.clone(),
+            payload_slot: 0,
+        });
+        s.inject_message(InjectMessage {
+            source: tile1,
+            dest: tile1,
+            payload: input,
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+
+        let scale0 = 1.0 / (30.0_f32 / 4.0 + 1e-6).sqrt();
+        let scale1 = 1.0 / (174.0_f32 / 4.0 + 1e-6).sqrt();
+
+        // Tile 0 output: position-major slices of features [0..2]
+        let out0 = result.outputs.get(&collect0).unwrap();
+        assert_eq!(out0.len(), 4);
+        assert!(
+            (out0[0] - 1.0 * scale0).abs() < 1e-5,
+            "out0[0]: {} vs {}",
+            out0[0],
+            1.0 * scale0
+        );
+        assert!(
+            (out0[1] - 2.0 * scale0).abs() < 1e-5,
+            "out0[1]: {} vs {}",
+            out0[1],
+            2.0 * scale0
+        );
+        assert!(
+            (out0[2] - 5.0 * scale1).abs() < 1e-5,
+            "out0[2]: {} vs {}",
+            out0[2],
+            5.0 * scale1
+        );
+        assert!(
+            (out0[3] - 6.0 * scale1).abs() < 1e-5,
+            "out0[3]: {} vs {}",
+            out0[3],
+            6.0 * scale1
+        );
+
+        // Tile 1 output: position-major slices of features [2..4]
+        let out1 = result.outputs.get(&collect1).unwrap();
+        assert_eq!(out1.len(), 4);
+        assert!(
+            (out1[0] - 3.0 * scale0).abs() < 1e-5,
+            "out1[0]: {} vs {}",
+            out1[0],
+            3.0 * scale0
+        );
+        assert!(
+            (out1[1] - 4.0 * scale0).abs() < 1e-5,
+            "out1[1]: {} vs {}",
+            out1[1],
+            4.0 * scale0
+        );
+        assert!(
+            (out1[2] - 7.0 * scale1).abs() < 1e-5,
+            "out1[2]: {} vs {}",
+            out1[2],
+            7.0 * scale1
+        );
+        assert!(
+            (out1[3] - 8.0 * scale1).abs() < 1e-5,
+            "out1[3]: {} vs {}",
+            out1[3],
+            8.0 * scale1
+        );
     }
 }

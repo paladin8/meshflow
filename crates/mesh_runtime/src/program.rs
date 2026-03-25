@@ -105,8 +105,12 @@ enum TaskProgram {
     #[serde(rename = "mat_mul")]
     MatMul {
         trigger_slot: u32,
-        operand_slots: Vec<u32>,
-        num_dynamic_operands: u32,
+        matrix_slot: u32,
+        vector_slot: u32,
+        rows: u32,
+        cols: u32,
+        #[serde(default)]
+        transpose: bool,
         output_slot: u32,
         output_dests: Vec<((u32, u32), Vec<String>)>,
         #[serde(default)]
@@ -123,6 +127,8 @@ enum TaskProgram {
         slice_offset: u32,
         #[serde(default)]
         slice_size: u32,
+        #[serde(default)]
+        feature_count: u32,
     },
     #[serde(rename = "rms_norm_normalize")]
     RmsNormNormalize {
@@ -516,8 +522,11 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
         }),
         TaskProgram::MatMul {
             trigger_slot,
-            operand_slots,
-            num_dynamic_operands,
+            matrix_slot,
+            vector_slot,
+            rows,
+            cols,
+            transpose,
             output_slot,
             output_dests,
             payload_slots,
@@ -525,8 +534,11 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             let dests = convert_route_dests(output_dests, width, height)?;
             Ok(TaskConfig {
                 kind: TaskKind::MatMul {
-                    operand_slots: operand_slots.clone(),
-                    num_dynamic_operands: *num_dynamic_operands,
+                    matrix_slot: *matrix_slot,
+                    vector_slot: *vector_slot,
+                    rows: *rows,
+                    cols: *cols,
+                    transpose: *transpose,
                     output_slot: *output_slot,
                     output_dests: dests,
                     payload_slots: payload_slots.clone(),
@@ -542,6 +554,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             partial_sum_slot,
             slice_offset,
             slice_size,
+            feature_count,
         } => {
             let dest = Coord::new(reduce_dest.0, reduce_dest.1);
             validate_coord(dest, width, height)?;
@@ -557,6 +570,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     partial_sum_slot: *partial_sum_slot,
                     slice_offset: *slice_offset,
                     slice_size: *slice_size,
+                    feature_count: *feature_count,
                 },
                 trigger_slot: *trigger_slot,
             })

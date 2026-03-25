@@ -113,10 +113,13 @@ pub enum TaskKind {
         input_slot: SlotId,
         output_slot: SlotId,
     },
-    /// Local dot-product / vector-matrix multiply.
+    /// Matrix-vector multiply: M @ v or M^T @ v.
     MatMul {
-        operand_slots: Vec<SlotId>,
-        num_dynamic_operands: u32,
+        matrix_slot: SlotId,
+        vector_slot: SlotId,
+        rows: u32,
+        cols: u32,
+        transpose: bool,
         output_slot: SlotId,
         output_dests: Vec<(Coord, Vec<Direction>)>,
         payload_slots: Vec<SlotId>,
@@ -129,6 +132,10 @@ pub enum TaskKind {
         partial_sum_slot: SlotId,
         slice_offset: u32,
         slice_size: u32,
+        /// Total features per position (0 = legacy single-position mode).
+        /// When > 0 and data.len() > feature_count, the input is position-major
+        /// and per-position partial sums are computed.
+        feature_count: u32,
     },
     /// RMSNorm phase 2: apply x * scale * gamma using scale from reduce PE.
     RmsNormNormalize {
