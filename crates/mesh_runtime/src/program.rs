@@ -70,6 +70,8 @@ enum TaskProgram {
         num_fragments: u32,
         total_rows: u32,
         fragment_offset: u32,
+        #[serde(default)]
+        num_positions: u32,
     },
     #[serde(rename = "concat_collect_forward")]
     ConcatCollectForward {
@@ -79,6 +81,10 @@ enum TaskProgram {
         fragment_offset: u32,
         activation: Option<String>,
         route_dests: Vec<((u32, u32), Vec<String>)>,
+        #[serde(default)]
+        num_positions: u32,
+        #[serde(default)]
+        scatter: bool,
     },
     #[serde(rename = "add")]
     Add {
@@ -434,11 +440,13 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             num_fragments,
             total_rows,
             fragment_offset,
+            num_positions,
         } => Ok(TaskConfig {
             kind: TaskKind::ConcatCollect {
                 num_fragments: *num_fragments,
                 total_rows: *total_rows,
                 fragment_offset: *fragment_offset,
+                num_positions: *num_positions,
             },
             trigger_slot: *trigger_slot,
         }),
@@ -449,6 +457,8 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             fragment_offset,
             activation,
             route_dests,
+            num_positions,
+            scatter,
         } => {
             let act = activation.as_deref().map(parse_activation).transpose()?;
             let dests = convert_route_dests(route_dests, width, height)?;
@@ -459,6 +469,8 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     fragment_offset: *fragment_offset,
                     activation: act,
                     route_dests: dests,
+                    num_positions: *num_positions,
+                    scatter: *scatter,
                 },
                 trigger_slot: *trigger_slot,
             })

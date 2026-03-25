@@ -84,6 +84,8 @@ pub enum TaskKind {
         num_fragments: u32,
         total_rows: u32,
         fragment_offset: u32,
+        /// Number of sequence positions (0 = infer as 1 for backward compat).
+        num_positions: u32,
     },
     /// Accumulate fragments, apply activation, and broadcast to next layer's tile PEs.
     /// Used for intermediate layers in multi-layer MLPs.
@@ -93,6 +95,10 @@ pub enum TaskKind {
         fragment_offset: u32,
         activation: Option<Activation>,
         route_dests: Vec<(Coord, Vec<Direction>)>,
+        /// Number of sequence positions (0 = infer as 1 for backward compat).
+        num_positions: u32,
+        /// When true, scatter row i to destination i instead of broadcasting.
+        scatter: bool,
     },
     /// Element-wise addition of two SRAM slots.
     Add {

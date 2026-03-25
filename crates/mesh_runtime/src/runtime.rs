@@ -395,16 +395,24 @@ impl Simulator {
                 pe.counters.messages_sent += 1;
                 self.profile.total_tasks_executed += 1;
 
-                // Compute y = W @ x + b
+                // Compute y = W @ x + b, batched over positions.
+                // If input is longer than tile_cols, it contains multiple
+                // positions concatenated. Each position is processed with
+                // the same weights. Output is row-major: for each output
+                // row i, emit all positions' values before row i+1.
                 let rows = tile_rows as usize;
                 let cols = tile_cols as usize;
-                let mut y = Vec::with_capacity(rows);
+                let num_positions = x.len() / cols;
+                let mut y = Vec::with_capacity(rows * num_positions);
                 for i in 0..rows {
-                    let mut sum = b[i];
-                    for j in 0..cols {
-                        sum += w[i * cols + j] * x[j];
+                    for p in 0..num_positions {
+                        let x_pos = &x[p * cols..(p + 1) * cols];
+                        let mut sum = b[i];
+                        for j in 0..cols {
+                            sum += w[i * cols + j] * x_pos[j];
+                        }
+                        y.push(sum);
                     }
-                    y.push(sum);
                 }
 
                 let message = Message {
@@ -425,6 +433,7 @@ impl Simulator {
                 num_fragments,
                 total_rows,
                 fragment_offset,
+                num_positions,
             } => {
                 let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
                 let completed = self.process_concat_fragment(
@@ -433,6 +442,7 @@ impl Simulator {
                     num_fragments,
                     total_rows,
                     fragment_offset,
+                    num_positions,
                 );
                 if let Some(result) = completed {
                     self.outputs.insert(coord, result);
@@ -444,6 +454,8 @@ impl Simulator {
                 fragment_offset,
                 ref activation,
                 ref route_dests,
+                num_positions,
+                scatter,
             } => {
                 let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
                 let activation = activation.clone();
@@ -454,6 +466,7 @@ impl Simulator {
                     num_fragments,
                     total_rows,
                     fragment_offset,
+                    num_positions,
                 );
                 if let Some(mut result) = completed {
                     // Apply activation function if specified
@@ -461,26 +474,46 @@ impl Simulator {
                         act.apply(&mut result);
                     }
 
-                    // Broadcast to next layer's tile PEs with send serialization:
-                    // each send costs 1 time unit.
-                    // Update PE counters first to avoid borrow conflicts.
+                    // Send to next layer's tile PEs with send serialization.
                     let num_sends = route_dests.len() as u64;
                     self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
 
-                    for (i, (dest, hops)) in route_dests.iter().enumerate() {
-                        let send_time = timestamp + self.config.task_base_latency + i as u64;
-                        let message = Message {
-                            id: self.next_message_id,
-                            source: coord,
-                            dest: *dest,
-                            hops: hops.clone(),
-                            current_hop: 0,
-                            payload: result.clone(),
-                            payload_slot: 0, // deliver to input slot 0 on tile PEs
-                            timestamp: send_time,
-                        };
-                        self.next_message_id += 1;
-                        self.enqueue_deliver(send_time, coord, coord, message);
+                    if scatter && !route_dests.is_empty() {
+                        // Scatter: send row i to destination i
+                        let row_size = result.len() / route_dests.len();
+                        for (i, (dest, hops)) in route_dests.iter().enumerate() {
+                            let send_time = timestamp + self.config.task_base_latency + i as u64;
+                            let row = result[i * row_size..(i + 1) * row_size].to_vec();
+                            let message = Message {
+                                id: self.next_message_id,
+                                source: coord,
+                                dest: *dest,
+                                hops: hops.clone(),
+                                current_hop: 0,
+                                payload: row,
+                                payload_slot: 0,
+                                timestamp: send_time,
+                            };
+                            self.next_message_id += 1;
+                            self.enqueue_deliver(send_time, coord, coord, message);
+                        }
+                    } else {
+                        // Broadcast: send full result to all destinations
+                        for (i, (dest, hops)) in route_dests.iter().enumerate() {
+                            let send_time = timestamp + self.config.task_base_latency + i as u64;
+                            let message = Message {
+                                id: self.next_message_id,
+                                source: coord,
+                                dest: *dest,
+                                hops: hops.clone(),
+                                current_hop: 0,
+                                payload: result.clone(),
+                                payload_slot: 0,
+                                timestamp: send_time,
+                            };
+                            self.next_message_id += 1;
+                            self.enqueue_deliver(send_time, coord, coord, message);
+                        }
                     }
                 }
             }
@@ -826,6 +859,10 @@ impl Simulator {
 
     /// Shared accumulator logic for ConcatCollect and ConcatCollectForward.
     /// Returns Some(completed_buffer) when all fragments have arrived, None otherwise.
+    ///
+    /// When `num_positions > 0`, fragments are in row-major layout (rows outer,
+    /// positions inner). The accumulator scales to `total_rows * num_positions`,
+    /// and the completed buffer is transposed to position-major on return.
     fn process_concat_fragment(
         &mut self,
         coord: Coord,
@@ -833,14 +870,20 @@ impl Simulator {
         num_fragments: u32,
         total_rows: u32,
         fragment_offset: u32,
+        num_positions: u32,
     ) -> Option<Vec<f32>> {
         let pe = self.mesh.pe_mut(coord);
         let fragment = pe.read_slot(trigger_slot).clone();
         pe.counters.tasks_executed += 1;
         self.profile.total_tasks_executed += 1;
 
-        let total_size = total_rows as usize;
-        let offset = fragment_offset as usize;
+        let num_pos = if num_positions > 0 {
+            num_positions as usize
+        } else {
+            1
+        };
+        let total_size = total_rows as usize * num_pos;
+        let offset = fragment_offset as usize * num_pos;
         let frag_len = fragment.len();
 
         // Use reserved SRAM slots for accumulator buffer and counter.
@@ -871,8 +914,22 @@ impl Simulator {
 
         // All fragments collected — return completed buffer
         if count == num_fragments {
-            let result = pe.remove_slot(accum_slot).unwrap();
+            let mut result = pe.remove_slot(accum_slot).unwrap();
             pe.remove_slot(counter_slot);
+
+            // Transpose from row-major (total_rows, num_pos) to
+            // position-major (num_pos, total_rows) when multi-position.
+            if num_pos > 1 {
+                let tr = total_rows as usize;
+                let mut transposed = vec![0.0; total_size];
+                for r in 0..tr {
+                    for p in 0..num_pos {
+                        transposed[p * tr + r] = result[r * num_pos + p];
+                    }
+                }
+                result = transposed;
+            }
+
             Some(result)
         } else {
             None
@@ -2017,5 +2074,250 @@ mod tests {
         // The reduce task fires 3 times but the first two return early.
         // total_tasks_executed should include all 3 reduce firings + 3 partial_sum
         assert!(result.profile.total_tasks_executed >= 6);
+    }
+
+    #[test]
+    fn linear_batched_two_positions() {
+        // W = [[1,0],[0,1]] (identity), b = [0,0]
+        // Input: 2 positions of 2 features = [1, 2, 3, 4]
+        // Position 0: [1, 2] → identity → [1, 2]
+        // Position 1: [3, 4] → identity → [3, 4]
+        // Tile output (row-major): [r0p0, r0p1, r1p0, r1p1] = [1, 3, 2, 4]
+        // Collect should gather and eventually produce position-major output
+        // For now, just verify the tile output is correct
+        let mut s = sim(2, 2);
+
+        // Single tile PE at (0,0), collect at (0,1)
+        let hops = crate::route::generate_route_xy(Coord::new(0, 0), Coord::new(0, 1));
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::Linear {
+                    input_slot: 0,
+                    weight_slot: 1,
+                    bias_slot: 2,
+                    tile_rows: 2,
+                    tile_cols: 2,
+                    route_dest: Coord::new(0, 1),
+                    hops,
+                    fragment_slot: 0,
+                    fragment_offset: 0,
+                },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            Coord::new(0, 1),
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+
+        // Identity weights, zero bias
+        s.write_sram(Coord::new(0, 0), 1, vec![1.0, 0.0, 0.0, 1.0]);
+        s.write_sram(Coord::new(0, 0), 2, vec![0.0, 0.0]);
+
+        // 2 positions: [1, 2] and [3, 4]
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![1.0, 2.0, 3.0, 4.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+        let output = result.outputs.get(&Coord::new(0, 1)).unwrap();
+
+        // Row-major output: [r0p0, r0p1, r1p0, r1p1] = [1, 3, 2, 4]
+        assert_eq!(output, &vec![1.0, 3.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn linear_batched_with_weights() {
+        // W = [[1, 2], [3, 4]], b = [0.5, 0.5]
+        // Position 0: x=[1, 0] → y=[1*1+2*0+0.5, 3*1+4*0+0.5] = [1.5, 3.5]
+        // Position 1: x=[0, 1] → y=[1*0+2*1+0.5, 3*0+4*1+0.5] = [2.5, 4.5]
+        // Row-major output: [r0p0, r0p1, r1p0, r1p1] = [1.5, 2.5, 3.5, 4.5]
+        let mut s = sim(2, 2);
+
+        let hops = crate::route::generate_route_xy(Coord::new(0, 0), Coord::new(0, 1));
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::Linear {
+                    input_slot: 0,
+                    weight_slot: 1,
+                    bias_slot: 2,
+                    tile_rows: 2,
+                    tile_cols: 2,
+                    route_dest: Coord::new(0, 1),
+                    hops,
+                    fragment_slot: 0,
+                    fragment_offset: 0,
+                },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            Coord::new(0, 1),
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+
+        s.write_sram(Coord::new(0, 0), 1, vec![1.0, 2.0, 3.0, 4.0]);
+        s.write_sram(Coord::new(0, 0), 2, vec![0.5, 0.5]);
+
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![1.0, 0.0, 0.0, 1.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+        let output = result.outputs.get(&Coord::new(0, 1)).unwrap();
+        assert_eq!(output.len(), 4);
+        assert!((output[0] - 1.5).abs() < 1e-6); // r0p0
+        assert!((output[1] - 2.5).abs() < 1e-6); // r0p1
+        assert!((output[2] - 3.5).abs() < 1e-6); // r1p0
+        assert!((output[3] - 4.5).abs() < 1e-6); // r1p1
+    }
+
+    #[test]
+    fn concat_collect_batched_transpose() {
+        // 2 tile PEs → collect PE, with num_positions=2
+        // Tile 0 (rows 0-1, 2 positions): row-major [r0p0, r0p1, r1p0, r1p1]
+        // Tile 1 (rows 2-3, 2 positions): row-major [r2p0, r2p1, r3p0, r3p1]
+        // After collect + transpose: [p0r0, p0r1, p0r2, p0r3, p1r0, p1r1, p1r2, p1r3]
+        let mut s = sim(1, 3);
+
+        let collect_coord = Coord::new(0, 2);
+
+        // Tile 0 → collect (fragment_offset=0)
+        for i in 0..2 {
+            s.add_task_direct(
+                collect_coord,
+                TaskConfig {
+                    kind: TaskKind::ConcatCollect {
+                        num_fragments: 2,
+                        total_rows: 4,
+                        fragment_offset: i * 2,
+                        num_positions: 2,
+                    },
+                    trigger_slot: i,
+                },
+            );
+        }
+        s.add_task_direct(
+            collect_coord,
+            TaskConfig {
+                kind: TaskKind::CollectOutput {
+                    input_slot: u32::MAX,
+                },
+                trigger_slot: u32::MAX,
+            },
+        );
+
+        // Fragment 0: rows 0-1, 2 positions → [1, 10, 2, 20]
+        // (r0p0=1, r0p1=10, r1p0=2, r1p1=20)
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: collect_coord,
+            payload: vec![1.0, 10.0, 2.0, 20.0],
+            payload_slot: 0,
+        });
+        // Fragment 1: rows 2-3, 2 positions → [3, 30, 4, 40]
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 1),
+            dest: collect_coord,
+            payload: vec![3.0, 30.0, 4.0, 40.0],
+            payload_slot: 1,
+        });
+
+        let result = s.run();
+
+        // The ConcatCollect stores the result in ACCUM_SLOT, then CollectOutput
+        // reads it. But we need CollectOutput to trigger on the accum slot.
+        // Actually, ConcatCollect stores output in self.outputs directly.
+        let output = result.outputs.get(&collect_coord).unwrap();
+
+        // Position-major: [p0r0, p0r1, p0r2, p0r3, p1r0, p1r1, p1r2, p1r3]
+        assert_eq!(output, &vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn concat_collect_forward_scatter() {
+        // Collect 2 fragments (2 positions), scatter rows to 2 destinations
+        // Fragment 0: [r0p0, r0p1] = [1, 10]
+        // Fragment 1: [r1p0, r1p1] = [2, 20]
+        // After transpose: [p0r0, p0r1, p1r0, p1r1] = [1, 2, 10, 20]
+        // Scatter: dest 0 gets [1, 2] (position 0), dest 1 gets [10, 20] (position 1)
+        let mut s = sim(3, 2);
+
+        let collect_coord = Coord::new(0, 0);
+        let dest0 = Coord::new(1, 0);
+        let dest1 = Coord::new(2, 0);
+
+        let hops0 = crate::route::generate_route_xy(collect_coord, dest0);
+        let hops1 = crate::route::generate_route_xy(collect_coord, dest1);
+
+        for i in 0..2 {
+            s.add_task_direct(
+                collect_coord,
+                TaskConfig {
+                    kind: TaskKind::ConcatCollectForward {
+                        num_fragments: 2,
+                        total_rows: 2,
+                        fragment_offset: i,
+                        activation: None,
+                        route_dests: vec![(dest0, hops0.clone()), (dest1, hops1.clone())],
+                        num_positions: 2,
+                        scatter: true,
+                    },
+                    trigger_slot: i,
+                },
+            );
+        }
+
+        // Collect outputs at destinations
+        s.add_task_direct(
+            dest0,
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+        s.add_task_direct(
+            dest1,
+            TaskConfig {
+                kind: TaskKind::CollectOutput { input_slot: 0 },
+                trigger_slot: 0,
+            },
+        );
+
+        // Fragment 0: row 0, 2 positions → [1, 10]
+        s.inject_message(InjectMessage {
+            source: collect_coord,
+            dest: collect_coord,
+            payload: vec![1.0, 10.0],
+            payload_slot: 0,
+        });
+        // Fragment 1: row 1, 2 positions → [2, 20]
+        s.inject_message(InjectMessage {
+            source: collect_coord,
+            dest: collect_coord,
+            payload: vec![2.0, 20.0],
+            payload_slot: 1,
+        });
+
+        let result = s.run();
+
+        // dest0 gets position 0: [p0r0, p0r1] = [1, 2]
+        assert_eq!(result.outputs.get(&dest0), Some(&vec![1.0, 2.0]));
+        // dest1 gets position 1: [p1r0, p1r1] = [10, 20]
+        assert_eq!(result.outputs.get(&dest1), Some(&vec![10.0, 20.0]));
     }
 }
