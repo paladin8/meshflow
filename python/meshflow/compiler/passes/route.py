@@ -155,12 +155,14 @@ def _route_xy(
 
                 for i in range(collect.num_fragments):
                     frag_offset = i * base + min(i, remainder)
+                    tile_rows = base + 1 if i < remainder else base
                     pe_tasks[node.coord].append(
                         ConcatCollectForwardEntry(
                             trigger_slot=i,
                             num_fragments=collect.num_fragments,
                             total_rows=collect.total_rows,
                             fragment_offset=frag_offset,
+                            fragment_rows=tile_rows,
                             activation=collect.activation,
                             route_dests=list(route_dests),
                             payload_slots=list(collect_payload_slots),
@@ -170,12 +172,14 @@ def _route_xy(
             else:
                 for i in range(collect.num_fragments):
                     frag_offset = i * base + min(i, remainder)
+                    tile_rows = base + 1 if i < remainder else base
                     pe_tasks[node.coord].append(
                         ConcatCollectEntry(
                             trigger_slot=i,
                             num_fragments=collect.num_fragments,
                             total_rows=collect.total_rows,
                             fragment_offset=frag_offset,
+                            fragment_rows=tile_rows,
                         )
                     )
 

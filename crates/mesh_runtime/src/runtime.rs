@@ -315,10 +315,8 @@ impl Simulator {
     // These must not collide with each other or with user-facing slots.
     // - ConcatCollect/ConcatCollectForward: MAX (accumulator), MAX-1 (counter)
     // - RmsNormReduce: MAX (accumulator), MAX-1 (counter)
-    // - ConcatCollect auto-detect: MAX-2 (stored num_positions)
     const ACCUM_SLOT: SlotId = u32::MAX;
     const COUNTER_SLOT: SlotId = u32::MAX - 1;
-    const NUM_POS_SLOT: SlotId = u32::MAX - 2;
 
     fn process_execute(&mut self, timestamp: u64, coord: Coord, task_index: usize) {
         // Clone the task to avoid borrow conflicts with the PE
@@ -432,6 +430,7 @@ impl Simulator {
                 num_fragments,
                 total_rows,
                 fragment_offset,
+                fragment_rows,
                 num_positions,
             } => {
                 let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
@@ -441,6 +440,7 @@ impl Simulator {
                     num_fragments,
                     total_rows,
                     fragment_offset,
+                    fragment_rows,
                     num_positions,
                 );
                 if let Some(result) = completed {
@@ -454,6 +454,7 @@ impl Simulator {
                 ref activation,
                 ref route_dests,
                 ref payload_slots,
+                fragment_rows,
                 num_positions,
                 scatter,
             } => {
@@ -467,6 +468,7 @@ impl Simulator {
                     num_fragments,
                     total_rows,
                     fragment_offset,
+                    fragment_rows,
                     num_positions,
                 );
                 if let Some(mut result) = completed {
@@ -928,6 +930,7 @@ impl Simulator {
     /// When `num_positions > 0`, fragments are in row-major layout (rows outer,
     /// positions inner). The accumulator scales to `total_rows * num_positions`,
     /// and the completed buffer is transposed to position-major on return.
+    #[allow(clippy::too_many_arguments)]
     fn process_concat_fragment(
         &mut self,
         coord: Coord,
@@ -935,6 +938,7 @@ impl Simulator {
         num_fragments: u32,
         total_rows: u32,
         fragment_offset: u32,
+        fragment_rows: u32,
         num_positions: u32,
     ) -> Option<Vec<f32>> {
         let pe = self.mesh.pe_mut(coord);
@@ -942,30 +946,22 @@ impl Simulator {
 
         let frag_len = fragment.len();
 
-        // Use reserved SRAM slots for accumulator buffer, counter, and num_positions.
+        // Use reserved SRAM slots for accumulator buffer and counter.
         let accum_slot = Self::ACCUM_SLOT;
         let counter_slot = Self::COUNTER_SLOT;
-        let num_pos_slot = Self::NUM_POS_SLOT;
 
-        // Determine num_positions. If set explicitly, use it. Otherwise, auto-detect
-        // from the first fragment's size: fragment has (tile_rows * num_positions) values.
-        // We compute: expected_tile_rows = total_rows / num_fragments (base), and
-        // if fragment is larger, infer num_positions = frag_len / expected_base.
+        // Determine num_positions:
+        // 1. Explicit num_positions field (set by compiler when known)
+        // 2. Infer from fragment_rows: num_pos = frag_len / fragment_rows
+        //    (exact for any tile split; fragment_rows is this tile's row count)
+        // 3. Default to 1 (single position, backward compat)
+        let fr = fragment_rows as usize;
         let num_pos = if num_positions > 0 {
             num_positions as usize
-        } else if pe.has_slot(num_pos_slot) {
-            // Use previously detected value
-            pe.read_slot(num_pos_slot)[0] as usize
+        } else if fr > 0 && frag_len > fr {
+            frag_len / fr
         } else {
-            // Auto-detect from first fragment
-            let base = (total_rows as usize) / (num_fragments as usize).max(1);
-            let detected = if base > 0 && frag_len > base {
-                frag_len / base
-            } else {
-                1
-            };
-            pe.write_slot(num_pos_slot, vec![detected as f32]);
-            detected
+            1
         };
         let total_size = total_rows as usize * num_pos;
         let offset = fragment_offset as usize * num_pos;
@@ -1015,7 +1011,6 @@ impl Simulator {
 
             let mut result = pe.remove_slot(accum_slot).unwrap();
             pe.remove_slot(counter_slot);
-            pe.remove_slot(num_pos_slot);
 
             // Transpose from row-major (total_rows, num_pos) to
             // position-major (num_pos, total_rows) when multi-position.
@@ -2300,7 +2295,8 @@ mod tests {
                         num_fragments: 2,
                         total_rows: 4,
                         fragment_offset: i * 2,
-                        num_positions: 2,
+                        fragment_rows: 2,
+                        num_positions: 0,
                     },
                     trigger_slot: i,
                 },
@@ -2370,7 +2366,8 @@ mod tests {
                         activation: None,
                         route_dests: vec![(dest0, hops0.clone()), (dest1, hops1.clone())],
                         payload_slots: vec![0, 0],
-                        num_positions: 2,
+                        fragment_rows: 1,
+                        num_positions: 0,
                         scatter: true,
                     },
                     trigger_slot: i,

@@ -59,6 +59,7 @@ class ConcatCollectTask:
     num_fragments: int = 0
     total_rows: int = 0
     fragment_offset: int = 0
+    fragment_rows: int = 0
     num_positions: int = 0
 
 
@@ -69,6 +70,7 @@ class ConcatCollectForwardTask:
     num_fragments: int = 0
     total_rows: int = 0
     fragment_offset: int = 0
+    fragment_rows: int = 0
     num_positions: int = 0
     scatter: bool = False
     activation: str | None = None

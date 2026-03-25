@@ -69,6 +69,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             num_fragments=task.num_fragments,
             total_rows=task.total_rows,
             fragment_offset=task.fragment_offset,
+            fragment_rows=task.fragment_rows,
             num_positions=task.num_positions,
         )
     if isinstance(task, ConcatCollectForwardEntry):
@@ -77,6 +78,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             num_fragments=task.num_fragments,
             total_rows=task.total_rows,
             fragment_offset=task.fragment_offset,
+            fragment_rows=task.fragment_rows,
             num_positions=task.num_positions,
             scatter=task.scatter,
             activation=task.activation,

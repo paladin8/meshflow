@@ -84,7 +84,10 @@ pub enum TaskKind {
         num_fragments: u32,
         total_rows: u32,
         fragment_offset: u32,
-        /// Number of sequence positions (0 = infer as 1 for backward compat).
+        /// Expected single-position fragment size for this tile (0 = legacy).
+        /// Used to infer num_positions: frag_len / fragment_rows.
+        fragment_rows: u32,
+        /// Number of sequence positions (0 = infer from fragment_rows).
         num_positions: u32,
     },
     /// Accumulate fragments, apply activation, and broadcast to next layer's tile PEs.
@@ -97,7 +100,9 @@ pub enum TaskKind {
         route_dests: Vec<(Coord, Vec<Direction>)>,
         /// Per-destination payload slots (which SRAM slot to deliver into).
         payload_slots: Vec<SlotId>,
-        /// Number of sequence positions (0 = infer as 1 for backward compat).
+        /// Expected single-position fragment size for this tile (0 = legacy).
+        fragment_rows: u32,
+        /// Number of sequence positions (0 = infer from fragment_rows).
         num_positions: u32,
         /// When true, scatter row i to destination i instead of broadcasting.
         scatter: bool,

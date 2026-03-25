@@ -71,6 +71,8 @@ enum TaskProgram {
         total_rows: u32,
         fragment_offset: u32,
         #[serde(default)]
+        fragment_rows: u32,
+        #[serde(default)]
         num_positions: u32,
     },
     #[serde(rename = "concat_collect_forward")]
@@ -83,6 +85,8 @@ enum TaskProgram {
         route_dests: Vec<((u32, u32), Vec<String>)>,
         #[serde(default)]
         payload_slots: Vec<u32>,
+        #[serde(default)]
+        fragment_rows: u32,
         #[serde(default)]
         num_positions: u32,
         #[serde(default)]
@@ -456,12 +460,14 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             num_fragments,
             total_rows,
             fragment_offset,
+            fragment_rows,
             num_positions,
         } => Ok(TaskConfig {
             kind: TaskKind::ConcatCollect {
                 num_fragments: *num_fragments,
                 total_rows: *total_rows,
                 fragment_offset: *fragment_offset,
+                fragment_rows: *fragment_rows,
                 num_positions: *num_positions,
             },
             trigger_slot: *trigger_slot,
@@ -474,6 +480,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             activation,
             route_dests,
             payload_slots,
+            fragment_rows,
             num_positions,
             scatter,
         } => {
@@ -487,6 +494,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     activation: act,
                     route_dests: dests,
                     payload_slots: payload_slots.clone(),
+                    fragment_rows: *fragment_rows,
                     num_positions: *num_positions,
                     scatter: *scatter,
                 },
