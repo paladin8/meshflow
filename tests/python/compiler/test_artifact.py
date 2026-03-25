@@ -231,6 +231,48 @@ class TestSerializationRoundTrip:
         assert task.route_dests[1] == ((1, 1), ["east", "south", "south"])
         assert task.route_dests[2] == ((1, 2), ["east", "south"])
 
+    def test_round_trip_concat_collect_forward_scatter(self) -> None:
+        program = RuntimeProgram(
+            version=1,
+            mesh_config=MeshProgramConfig(width=2, height=4),
+            pe_programs=[
+                PEProgram(
+                    coord=(0, 3),
+                    tasks=[
+                        ConcatCollectForwardTask(
+                            trigger_slot=0,
+                            num_fragments=3,
+                            total_rows=6,
+                            fragment_offset=0,
+                            num_positions=2,
+                            scatter=True,
+                            activation="relu",
+                            route_dests=[
+                                ((1, 0), ["east", "south", "south", "south"]),
+                                ((1, 1), ["east", "south", "south"]),
+                            ],
+                        ),
+                    ],
+                    initial_sram={},
+                ),
+            ],
+            input_slots=[],
+        )
+        restored = deserialize(serialize(program))
+
+        task = restored.pe_programs[0].tasks[0]
+        assert isinstance(task, ConcatCollectForwardTask)
+        assert task.kind == "concat_collect_forward"
+        assert task.num_fragments == 3
+        assert task.total_rows == 6
+        assert task.fragment_offset == 0
+        assert task.num_positions == 2
+        assert task.scatter is True
+        assert task.activation == "relu"
+        assert len(task.route_dests) == 2
+        assert task.route_dests[0] == ((1, 0), ["east", "south", "south", "south"])
+        assert task.route_dests[1] == ((1, 1), ["east", "south", "south"])
+
     def test_round_trip_add_task(self) -> None:
         program = RuntimeProgram(
             version=1,

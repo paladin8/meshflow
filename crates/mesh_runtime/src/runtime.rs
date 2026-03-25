@@ -682,6 +682,8 @@ impl Simulator {
                 reduce_dest,
                 ref reduce_hops,
                 partial_sum_slot,
+                slice_offset: _,
+                slice_size: _,
             } => {
                 let pe = self.mesh.pe_mut(coord);
                 let data = pe.read_slot(input_slot).clone();
@@ -713,6 +715,8 @@ impl Simulator {
                 gamma_slot,
                 ref output_dests,
                 ref payload_slots,
+                slice_offset: _,
+                slice_size: _,
             } => {
                 let pe = self.mesh.pe_mut(coord);
                 let data = pe.read_slot(input_slot).clone();
@@ -1780,6 +1784,8 @@ mod tests {
                     reduce_dest: reduce,
                     reduce_hops: hops_to_reduce,
                     partial_sum_slot: 0, // slot on reduce PE
+                    slice_offset: 0,
+                    slice_size: 0,
                 },
                 trigger_slot: 0,
             },
@@ -1793,6 +1799,8 @@ mod tests {
                     gamma_slot: 2,
                     output_dests: vec![(collect0, hops_to_collect0)],
                     payload_slots: vec![0],
+                    slice_offset: 0,
+                    slice_size: 0,
                 },
                 trigger_slot: 1, // triggered by scale factor arrival
             },
@@ -1810,6 +1818,8 @@ mod tests {
                     reduce_dest: reduce,
                     reduce_hops: hops_to_reduce1,
                     partial_sum_slot: 1, // different slot on reduce PE
+                    slice_offset: 0,
+                    slice_size: 0,
                 },
                 trigger_slot: 0,
             },
@@ -1823,6 +1833,8 @@ mod tests {
                     gamma_slot: 2,
                     output_dests: vec![(collect1, hops_to_collect1)],
                     payload_slots: vec![0],
+                    slice_offset: 0,
+                    slice_size: 0,
                 },
                 trigger_slot: 1,
             },
@@ -1913,6 +1925,8 @@ mod tests {
                     reduce_dest: reduce,
                     reduce_hops: hops_to_reduce,
                     partial_sum_slot: 0,
+                    slice_offset: 0,
+                    slice_size: 0,
                 },
                 trigger_slot: 0,
             },
@@ -1926,6 +1940,8 @@ mod tests {
                     gamma_slot: 2,
                     output_dests: vec![],
                     payload_slots: vec![],
+                    slice_offset: 0,
+                    slice_size: 0,
                 },
                 trigger_slot: 1,
             },
@@ -1996,6 +2012,8 @@ mod tests {
                         reduce_dest: reduce,
                         reduce_hops: hops,
                         partial_sum_slot: i as u32, // each tile writes to a different slot
+                        slice_offset: 0,
+                        slice_size: 0,
                     },
                     trigger_slot: 0,
                 },

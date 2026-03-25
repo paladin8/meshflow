@@ -59,6 +59,7 @@ class ConcatCollectTask:
     num_fragments: int = 0
     total_rows: int = 0
     fragment_offset: int = 0
+    num_positions: int = 1
 
 
 @dataclass
@@ -68,6 +69,8 @@ class ConcatCollectForwardTask:
     num_fragments: int = 0
     total_rows: int = 0
     fragment_offset: int = 0
+    num_positions: int = 1
+    scatter: bool = False
     activation: str | None = None
     route_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
 
@@ -110,6 +113,8 @@ class RmsNormPartialSumTask:
     reduce_dest: tuple[int, int] = (0, 0)
     reduce_hops: list[str] = field(default_factory=list)
     partial_sum_slot: int = 0
+    slice_offset: int = 0
+    slice_size: int = 0
 
 
 @dataclass
@@ -121,6 +126,8 @@ class RmsNormNormalizeTask:
     gamma_slot: int = 2
     output_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
     payload_slots: list[int] = field(default_factory=list)
+    slice_offset: int = 0
+    slice_size: int = 0
 
 
 @dataclass

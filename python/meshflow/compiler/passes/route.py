@@ -272,6 +272,8 @@ def _route_rmsnorm_tile(
             reduce_dest=reduce_node.coord,
             reduce_hops=reduce_hops,
             partial_sum_slot=tile.tile_index,
+            slice_offset=tile.feature_slice_offset,
+            slice_size=tile.feature_slice_size,
         )
     )
 
@@ -295,6 +297,8 @@ def _route_rmsnorm_tile(
             gamma_slot=2,
             output_dests=outgoing_dests,
             payload_slots=outgoing_payload_slots,
+            slice_offset=tile.feature_slice_offset,
+            slice_size=tile.feature_slice_size,
         )
     )
 

@@ -69,6 +69,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             num_fragments=task.num_fragments,
             total_rows=task.total_rows,
             fragment_offset=task.fragment_offset,
+            num_positions=task.num_positions,
         )
     if isinstance(task, ConcatCollectForwardEntry):
         return ConcatCollectForwardTask(
@@ -76,6 +77,8 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             num_fragments=task.num_fragments,
             total_rows=task.total_rows,
             fragment_offset=task.fragment_offset,
+            num_positions=task.num_positions,
+            scatter=task.scatter,
             activation=task.activation,
             route_dests=[(coord, [d.value for d in hops]) for coord, hops in task.route_dests],
         )
@@ -110,6 +113,8 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             reduce_dest=task.reduce_dest,
             reduce_hops=[d.value for d in task.reduce_hops],
             partial_sum_slot=task.partial_sum_slot,
+            slice_offset=task.slice_offset,
+            slice_size=task.slice_size,
         )
     if isinstance(task, RmsNormNormalizeEntry):
         return RmsNormNormalizeTask(
@@ -119,6 +124,8 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             gamma_slot=task.gamma_slot,
             output_dests=[(coord, [d.value for d in hops]) for coord, hops in task.output_dests],
             payload_slots=list(task.payload_slots),
+            slice_offset=task.slice_offset,
+            slice_size=task.slice_size,
         )
     if isinstance(task, RmsNormReduceEntry):
         return RmsNormReduceTask(

@@ -119,6 +119,10 @@ enum TaskProgram {
         reduce_dest: (u32, u32),
         reduce_hops: Vec<String>,
         partial_sum_slot: u32,
+        #[serde(default)]
+        slice_offset: u32,
+        #[serde(default)]
+        slice_size: u32,
     },
     #[serde(rename = "rms_norm_normalize")]
     RmsNormNormalize {
@@ -129,6 +133,10 @@ enum TaskProgram {
         output_dests: Vec<((u32, u32), Vec<String>)>,
         #[serde(default)]
         payload_slots: Vec<u32>,
+        #[serde(default)]
+        slice_offset: u32,
+        #[serde(default)]
+        slice_size: u32,
     },
     #[serde(rename = "rms_norm_reduce")]
     RmsNormReduce {
@@ -532,6 +540,8 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             reduce_dest,
             reduce_hops,
             partial_sum_slot,
+            slice_offset,
+            slice_size,
         } => {
             let dest = Coord::new(reduce_dest.0, reduce_dest.1);
             validate_coord(dest, width, height)?;
@@ -545,6 +555,8 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     reduce_dest: dest,
                     reduce_hops: hops,
                     partial_sum_slot: *partial_sum_slot,
+                    slice_offset: *slice_offset,
+                    slice_size: *slice_size,
                 },
                 trigger_slot: *trigger_slot,
             })
@@ -556,6 +568,8 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             gamma_slot,
             output_dests,
             payload_slots,
+            slice_offset,
+            slice_size,
         } => {
             let dests = convert_route_dests(output_dests, width, height)?;
             Ok(TaskConfig {
@@ -565,6 +579,8 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     gamma_slot: *gamma_slot,
                     output_dests: dests,
                     payload_slots: payload_slots.clone(),
+                    slice_offset: *slice_offset,
+                    slice_size: *slice_size,
                 },
                 trigger_slot: *trigger_slot,
             })

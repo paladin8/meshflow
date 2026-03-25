@@ -127,6 +127,8 @@ pub enum TaskKind {
         reduce_dest: Coord,
         reduce_hops: Vec<Direction>,
         partial_sum_slot: SlotId,
+        slice_offset: u32,
+        slice_size: u32,
     },
     /// RMSNorm phase 2: apply x * scale * gamma using scale from reduce PE.
     RmsNormNormalize {
@@ -135,6 +137,8 @@ pub enum TaskKind {
         gamma_slot: SlotId,
         output_dests: Vec<(Coord, Vec<Direction>)>,
         payload_slots: Vec<SlotId>,
+        slice_offset: u32,
+        slice_size: u32,
     },
     /// RMSNorm reduce: accumulate partial sums, compute scale, broadcast.
     RmsNormReduce {
