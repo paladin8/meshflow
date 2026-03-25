@@ -100,8 +100,11 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
     if isinstance(task, MatMulEntry):
         return MatMulTask(
             trigger_slot=task.trigger_slot,
-            operand_slots=list(task.operand_slots),
-            num_dynamic_operands=task.num_dynamic_operands,
+            matrix_slot=task.matrix_slot,
+            vector_slot=task.vector_slot,
+            rows=task.rows,
+            cols=task.cols,
+            transpose=task.transpose,
             output_slot=task.output_slot,
             output_dests=[(coord, [d.value for d in hops]) for coord, hops in task.output_dests],
             payload_slots=list(task.payload_slots),

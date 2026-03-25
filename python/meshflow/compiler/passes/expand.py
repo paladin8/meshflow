@@ -92,9 +92,11 @@ def expand(graph: GraphIR, config: CompilerConfig) -> ExpandedIR:
                 chain = attention_chains[nid]
                 assert node.attrs is not None
                 seq_len = node.attrs["seq_len"]
+                d_model = node.attrs.get("d_model", 0)
                 attn_group = AttentionGroup(
                     origin_id=nid,
                     seq_len=seq_len,
+                    d_model=d_model,
                     softmax_id=chain["softmax_id"],
                     av_matmul_id=chain["av_matmul_id"],
                 )
@@ -112,7 +114,8 @@ def expand(graph: GraphIR, config: CompilerConfig) -> ExpandedIR:
             else:
                 assert node.attrs is not None
                 seq_len = node.attrs["seq_len"]
-                attn_group = AttentionGroup(origin_id=nid, seq_len=seq_len)
+                d_model = node.attrs.get("d_model", 0)
+                attn_group = AttentionGroup(origin_id=nid, seq_len=seq_len, d_model=d_model)
                 pe_ids = [f"{nid}_attn_{i}" for i in range(seq_len)]
                 node_expansions[nid] = NodeExpansion(input_pe_ids=pe_ids, output_pe_ids=pe_ids)
                 groups.append(attn_group)

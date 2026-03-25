@@ -340,12 +340,15 @@ class TestSerializationRoundTrip:
                     coord=(0, 0),
                     tasks=[
                         MatMulTask(
-                            trigger_slot=4,
-                            operand_slots=[0, 1, 2, 3, 4],
-                            num_dynamic_operands=4,
-                            output_slot=9,
+                            trigger_slot=0,
+                            matrix_slot=1,
+                            vector_slot=0,
+                            rows=3,
+                            cols=2,
+                            transpose=False,
+                            output_slot=3,
                             output_dests=[((1, 0), ["east"])],
-                            payload_slots=[],
+                            payload_slots=[0],
                         ),
                     ],
                     initial_sram={},
@@ -358,11 +361,12 @@ class TestSerializationRoundTrip:
         task = restored.pe_programs[0].tasks[0]
         assert isinstance(task, MatMulTask)
         assert task.kind == "mat_mul"
-        assert task.trigger_slot == 4
-        assert task.operand_slots == [0, 1, 2, 3, 4]
-        assert task.num_dynamic_operands == 4
-        assert task.output_slot == 9
-        assert task.output_dests == [((1, 0), ["east"])]
+        assert task.matrix_slot == 1
+        assert task.vector_slot == 0
+        assert task.rows == 3
+        assert task.cols == 2
+        assert task.transpose is False
+        assert task.output_slot == 3
 
     def test_round_trip_rms_norm_partial_sum_task(self) -> None:
         program = RuntimeProgram(

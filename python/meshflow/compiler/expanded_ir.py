@@ -57,6 +57,7 @@ class AttentionGroup:
 
     origin_id: str
     seq_len: int
+    d_model: int = 0
     softmax_id: str | None = None
     av_matmul_id: str | None = None
 

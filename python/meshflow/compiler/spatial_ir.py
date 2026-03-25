@@ -65,6 +65,7 @@ class PlacedAttentionPeData:
 
     pe_index: int
     seq_len: int
+    d_model: int
     origin_id: str
     softmax_id: str | None = None
     av_matmul_id: str | None = None

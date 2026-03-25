@@ -352,34 +352,39 @@ def _route_attention_pe(
     node_map: dict[str, PlacedNode],
     pe_tasks: dict[tuple[int, int], list[TaskEntry]],
 ) -> None:
-    """Route an attention PE with co-located QK^T MatMul, Softmax, and AV MatMul."""
+    """Route an attention PE with co-located QK^T MatMul, Softmax, and AV MatMul.
+
+    SRAM slot layout:
+      Slot 0: Q row (d_model) — scattered from Q collect
+      Slot 1: K matrix (seq_len * d_model) — broadcast from K collect
+      Slot 2: V matrix (seq_len * d_model) — broadcast from V collect
+      Slot 3: QK^T result (seq_len)
+      Slot 4: Softmax output (seq_len)
+      Slot 5: AV result (d_model)
+    """
     attn = node.data
     assert isinstance(attn, PlacedAttentionPeData)
 
     seq_len = attn.seq_len
+    q_slot = 0
+    k_slot = 1
+    v_slot = 2
+    qkt_output_slot = 3
+    softmax_output_slot = 4
+    av_output_slot = 5
 
-    # SRAM slot layout:
-    # Slot 0: Q row
-    # Slots 1..seq_len: K vectors
-    # Slots seq_len+1..2*seq_len: V vectors
-    # Slot 2*seq_len+1: QK^T result
-    # Slot 2*seq_len+2: Softmax output
-    # Slot 2*seq_len+3: AV result
-
-    qkt_output_slot = 2 * seq_len + 1
-    softmax_output_slot = 2 * seq_len + 2
-    av_output_slot = 2 * seq_len + 3
-
-    # --- QK^T MatMul ---
-    # operand_slots: [0 (Q), 1..seq_len (K vectors)]
-    # One TaskConfig per K slot — counter fires computation when all K arrive.
-    qkt_operand_slots = list(range(0, seq_len + 1))
-    for k_slot in range(1, seq_len + 1):
+    # --- QK^T MatMul: K @ Q → scores(seq_len) ---
+    # matrix=K(seq_len, d_model), vector=Q(d_model), transpose=false → (seq_len,)
+    # Two TaskConfig entries: trigger on Q (slot 0) and K (slot 1)
+    for trigger in [q_slot, k_slot]:
         pe_tasks[node.coord].append(
             MatMulEntry(
-                trigger_slot=k_slot,
-                operand_slots=qkt_operand_slots,
-                num_dynamic_operands=seq_len,
+                trigger_slot=trigger,
+                matrix_slot=k_slot,
+                vector_slot=q_slot,
+                rows=seq_len,
+                cols=attn.d_model,
+                transpose=False,
                 output_slot=qkt_output_slot,
                 output_dests=[],  # local write only
             )
@@ -395,11 +400,9 @@ def _route_attention_pe(
             )
         )
 
-    # --- AV MatMul ---
+    # --- AV MatMul: V^T @ softmax → output(d_model) ---
+    # matrix=V(seq_len, d_model), vector=softmax(seq_len), transpose=true → (d_model,)
     if attn.av_matmul_id is not None:
-        # operand_slots: [softmax_output, V slots seq_len+1..2*seq_len]
-        av_operand_slots = [softmax_output_slot] + list(range(seq_len + 1, 2 * seq_len + 1))
-
         # Find outgoing edges from this attention PE (inter-group, to downstream)
         outgoing_dests: list[tuple[tuple[int, int], list[Direction]]] = []
         av_payload_slots: list[int] = []
@@ -411,15 +414,16 @@ def _route_attention_pe(
                     outgoing_dests.append((dst.coord, hops))
                     av_payload_slots.append(e.dst_slot)
 
-        # One TaskConfig per dynamic input: V slots + softmax output.
-        # Counter fires when all seq_len+1 dynamic inputs arrive.
-        av_trigger_slots = list(range(seq_len + 1, 2 * seq_len + 1)) + [softmax_output_slot]
-        for trigger_slot in av_trigger_slots:
+        # Two TaskConfig entries: trigger on V (slot 2) and softmax output (slot 4)
+        for trigger in [v_slot, softmax_output_slot]:
             pe_tasks[node.coord].append(
                 MatMulEntry(
-                    trigger_slot=trigger_slot,
-                    operand_slots=av_operand_slots,
-                    num_dynamic_operands=seq_len + 1,
+                    trigger_slot=trigger,
+                    matrix_slot=v_slot,
+                    vector_slot=softmax_output_slot,
+                    rows=seq_len,
+                    cols=attn.d_model,
+                    transpose=True,
                     output_slot=av_output_slot,
                     output_dests=outgoing_dests,
                     payload_slots=av_payload_slots,

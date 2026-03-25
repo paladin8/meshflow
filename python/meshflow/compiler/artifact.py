@@ -98,8 +98,11 @@ class SoftmaxTask:
 class MatMulTask:
     kind: str = field(default="mat_mul", init=False)
     trigger_slot: int = 0
-    operand_slots: list[int] = field(default_factory=list)
-    num_dynamic_operands: int = 0
+    matrix_slot: int = 0
+    vector_slot: int = 0
+    rows: int = 0
+    cols: int = 0
+    transpose: bool = False
     output_slot: int = 0
     output_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
     payload_slots: list[int] = field(default_factory=list)

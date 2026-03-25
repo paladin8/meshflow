@@ -612,29 +612,34 @@ class TestAttentionRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config)
 
-        # seq_len=2: 2 QK^T entries + 1 Softmax + 3 AV entries = 6 tasks
+        # New slot layout: Q=0, K=1, V=2, QK^T=3, softmax=4, AV=5
+        # 2 QK^T entries (trigger on Q=0 and K=1) + 1 Softmax + 2 AV entries (trigger on V=2 and softmax=4)
         attn_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 0))
         matmul_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulEntry)]
         softmax_tasks = [t for t in attn_pe.tasks if isinstance(t, SoftmaxEntry)]
 
-        # QK^T: one entry per K slot (1, 2)
-        qkt_tasks = [t for t in matmul_tasks if t.output_slot == 5]  # 2*2+1
+        # QK^T: trigger on Q (0) and K (1)
+        qkt_tasks = [t for t in matmul_tasks if t.output_slot == 3]
         assert len(qkt_tasks) == 2
-        assert {t.trigger_slot for t in qkt_tasks} == {1, 2}
-        assert qkt_tasks[0].num_dynamic_operands == 2
+        assert {t.trigger_slot for t in qkt_tasks} == {0, 1}
+        assert qkt_tasks[0].matrix_slot == 1  # K matrix
+        assert qkt_tasks[0].vector_slot == 0  # Q vector
+        assert qkt_tasks[0].transpose is False
 
         # Softmax
         assert len(softmax_tasks) == 1
         sm = softmax_tasks[0]
-        assert sm.trigger_slot == 5
-        assert sm.input_slot == 5
-        assert sm.output_slot == 6  # 2*2+2
+        assert sm.trigger_slot == 3
+        assert sm.input_slot == 3
+        assert sm.output_slot == 4
 
-        # AV: one entry per V slot (3, 4) + softmax output (6) = 3 entries
-        av_tasks = [t for t in matmul_tasks if t.output_slot == 7]  # 2*2+3
-        assert len(av_tasks) == 3
-        assert {t.trigger_slot for t in av_tasks} == {3, 4, 6}
-        assert av_tasks[0].num_dynamic_operands == 3  # seq_len + 1
+        # AV: trigger on V (2) and softmax output (4)
+        av_tasks = [t for t in matmul_tasks if t.output_slot == 5]
+        assert len(av_tasks) == 2
+        assert {t.trigger_slot for t in av_tasks} == {2, 4}
+        assert av_tasks[0].matrix_slot == 2  # V matrix
+        assert av_tasks[0].vector_slot == 4  # softmax weights
+        assert av_tasks[0].transpose is True
 
     def test_attention_slot_layout(self) -> None:
         """Verify SRAM slot assignments follow the spec for seq_len=4."""
@@ -657,19 +662,22 @@ class TestAttentionRouting:
         attn_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 0))
         matmul_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulEntry)]
 
-        # QK^T: 4 entries (one per K slot), all with same operand_slots
-        qkt_tasks = [t for t in matmul_tasks if t.output_slot == 9]
-        assert len(qkt_tasks) == 4
-        assert qkt_tasks[0].operand_slots == [0, 1, 2, 3, 4]
+        # QK^T: 2 entries (trigger on Q=0 and K=1), output slot 3
+        qkt_tasks = [t for t in matmul_tasks if t.output_slot == 3]
+        assert len(qkt_tasks) == 2
+        assert qkt_tasks[0].matrix_slot == 1  # K
+        assert qkt_tasks[0].vector_slot == 0  # Q
 
         sm = next(t for t in attn_pe.tasks if isinstance(t, SoftmaxEntry))
-        assert sm.input_slot == 9
-        assert sm.output_slot == 10  # 2*4+2
+        assert sm.input_slot == 3
+        assert sm.output_slot == 4
 
-        # AV: 5 entries (4 V slots + softmax output)
-        av_tasks = [t for t in matmul_tasks if t.output_slot == 11]
-        assert len(av_tasks) == 5
-        assert av_tasks[0].operand_slots == [10, 5, 6, 7, 8]
+        # AV: 2 entries (trigger on V=2 and softmax=4), output slot 5
+        av_tasks = [t for t in matmul_tasks if t.output_slot == 5]
+        assert len(av_tasks) == 2
+        assert av_tasks[0].matrix_slot == 2  # V
+        assert av_tasks[0].vector_slot == 4  # softmax
+        assert av_tasks[0].transpose is True
 
     def test_attention_av_routes_to_downstream(self) -> None:
         """AV result routes to downstream PEs."""
@@ -692,7 +700,7 @@ class TestAttentionRouting:
         schedule = route(spatial, config)
 
         attn_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 0))
-        av_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulEntry) and t.output_slot == 7]
+        av_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulEntry) and t.output_slot == 5]
         assert len(av_tasks) > 0
         # All AV entries share the same output_dests
         av = av_tasks[0]

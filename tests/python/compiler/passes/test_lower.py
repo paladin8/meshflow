@@ -147,20 +147,25 @@ class TestLowerNewTasks:
 
     def test_lower_mat_mul_entry(self) -> None:
         entry = MatMulEntry(
-            trigger_slot=4,
-            operand_slots=[0, 1, 2, 3, 4],
-            num_dynamic_operands=4,
-            output_slot=9,
+            trigger_slot=0,
+            matrix_slot=1,
+            vector_slot=0,
+            rows=3,
+            cols=2,
+            transpose=False,
+            output_slot=3,
             output_dests=[((1, 0), [Direction.EAST])],
-            payload_slots=[],
+            payload_slots=[0],
         )
         task = _lower_task(entry)
         assert isinstance(task, MatMulTask)
         assert task.kind == "mat_mul"
-        assert task.trigger_slot == 4
-        assert task.operand_slots == [0, 1, 2, 3, 4]
-        assert task.num_dynamic_operands == 4
-        assert task.output_slot == 9
+        assert task.matrix_slot == 1
+        assert task.vector_slot == 0
+        assert task.rows == 3
+        assert task.cols == 2
+        assert task.transpose is False
+        assert task.output_slot == 3
         assert task.output_dests == [((1, 0), ["east"])]
 
     def test_lower_rms_norm_partial_sum_entry(self) -> None:
@@ -330,8 +335,8 @@ class TestLowerNewTasks:
             pe for pe in program.pe_programs if any(isinstance(t, MatMulTask) for t in pe.tasks)
         )
         matmul_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulTask)]
-        # seq_len=2: 2 QK^T entries + 3 AV entries = 5 MatMul tasks
-        assert len(matmul_tasks) == 5
+        # 2 QK^T entries (trigger on Q=0, K=1) + 2 AV entries (trigger on V=2, softmax=4)
+        assert len(matmul_tasks) == 4
         softmax_tasks = [t for t in attn_pe.tasks if isinstance(t, SoftmaxTask)]
         assert len(softmax_tasks) == 1
 

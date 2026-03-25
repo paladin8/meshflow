@@ -287,6 +287,7 @@ def _place_attention_group(group: AttentionGroup, col: int) -> tuple[list[Placed
                 data=PlacedAttentionPeData(
                     pe_index=i,
                     seq_len=group.seq_len,
+                    d_model=group.d_model,
                     origin_id=group.origin_id,
                     softmax_id=group.softmax_id,
                     av_matmul_id=group.av_matmul_id,
