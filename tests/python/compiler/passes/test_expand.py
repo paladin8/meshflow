@@ -264,7 +264,7 @@ class TestExpandRmsNorm:
         expanded = expand(graph, CompilerConfig())
         exp = expanded.node_expansions["rn"]
         assert exp.input_pe_ids == ["rn_tile_0", "rn_tile_1", "rn_tile_2", "rn_tile_3"]
-        assert exp.output_pe_ids == ["rn_tile_0", "rn_tile_1", "rn_tile_2", "rn_tile_3"]
+        assert exp.output_pe_ids == ["rn_collect"]
 
 
 class TestExpandMatMul:

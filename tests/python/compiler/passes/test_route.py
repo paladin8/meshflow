@@ -580,14 +580,15 @@ class TestRmsNormRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
-        # Normalize output should route to collect PE
+        # Normalize output should route to the RMSNorm's own collect PE
         tile_pe = next(p for p in schedule.pe_schedules if p.coord == (1, 0))
         norm_task = tile_pe.tasks[1]
         assert isinstance(norm_task, RmsNormNormalizeEntry)
         assert len(norm_task.output_dests) >= 1
-        # The collect PE is at (2, 0)
+        # The RMSNorm collect PE is within the same column
         dest_coords = [coord for coord, _ in norm_task.output_dests]
-        assert (2, 0) in dest_coords
+        # Collect PE is at (1, num_tiles + 1) = (1, 5) for 4 tiles
+        assert (1, 5) in dest_coords
 
 
 class TestAttentionRouting:

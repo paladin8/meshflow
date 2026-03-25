@@ -444,12 +444,13 @@ class TestRmsNormPlacement:
         expanded = expand(graph, CompilerConfig())
         spatial = place(expanded, CompilerConfig())
 
-        # 4 tile PEs + 1 reduce PE = 5 nodes
-        assert len(spatial.nodes) == 5
+        # 4 tile PEs + 1 reduce PE + 1 collect PE = 6 nodes
+        assert len(spatial.nodes) == 6
         coords = {n.id: n.coord for n in spatial.nodes}
         for i in range(4):
             assert coords[f"rn_tile_{i}"] == (0, i)
         assert coords["rn_reduce"] == (0, 4)
+        assert coords["rn_collect"] == (0, 5)
 
     def test_rmsnorm_data_types(self) -> None:
         graph = GraphIR(

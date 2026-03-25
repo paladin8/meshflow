@@ -74,7 +74,8 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
             placed_edges.extend(edges)
             tile_ids = [f"{group.origin_id}_tile_{i}" for i in range(group.num_tiles)]
             reduce_id = f"{group.origin_id}_reduce"
-            node_pe_map[group.origin_id] = tile_ids + [reduce_id]
+            collect_id = f"{group.origin_id}_collect"
+            node_pe_map[group.origin_id] = tile_ids + [reduce_id, collect_id]
 
         elif isinstance(group, AttentionGroup):
             nodes, height = _place_attention_group(group, col)
@@ -241,7 +242,35 @@ def _place_rmsnorm_group(
             )
         )
 
-    return nodes, edges, reduce_row + 1
+    # Collect PE gathers normalized fragments from all tiles
+    collect_row = reduce_row + 1
+    collect_id = f"{group.origin_id}_collect"
+    nodes.append(
+        PlacedNode(
+            id=collect_id,
+            kind=PlacedNodeKind.LINEAR_COLLECT,
+            coord=(col, collect_row),
+            data=PlacedCollectData(
+                num_fragments=group.num_tiles,
+                total_rows=group.feature_count,
+                origin_id=group.origin_id,
+                activation=None,
+            ),
+        )
+    )
+
+    # Internal edges: tile → collect (normalized fragments)
+    for i in range(group.num_tiles):
+        edges.append(
+            PlacedEdge(
+                src_node=f"{group.origin_id}_tile_{i}",
+                src_slot=1,  # normalize output
+                dst_node=collect_id,
+                dst_slot=i,
+            )
+        )
+
+    return nodes, edges, collect_row + 1
 
 
 def _place_attention_group(group: AttentionGroup, col: int) -> tuple[list[PlacedNode], int]:

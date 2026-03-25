@@ -83,7 +83,9 @@ def expand(graph: GraphIR, config: CompilerConfig) -> ExpandedIR:
                 )
             )
             tile_ids = [f"{nid}_tile_{i}" for i in range(num_tiles)]
-            node_expansions[nid] = NodeExpansion(input_pe_ids=tile_ids, output_pe_ids=tile_ids)
+            collect_id = f"{nid}_collect"
+            # Data enters through tiles, exits through collect (gathers normalized fragments)
+            node_expansions[nid] = NodeExpansion(input_pe_ids=tile_ids, output_pe_ids=[collect_id])
 
         elif node.op == OpType.MATMUL:
             if nid in attention_chains:
