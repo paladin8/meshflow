@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 
-from meshflow._mesh_runtime import run_program
+from meshflow._mesh_runtime import MeshConfig, SimInput, TaskKind, run_program, run_simulation
 from meshflow.compiler import CompilerConfig, compile
 from meshflow.compiler.artifact import serialize
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
@@ -34,6 +34,21 @@ def _run_graph(
         output = data
     assert output is not None, f"no output found, outputs={dict(result.outputs)}"
     return output
+
+
+def _run_graph_result(
+    graph: GraphIR,
+    weights: dict[str, dict[str, np.ndarray]] | None,
+    mesh_height: int = 6,
+    inputs: dict[str, list[float]] | None = None,
+) -> object:
+    """Compile, serialize, run, and return the full SimResult (with final_timestamp)."""
+    config = CompilerConfig(mesh_height=mesh_height)
+    program = compile(graph, config, weights=weights)
+    artifact_bytes = serialize(program)
+
+    run_inputs: dict[str, list[float]] = inputs if inputs is not None else {}
+    return run_program(artifact_bytes, inputs=run_inputs)
 
 
 class TestMlpHelper:
@@ -399,4 +414,103 @@ class TestMatMul:
         assert torch.allclose(actual, expected, atol=1e-3), (
             f"attention matmul larger mismatch:\ngot\n{actual}\nexpected\n{expected}\n"
             f"diff=\n{actual - expected}"
+        )
+
+
+class TestCostModel:
+    """Tests for data-proportional cost model behavior."""
+
+    def test_linear_cost_scales_with_dimensions(self) -> None:
+        """Larger MLP dimensions produce higher final_timestamp."""
+        torch.manual_seed(100)
+        x_small = torch.randn(4)
+        x_large = torch.randn(4)
+
+        # Small MLP: [4, 4]
+        small_graph = mlp_block([4, 4])
+        small_weights = mlp_weights([4, 4], seed=1)
+        small_result = _run_graph_result(
+            small_graph, small_weights, inputs={"input": x_small.tolist()}
+        )
+
+        # Large MLP: [4, 16]
+        large_graph = mlp_block([4, 16])
+        large_weights = mlp_weights([4, 16], seed=1)
+        large_result = _run_graph_result(
+            large_graph, large_weights, inputs={"input": x_large.tolist()}
+        )
+
+        assert large_result.final_timestamp > small_result.final_timestamp, (
+            f"Expected larger MLP to take longer: "
+            f"small={small_result.final_timestamp}, large={large_result.final_timestamp}"
+        )
+
+    def test_matmul_cost_scales_with_matrix_size(self) -> None:
+        """Larger transformer dimensions produce higher final_timestamp."""
+        torch.manual_seed(200)
+
+        # Small transformer: seq_len=2, d_model=4
+        small_graph = transformer_block(seq_len=2, d_model=4, d_ff=8, eps=1e-6)
+        small_weights = transformer_weights(d_model=4, d_ff=8, seed=2)
+        x_small = torch.randn(2, 4)
+        small_result = _run_graph_result(
+            small_graph,
+            small_weights,
+            mesh_height=6,
+            inputs={"input": x_small.flatten().tolist()},
+        )
+
+        # Large transformer: seq_len=4, d_model=8
+        large_graph = transformer_block(seq_len=4, d_model=8, d_ff=16, eps=1e-6)
+        large_weights = transformer_weights(d_model=8, d_ff=16, seed=2)
+        x_large = torch.randn(4, 8)
+        large_result = _run_graph_result(
+            large_graph,
+            large_weights,
+            mesh_height=6,
+            inputs={"input": x_large.flatten().tolist()},
+        )
+
+        assert large_result.final_timestamp > small_result.final_timestamp, (
+            f"Expected larger transformer to take longer: "
+            f"small={small_result.final_timestamp}, large={large_result.final_timestamp}"
+        )
+
+    def test_cost_per_element_configurable(self) -> None:
+        """cost_per_element plumbing works: FORWARD->COLLECT with 0 elements is unaffected."""
+        # ForwardActivation has 0 elements, so cost_per_element should not matter.
+        config_low = MeshConfig(width=3, height=1, cost_per_element=1)
+        config_high = MeshConfig(width=3, height=1, cost_per_element=10)
+
+        def build_input() -> SimInput:
+            inp = SimInput()
+            inp.add_task((0, 0), TaskKind.ForwardActivation, 0, route_dest=(2, 0))
+            inp.add_task((2, 0), TaskKind.CollectOutput, 0)
+            inp.add_message((0, 0), (0, 0), [1.0, 2.0, 3.0], 0)
+            return inp
+
+        result_low = run_simulation(config_low, build_input())
+        result_high = run_simulation(config_high, build_input())
+
+        assert result_low.final_timestamp == result_high.final_timestamp, (
+            f"ForwardActivation (0 elements) should be unaffected by cost_per_element: "
+            f"low={result_low.final_timestamp}, high={result_high.final_timestamp}"
+        )
+
+    def test_forward_activation_zero_element_cost(self) -> None:
+        """FORWARD->COLLECT graph completes with low final_timestamp (< 20)."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="input", op=OpType.FORWARD),
+                Node(id="output", op=OpType.COLLECT),
+            ],
+            edges=[
+                Edge(src_node="input", src_slot=0, dst_node="output", dst_slot=0),
+            ],
+        )
+        result = _run_graph_result(graph, weights={}, inputs={"input": [1.0, 2.0, 3.0]})
+
+        assert result.final_timestamp < 20, (
+            f"FORWARD->COLLECT should be fast (0 elements): "
+            f"final_timestamp={result.final_timestamp}"
         )

@@ -96,7 +96,6 @@ impl Simulator {
     }
 
     /// Compute task execution cost: fixed overhead + work-proportional cost.
-    #[allow(dead_code)]
     fn task_cost(&self, elements: u64) -> u64 {
         self.config.task_base_latency + elements * self.config.cost_per_element
     }
@@ -361,7 +360,8 @@ impl Simulator {
 
                 // Enqueue at current PE — the event loop will forward or
                 // deliver locally depending on whether hops is empty.
-                self.emit_message(timestamp, coord, route_dest, hops, data, payload_slot);
+                let send_time = timestamp + self.task_cost(0);
+                self.emit_message(send_time, coord, route_dest, hops, data, payload_slot);
             }
             TaskKind::CollectOutput { input_slot } => {
                 let pe = self.mesh.pe_mut(coord);
@@ -410,7 +410,9 @@ impl Simulator {
                     }
                 }
 
-                self.emit_message(timestamp, coord, route_dest, hops, y, fragment_slot);
+                let elements = (tile_rows as u64) * (tile_cols as u64) * (num_positions as u64);
+                let send_time = timestamp + self.task_cost(elements);
+                self.emit_message(send_time, coord, route_dest, hops, y, fragment_slot);
             }
             TaskKind::ConcatCollect {
                 num_fragments,
@@ -464,7 +466,7 @@ impl Simulator {
                     }
 
                     // Send to next layer's tile PEs with send serialization.
-                    let base_time = timestamp + self.config.task_base_latency;
+                    let base_time = timestamp + self.task_cost(0);
                     if scatter && !route_dests.is_empty() {
                         // Scatter: send row i to destination i
                         self.scatter_to_dests(
@@ -519,12 +521,14 @@ impl Simulator {
                     b.len()
                 );
                 let result: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
-                self.task_write_slot(timestamp, coord, output_slot, result.clone());
+                let elements = a.len() as u64;
+                let element_cost = elements * self.config.cost_per_element;
+                self.task_write_slot(timestamp + element_cost, coord, output_slot, result.clone());
 
                 // Route to destinations
                 let output_dests = output_dests.clone();
                 let payload_slots = payload_slots.clone();
-                let base_time = timestamp + self.config.task_base_latency;
+                let base_time = timestamp + self.task_cost(elements);
                 self.broadcast_to_dests(base_time, coord, &output_dests, &payload_slots, result);
             }
             TaskKind::Softmax {
@@ -542,7 +546,9 @@ impl Simulator {
                 let sum: f32 = exp_vals.iter().sum();
                 let result: Vec<f32> = exp_vals.iter().map(|x| x / sum).collect();
 
-                self.task_write_slot(timestamp, coord, output_slot, result);
+                let elements = 3 * data.len() as u64;
+                let element_cost = elements * self.config.cost_per_element;
+                self.task_write_slot(timestamp + element_cost, coord, output_slot, result);
             }
             TaskKind::MatMul {
                 matrix_slot,
@@ -588,13 +594,15 @@ impl Simulator {
                     out
                 };
 
-                self.task_write_slot(timestamp, coord, output_slot, result.clone());
+                let elements = (rows as u64) * (cols as u64);
+                let element_cost = elements * self.config.cost_per_element;
+                self.task_write_slot(timestamp + element_cost, coord, output_slot, result.clone());
 
                 let output_dests = output_dests.clone();
                 let payload_slots = payload_slots.clone();
 
                 // Route to destinations
-                let base_time = timestamp + self.config.task_base_latency;
+                let base_time = timestamp + self.task_cost(elements);
                 self.broadcast_to_dests(base_time, coord, &output_dests, &payload_slots, result);
             }
             TaskKind::RmsNormPartialSum {
@@ -647,8 +655,15 @@ impl Simulator {
 
                 // Send partial sum(s) to reduce PE
                 let reduce_hops = reduce_hops.clone();
+                let num_pos = if fc > 0 && data.len() > fc {
+                    data.len() / fc
+                } else {
+                    1
+                };
+                let elements = (ss as u64) * (num_pos as u64);
+                let send_time = timestamp + self.task_cost(elements);
                 self.emit_message(
-                    timestamp,
+                    send_time,
                     coord,
                     reduce_dest,
                     reduce_hops,
@@ -721,7 +736,8 @@ impl Simulator {
                 // Route to destinations
                 let output_dests = output_dests.clone();
                 let payload_slots = payload_slots.clone();
-                let base_time = timestamp + self.config.task_base_latency;
+                let elements = (ss as u64) * (num_positions as u64);
+                let base_time = timestamp + self.task_cost(elements);
                 self.broadcast_to_dests(base_time, coord, &output_dests, &payload_slots, result);
             }
             TaskKind::RmsNormReduce {
@@ -790,7 +806,8 @@ impl Simulator {
                 // Broadcast scale factor(s) to all tile PEs
                 let tile_dests = tile_dests.clone();
                 let uniform_slots = vec![scale_slot; tile_dests.len()];
-                let base_time = timestamp + self.config.task_base_latency;
+                let elements = (num_tiles as u64) * (num_positions as u64);
+                let base_time = timestamp + self.task_cost(elements);
                 self.broadcast_to_dests(base_time, coord, &tile_dests, &uniform_slots, scales);
             }
         }
