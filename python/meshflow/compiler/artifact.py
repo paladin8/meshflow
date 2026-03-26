@@ -16,6 +16,22 @@ class MeshProgramConfig:
     max_events: int = 100_000
 
 
+@dataclass
+class BroadcastRouteTask:
+    """A single route in a broadcast fan-out (serialization form).
+
+    dest: (x, y) coordinate of the final destination.
+    hops: ordered direction strings from source to destination.
+    deliver_at: hop indices for intermediate delivery (empty = point-to-point).
+    payload_slot: SRAM slot to deliver into on the destination PE.
+    """
+
+    dest: tuple[int, int] = (0, 0)
+    hops: list[str] = field(default_factory=list)
+    deliver_at: list[int] = field(default_factory=list)
+    payload_slot: int = 0
+
+
 # ---------------------------------------------------------------------------
 # Per-kind task dataclasses — each serializes as a flat dict with `kind`
 # as the discriminator.
@@ -76,8 +92,7 @@ class ConcatCollectForwardTask:
     num_positions: int = 0
     scatter: bool = False
     activation: str | None = None
-    route_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
-    payload_slots: list[int] = field(default_factory=list)
+    routes: list[BroadcastRouteTask] = field(default_factory=list)
 
 
 @dataclass
@@ -87,8 +102,7 @@ class AddTask:
     input_slot_a: int = 0
     input_slot_b: int = 1
     output_slot: int = 2
-    output_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
-    payload_slots: list[int] = field(default_factory=list)
+    routes: list[BroadcastRouteTask] = field(default_factory=list)
 
 
 @dataclass
@@ -109,8 +123,7 @@ class MatMulTask:
     cols: int = 0
     transpose: bool = False
     output_slot: int = 0
-    output_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
-    payload_slots: list[int] = field(default_factory=list)
+    routes: list[BroadcastRouteTask] = field(default_factory=list)
 
 
 @dataclass
@@ -133,8 +146,7 @@ class RmsNormNormalizeTask:
     input_slot: int = 0
     scale_slot: int = 1
     gamma_slot: int = 2
-    output_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
-    payload_slots: list[int] = field(default_factory=list)
+    routes: list[BroadcastRouteTask] = field(default_factory=list)
     slice_offset: int = 0
     slice_size: int = 0
 
@@ -146,8 +158,7 @@ class RmsNormReduceTask:
     num_tiles: int = 0
     feature_count: int = 0
     eps: float = 1e-6
-    tile_dests: list[tuple[tuple[int, int], list[str]]] = field(default_factory=list)
-    scale_slot: int = 1
+    routes: list[BroadcastRouteTask] = field(default_factory=list)
 
 
 TaskProgram = (
@@ -246,15 +257,10 @@ def _task_to_dict(task: TaskProgram) -> dict[str, Any]:
         d["route_dest"] = list(d["route_dest"])
     if "reduce_dest" in d and d["reduce_dest"] is not None:
         d["reduce_dest"] = list(d["reduce_dest"])
-    # Convert route_dests list of (coord_tuple, hops) for ConcatCollectForwardTask
-    if "route_dests" in d:
-        d["route_dests"] = [[list(coord), hops] for coord, hops in d["route_dests"]]
-    # Convert output_dests for Add, MatMul, RmsNormNormalize
-    if "output_dests" in d:
-        d["output_dests"] = [[list(coord), hops] for coord, hops in d["output_dests"]]
-    # Convert tile_dests for RmsNormReduce
-    if "tile_dests" in d:
-        d["tile_dests"] = [[list(coord), hops] for coord, hops in d["tile_dests"]]
+    # Convert routes list of BroadcastRouteTask dicts — dest tuple to list
+    if "routes" in d:
+        for route in d["routes"]:
+            route["dest"] = list(route["dest"])
     return d
 
 
@@ -275,22 +281,41 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
     if kind == "concat_collect":
         return ConcatCollectTask(**fields)
     if kind == "concat_collect_forward":
-        # Convert route_dests: [[coord_list, hops], ...] → [(coord_tuple, hops), ...]
-        if "route_dests" in fields:
-            fields["route_dests"] = [(tuple(coord), hops) for coord, hops in fields["route_dests"]]
+        if "routes" in fields:
+            fields["routes"] = [
+                BroadcastRouteTask(
+                    dest=tuple(r["dest"]),
+                    hops=r["hops"],
+                    deliver_at=r.get("deliver_at", []),
+                    payload_slot=r["payload_slot"],
+                )
+                for r in fields["routes"]
+            ]
         return ConcatCollectForwardTask(**fields)
     if kind == "add":
-        if "output_dests" in fields:
-            fields["output_dests"] = [
-                (tuple(coord), hops) for coord, hops in fields["output_dests"]
+        if "routes" in fields:
+            fields["routes"] = [
+                BroadcastRouteTask(
+                    dest=tuple(r["dest"]),
+                    hops=r["hops"],
+                    deliver_at=r.get("deliver_at", []),
+                    payload_slot=r["payload_slot"],
+                )
+                for r in fields["routes"]
             ]
         return AddTask(**fields)
     if kind == "softmax":
         return SoftmaxTask(**fields)
     if kind == "mat_mul":
-        if "output_dests" in fields:
-            fields["output_dests"] = [
-                (tuple(coord), hops) for coord, hops in fields["output_dests"]
+        if "routes" in fields:
+            fields["routes"] = [
+                BroadcastRouteTask(
+                    dest=tuple(r["dest"]),
+                    hops=r["hops"],
+                    deliver_at=r.get("deliver_at", []),
+                    payload_slot=r["payload_slot"],
+                )
+                for r in fields["routes"]
             ]
         return MatMulTask(**fields)
     if kind == "rms_norm_partial_sum":
@@ -298,14 +323,28 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
             fields["reduce_dest"] = tuple(fields["reduce_dest"])
         return RmsNormPartialSumTask(**fields)
     if kind == "rms_norm_normalize":
-        if "output_dests" in fields:
-            fields["output_dests"] = [
-                (tuple(coord), hops) for coord, hops in fields["output_dests"]
+        if "routes" in fields:
+            fields["routes"] = [
+                BroadcastRouteTask(
+                    dest=tuple(r["dest"]),
+                    hops=r["hops"],
+                    deliver_at=r.get("deliver_at", []),
+                    payload_slot=r["payload_slot"],
+                )
+                for r in fields["routes"]
             ]
         return RmsNormNormalizeTask(**fields)
     if kind == "rms_norm_reduce":
-        if "tile_dests" in fields:
-            fields["tile_dests"] = [(tuple(coord), hops) for coord, hops in fields["tile_dests"]]
+        if "routes" in fields:
+            fields["routes"] = [
+                BroadcastRouteTask(
+                    dest=tuple(r["dest"]),
+                    hops=r["hops"],
+                    deliver_at=r.get("deliver_at", []),
+                    payload_slot=r["payload_slot"],
+                )
+                for r in fields["routes"]
+            ]
         return RmsNormReduceTask(**fields)
     raise ValueError(f"unknown task kind: {kind!r}")
 

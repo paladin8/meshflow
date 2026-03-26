@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::coords::{Coord, Direction};
 use crate::message::SlotId;
-use crate::pe::{Activation, TaskConfig, TaskKind};
+use crate::pe::{Activation, BroadcastRouteRuntime, TaskConfig, TaskKind};
 use crate::runtime::{InjectMessage, SimConfig, SimResult, Simulator};
 
 // ---------------------------------------------------------------------------
@@ -90,9 +90,8 @@ enum TaskProgram {
         total_rows: u32,
         fragment_offset: u32,
         activation: Option<String>,
-        route_dests: Vec<((u32, u32), Vec<String>)>,
         #[serde(default)]
-        payload_slots: Vec<u32>,
+        routes: Vec<BroadcastRouteProgram>,
         #[serde(default)]
         fragment_rows: u32,
         #[serde(default)]
@@ -106,9 +105,8 @@ enum TaskProgram {
         input_slot_a: u32,
         input_slot_b: u32,
         output_slot: u32,
-        output_dests: Vec<((u32, u32), Vec<String>)>,
         #[serde(default)]
-        payload_slots: Vec<u32>,
+        routes: Vec<BroadcastRouteProgram>,
     },
     #[serde(rename = "softmax")]
     Softmax {
@@ -126,9 +124,8 @@ enum TaskProgram {
         #[serde(default)]
         transpose: bool,
         output_slot: u32,
-        output_dests: Vec<((u32, u32), Vec<String>)>,
         #[serde(default)]
-        payload_slots: Vec<u32>,
+        routes: Vec<BroadcastRouteProgram>,
     },
     #[serde(rename = "rms_norm_partial_sum")]
     RmsNormPartialSum {
@@ -150,9 +147,8 @@ enum TaskProgram {
         input_slot: u32,
         scale_slot: u32,
         gamma_slot: u32,
-        output_dests: Vec<((u32, u32), Vec<String>)>,
         #[serde(default)]
-        payload_slots: Vec<u32>,
+        routes: Vec<BroadcastRouteProgram>,
         #[serde(default)]
         slice_offset: u32,
         #[serde(default)]
@@ -164,8 +160,8 @@ enum TaskProgram {
         num_tiles: u32,
         feature_count: u32,
         eps: f32,
-        tile_dests: Vec<((u32, u32), Vec<String>)>,
-        scale_slot: u32,
+        #[serde(default)]
+        routes: Vec<BroadcastRouteProgram>,
     },
 }
 
@@ -173,6 +169,15 @@ enum TaskProgram {
 struct InputSlotProgram {
     name: String,
     coord: (u32, u32),
+    payload_slot: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct BroadcastRouteProgram {
+    dest: (u32, u32),
+    hops: Vec<String>,
+    #[serde(default)]
+    deliver_at: Vec<usize>,
     payload_slot: u32,
 }
 
@@ -380,21 +385,27 @@ fn parse_direction(s: &str) -> Result<Direction, ProgramError> {
     }
 }
 
-fn convert_route_dests(
-    dests: &[((u32, u32), Vec<String>)],
+fn convert_routes(
+    routes: &[BroadcastRouteProgram],
     width: u32,
     height: u32,
-) -> Result<Vec<(Coord, Vec<Direction>)>, ProgramError> {
-    dests
+) -> Result<Vec<BroadcastRouteRuntime>, ProgramError> {
+    routes
         .iter()
-        .map(|(coord, hops)| {
-            let c = Coord::new(coord.0, coord.1);
-            validate_coord(c, width, height)?;
-            let h: Vec<Direction> = hops
+        .map(|r| {
+            let dest = Coord::new(r.dest.0, r.dest.1);
+            validate_coord(dest, width, height)?;
+            let hops: Vec<Direction> = r
+                .hops
                 .iter()
                 .map(|s| parse_direction(s))
                 .collect::<Result<_, _>>()?;
-            Ok((c, h))
+            Ok(BroadcastRouteRuntime {
+                dest,
+                hops,
+                deliver_at: r.deliver_at.clone(),
+                payload_slot: r.payload_slot,
+            })
         })
         .collect()
 }
@@ -489,22 +500,20 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             total_rows,
             fragment_offset,
             activation,
-            route_dests,
-            payload_slots,
+            routes,
             fragment_rows,
             num_positions,
             scatter,
         } => {
             let act = activation.as_deref().map(parse_activation).transpose()?;
-            let dests = convert_route_dests(route_dests, width, height)?;
+            let converted_routes = convert_routes(routes, width, height)?;
             Ok(TaskConfig {
                 kind: TaskKind::ConcatCollectForward {
                     num_fragments: *num_fragments,
                     total_rows: *total_rows,
                     fragment_offset: *fragment_offset,
                     activation: act,
-                    route_dests: dests,
-                    payload_slots: payload_slots.clone(),
+                    routes: converted_routes,
                     fragment_rows: *fragment_rows,
                     num_positions: *num_positions,
                     scatter: *scatter,
@@ -517,17 +526,15 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             input_slot_a,
             input_slot_b,
             output_slot,
-            output_dests,
-            payload_slots,
+            routes,
         } => {
-            let dests = convert_route_dests(output_dests, width, height)?;
+            let converted_routes = convert_routes(routes, width, height)?;
             Ok(TaskConfig {
                 kind: TaskKind::Add {
                     input_slot_a: *input_slot_a,
                     input_slot_b: *input_slot_b,
                     output_slot: *output_slot,
-                    output_dests: dests,
-                    payload_slots: payload_slots.clone(),
+                    routes: converted_routes,
                 },
                 trigger_slot: *trigger_slot,
             })
@@ -551,10 +558,9 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             cols,
             transpose,
             output_slot,
-            output_dests,
-            payload_slots,
+            routes,
         } => {
-            let dests = convert_route_dests(output_dests, width, height)?;
+            let converted_routes = convert_routes(routes, width, height)?;
             Ok(TaskConfig {
                 kind: TaskKind::MatMul {
                     matrix_slot: *matrix_slot,
@@ -563,8 +569,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     cols: *cols,
                     transpose: *transpose,
                     output_slot: *output_slot,
-                    output_dests: dests,
-                    payload_slots: payload_slots.clone(),
+                    routes: converted_routes,
                 },
                 trigger_slot: *trigger_slot,
             })
@@ -603,19 +608,17 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             input_slot,
             scale_slot,
             gamma_slot,
-            output_dests,
-            payload_slots,
+            routes,
             slice_offset,
             slice_size,
         } => {
-            let dests = convert_route_dests(output_dests, width, height)?;
+            let converted_routes = convert_routes(routes, width, height)?;
             Ok(TaskConfig {
                 kind: TaskKind::RmsNormNormalize {
                     input_slot: *input_slot,
                     scale_slot: *scale_slot,
                     gamma_slot: *gamma_slot,
-                    output_dests: dests,
-                    payload_slots: payload_slots.clone(),
+                    routes: converted_routes,
                     slice_offset: *slice_offset,
                     slice_size: *slice_size,
                 },
@@ -627,17 +630,15 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             num_tiles,
             feature_count,
             eps,
-            tile_dests,
-            scale_slot,
+            routes,
         } => {
-            let dests = convert_route_dests(tile_dests, width, height)?;
+            let converted_routes = convert_routes(routes, width, height)?;
             Ok(TaskConfig {
                 kind: TaskKind::RmsNormReduce {
                     num_tiles: *num_tiles,
                     feature_count: *feature_count,
                     eps: *eps,
-                    tile_dests: dests,
-                    scale_slot: *scale_slot,
+                    routes: converted_routes,
                 },
                 trigger_slot: *trigger_slot,
             })

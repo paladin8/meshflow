@@ -4,7 +4,7 @@ use crate::coords::{Coord, Direction};
 use crate::event::{EventKind, EventQueue};
 use crate::mesh::Mesh;
 use crate::message::{Message, SlotId};
-use crate::pe::{TaskConfig, TaskKind};
+use crate::pe::{BroadcastRouteRuntime, TaskConfig, TaskKind};
 use crate::profiling::{OperatorTiming, ProfileSummary, TraceEvent, TraceEventKind};
 use crate::route::generate_route_xy;
 
@@ -459,16 +459,14 @@ impl Simulator {
                 total_rows,
                 fragment_offset,
                 ref activation,
-                ref route_dests,
-                ref payload_slots,
+                ref routes,
                 fragment_rows,
                 num_positions,
                 scatter,
             } => {
                 let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
                 let activation = activation.clone();
-                let payload_slots = payload_slots.clone();
-                let route_dests = route_dests.clone();
+                let routes = routes.clone();
                 let completed = self.process_concat_fragment(
                     coord,
                     trigger_slot,
@@ -486,24 +484,12 @@ impl Simulator {
 
                     // Send to next layer's tile PEs with send serialization.
                     let base_time = timestamp + self.task_cost(0);
-                    if scatter && !route_dests.is_empty() {
+                    if scatter && !routes.is_empty() {
                         // Scatter: send row i to destination i
-                        self.scatter_to_dests(
-                            base_time,
-                            coord,
-                            &route_dests,
-                            &payload_slots,
-                            &result,
-                        );
+                        self.scatter_to_dests(base_time, coord, &routes, &result);
                     } else {
                         // Broadcast: send full result to all destinations
-                        self.broadcast_to_dests(
-                            base_time,
-                            coord,
-                            &route_dests,
-                            &payload_slots,
-                            result,
-                        );
+                        self.broadcast_to_dests(base_time, coord, &routes, result);
                     }
                 }
             }
@@ -511,8 +497,7 @@ impl Simulator {
                 input_slot_a,
                 input_slot_b,
                 output_slot,
-                ref output_dests,
-                ref payload_slots,
+                ref routes,
             } => {
                 let pe = self.mesh.pe_mut(coord);
 
@@ -545,10 +530,9 @@ impl Simulator {
                 self.task_write_slot(timestamp + element_cost, coord, output_slot, result.clone());
 
                 // Route to destinations
-                let output_dests = output_dests.clone();
-                let payload_slots = payload_slots.clone();
+                let routes = routes.clone();
                 let base_time = timestamp + self.task_cost(elements);
-                self.broadcast_to_dests(base_time, coord, &output_dests, &payload_slots, result);
+                self.broadcast_to_dests(base_time, coord, &routes, result);
             }
             TaskKind::Softmax {
                 input_slot,
@@ -576,8 +560,7 @@ impl Simulator {
                 cols,
                 transpose,
                 output_slot,
-                ref output_dests,
-                ref payload_slots,
+                ref routes,
             } => {
                 let pe = self.mesh.pe_mut(coord);
 
@@ -617,12 +600,11 @@ impl Simulator {
                 let element_cost = elements * self.config.cost_per_element;
                 self.task_write_slot(timestamp + element_cost, coord, output_slot, result.clone());
 
-                let output_dests = output_dests.clone();
-                let payload_slots = payload_slots.clone();
+                let routes = routes.clone();
 
                 // Route to destinations
                 let base_time = timestamp + self.task_cost(elements);
-                self.broadcast_to_dests(base_time, coord, &output_dests, &payload_slots, result);
+                self.broadcast_to_dests(base_time, coord, &routes, result);
             }
             TaskKind::RmsNormPartialSum {
                 input_slot,
@@ -694,8 +676,7 @@ impl Simulator {
                 input_slot,
                 scale_slot,
                 gamma_slot,
-                ref output_dests,
-                ref payload_slots,
+                ref routes,
                 slice_offset,
                 slice_size,
             } => {
@@ -753,18 +734,16 @@ impl Simulator {
                 };
 
                 // Route to destinations
-                let output_dests = output_dests.clone();
-                let payload_slots = payload_slots.clone();
+                let routes = routes.clone();
                 let elements = (ss as u64) * (num_positions as u64);
                 let base_time = timestamp + self.task_cost(elements);
-                self.broadcast_to_dests(base_time, coord, &output_dests, &payload_slots, result);
+                self.broadcast_to_dests(base_time, coord, &routes, result);
             }
             TaskKind::RmsNormReduce {
                 num_tiles,
                 feature_count,
                 eps,
-                ref tile_dests,
-                scale_slot,
+                ref routes,
             } => {
                 // Counter-based accumulation: fires on each partial sum arrival,
                 // computes when all arrive. Only counts as executed on completion.
@@ -820,14 +799,15 @@ impl Simulator {
                 pe.remove_slot(counter_slot);
 
                 // Write scale(s) to local SRAM (for debugging/inspection)
-                pe.write_slot(scale_slot, scales.clone());
+                // Use the first route's payload_slot as the local scale slot
+                let local_scale_slot = routes.first().map(|r| r.payload_slot).unwrap_or(1);
+                pe.write_slot(local_scale_slot, scales.clone());
 
                 // Broadcast scale factor(s) to all tile PEs
-                let tile_dests = tile_dests.clone();
-                let uniform_slots = vec![scale_slot; tile_dests.len()];
+                let routes = routes.clone();
                 let elements = (num_tiles as u64) * (num_positions as u64);
                 let base_time = timestamp + self.task_cost(elements);
-                self.broadcast_to_dests(base_time, coord, &tile_dests, &uniform_slots, scales);
+                self.broadcast_to_dests(base_time, coord, &routes, scales);
             }
         }
     }
@@ -859,7 +839,7 @@ impl Simulator {
     }
 
     /// Create and enqueue a broadcast message that delivers at intermediate stops.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_broadcast_message(
         &mut self,
         timestamp: u64,
@@ -885,47 +865,69 @@ impl Simulator {
         self.enqueue_deliver(timestamp, source, source, message);
     }
 
-    /// Broadcast `payload` (cloned) to every destination in `dests`, one message
-    /// per destination.  The `messages_sent` counter on `coord` is incremented
-    /// by `dests.len()`.  Send times are serialised: `base_time + i`.
+    /// Broadcast `payload` (cloned) to every route destination, one message
+    /// per route.  The `messages_sent` counter on `coord` is incremented
+    /// by `routes.len()`.  Send times are serialised: `base_time + i`.
     fn broadcast_to_dests(
         &mut self,
         base_time: u64,
         coord: Coord,
-        dests: &[(Coord, Vec<Direction>)],
-        payload_slots: &[SlotId],
+        routes: &[BroadcastRouteRuntime],
         payload: Vec<f32>,
     ) {
-        self.mesh.pe_mut(coord).counters.messages_sent += dests.len() as u64;
-        for (i, (dest, hops)) in dests.iter().enumerate() {
+        self.mesh.pe_mut(coord).counters.messages_sent += routes.len() as u64;
+        for (i, route) in routes.iter().enumerate() {
             let send_time = base_time + i as u64;
-            let slot = payload_slots.get(i).copied().unwrap_or(0);
-            self.emit_message(send_time, coord, *dest, hops.clone(), payload.clone(), slot);
+            if route.deliver_at.is_empty() {
+                self.emit_message(
+                    send_time,
+                    coord,
+                    route.dest,
+                    route.hops.clone(),
+                    payload.clone(),
+                    route.payload_slot,
+                );
+            } else {
+                self.emit_broadcast_message(
+                    send_time,
+                    coord,
+                    route.dest,
+                    route.hops.clone(),
+                    route.deliver_at.clone(),
+                    payload.clone(),
+                    route.payload_slot,
+                );
+            }
         }
     }
 
-    /// Scatter `result` across `dests`: row `i` (of length `result.len() /
-    /// dests.len()`) goes to `dests[i]`.  The `messages_sent` counter on
-    /// `coord` is incremented by `dests.len()`.  Send times are serialised:
-    /// `base_time + i`.  No-ops when `dests` is empty.
+    /// Scatter `result` across `routes`: row `i` (of length `result.len() /
+    /// routes.len()`) goes to `routes[i]`.  The `messages_sent` counter on
+    /// `coord` is incremented by `routes.len()`.  Send times are serialised:
+    /// `base_time + i`.  No-ops when `routes` is empty.
     fn scatter_to_dests(
         &mut self,
         base_time: u64,
         coord: Coord,
-        dests: &[(Coord, Vec<Direction>)],
-        payload_slots: &[SlotId],
+        routes: &[BroadcastRouteRuntime],
         result: &[f32],
     ) {
-        if dests.is_empty() {
+        if routes.is_empty() {
             return;
         }
-        let row_size = result.len() / dests.len();
-        self.mesh.pe_mut(coord).counters.messages_sent += dests.len() as u64;
-        for (i, (dest, hops)) in dests.iter().enumerate() {
+        let row_size = result.len() / routes.len();
+        self.mesh.pe_mut(coord).counters.messages_sent += routes.len() as u64;
+        for (i, route) in routes.iter().enumerate() {
             let send_time = base_time + i as u64;
             let row = result[i * row_size..(i + 1) * row_size].to_vec();
-            let slot = payload_slots.get(i).copied().unwrap_or(0);
-            self.emit_message(send_time, coord, *dest, hops.clone(), row, slot);
+            self.emit_message(
+                send_time,
+                coord,
+                route.dest,
+                route.hops.clone(),
+                row,
+                route.payload_slot,
+            );
         }
     }
 
@@ -1063,6 +1065,16 @@ impl Simulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a point-to-point BroadcastRouteRuntime (deliver_at is empty).
+    fn route_p2p(dest: Coord, hops: Vec<Direction>, payload_slot: SlotId) -> BroadcastRouteRuntime {
+        BroadcastRouteRuntime {
+            dest,
+            hops,
+            deliver_at: vec![],
+            payload_slot,
+        }
+    }
 
     fn sim(width: u32, height: u32) -> Simulator {
         Simulator::new(SimConfig {
@@ -1501,8 +1513,7 @@ mod tests {
                     input_slot_a: 0,
                     input_slot_b: 1,
                     output_slot: 2,
-                    output_dests: vec![(Coord::new(1, 0), hops)],
-                    payload_slots: vec![0],
+                    routes: vec![route_p2p(Coord::new(1, 0), hops, 0)],
                 },
                 trigger_slot: 1, // trigger when second input arrives
             },
@@ -1544,8 +1555,10 @@ mod tests {
                     input_slot_a: 0,
                     input_slot_b: 1,
                     output_slot: 2,
-                    output_dests: vec![(Coord::new(1, 0), hops1), (Coord::new(2, 0), hops2)],
-                    payload_slots: vec![0, 0],
+                    routes: vec![
+                        route_p2p(Coord::new(1, 0), hops1, 0),
+                        route_p2p(Coord::new(2, 0), hops2, 0),
+                    ],
                 },
                 trigger_slot: 1,
             },
@@ -1725,8 +1738,7 @@ mod tests {
                         cols: 2,
                         transpose: false,
                         output_slot: 2,
-                        output_dests: vec![(Coord::new(1, 0), hops.clone())],
-                        payload_slots: vec![0],
+                        routes: vec![route_p2p(Coord::new(1, 0), hops.clone(), 0)],
                     },
                     trigger_slot: trigger,
                 },
@@ -1771,8 +1783,7 @@ mod tests {
                         cols: 2,
                         transpose: true,
                         output_slot: 2,
-                        output_dests: vec![(Coord::new(1, 0), hops.clone())],
-                        payload_slots: vec![0],
+                        routes: vec![route_p2p(Coord::new(1, 0), hops.clone(), 0)],
                     },
                     trigger_slot: trigger,
                 },
@@ -1818,8 +1829,7 @@ mod tests {
                         cols: 2,
                         transpose: false,
                         output_slot: 2,
-                        output_dests: vec![(Coord::new(1, 0), hops.clone())],
-                        payload_slots: vec![0],
+                        routes: vec![route_p2p(Coord::new(1, 0), hops.clone(), 0)],
                     },
                     trigger_slot: trigger,
                 },
@@ -1896,8 +1906,7 @@ mod tests {
                     input_slot: 0,
                     scale_slot: 1,
                     gamma_slot: 2,
-                    output_dests: vec![(collect0, hops_to_collect0)],
-                    payload_slots: vec![0],
+                    routes: vec![route_p2p(collect0, hops_to_collect0, 0)],
                     slice_offset: 0,
                     slice_size: 0,
                 },
@@ -1931,8 +1940,7 @@ mod tests {
                     input_slot: 0,
                     scale_slot: 1,
                     gamma_slot: 2,
-                    output_dests: vec![(collect1, hops_to_collect1)],
-                    payload_slots: vec![0],
+                    routes: vec![route_p2p(collect1, hops_to_collect1, 0)],
                     slice_offset: 0,
                     slice_size: 0,
                 },
@@ -1953,11 +1961,10 @@ mod tests {
                         num_tiles: 2,
                         feature_count: 4,
                         eps: 1e-6,
-                        tile_dests: vec![
-                            (tile0, hops_to_tile0.clone()),
-                            (tile1, hops_to_tile1.clone()),
+                        routes: vec![
+                            route_p2p(tile0, hops_to_tile0.clone(), 1),
+                            route_p2p(tile1, hops_to_tile1.clone(), 1),
                         ],
-                        scale_slot: 1, // writes scale to slot 1 on tile PEs
                     },
                     trigger_slot: trigger,
                 },
@@ -2039,8 +2046,7 @@ mod tests {
                     input_slot: 0,
                     scale_slot: 1,
                     gamma_slot: 2,
-                    output_dests: vec![],
-                    payload_slots: vec![],
+                    routes: vec![],
                     slice_offset: 0,
                     slice_size: 0,
                 },
@@ -2058,8 +2064,7 @@ mod tests {
                     num_tiles: 1,
                     feature_count: 2,
                     eps: 1e-6,
-                    tile_dests: vec![(tile, hops_to_tile)],
-                    scale_slot: 1,
+                    routes: vec![route_p2p(tile, hops_to_tile, 1)],
                 },
                 trigger_slot: 0,
             },
@@ -2131,8 +2136,7 @@ mod tests {
                     num_tiles: 3,
                     feature_count: 6, // 3 tiles * 2 features each
                     eps: 0.0,
-                    tile_dests: vec![], // no broadcast needed for this test
-                    scale_slot: 10,
+                    routes: vec![], // no broadcast needed for this test
                 },
                 trigger_slot: 0,
             },
@@ -2145,8 +2149,7 @@ mod tests {
                     num_tiles: 3,
                     feature_count: 6,
                     eps: 0.0,
-                    tile_dests: vec![],
-                    scale_slot: 10,
+                    routes: vec![],
                 },
                 trigger_slot: 1,
             },
@@ -2158,8 +2161,7 @@ mod tests {
                     num_tiles: 3,
                     feature_count: 6,
                     eps: 0.0,
-                    tile_dests: vec![],
-                    scale_slot: 10,
+                    routes: vec![],
                 },
                 trigger_slot: 2,
             },
@@ -2392,8 +2394,10 @@ mod tests {
                         total_rows: 2,
                         fragment_offset: i,
                         activation: None,
-                        route_dests: vec![(dest0, hops0.clone()), (dest1, hops1.clone())],
-                        payload_slots: vec![0, 0],
+                        routes: vec![
+                            route_p2p(dest0, hops0.clone(), 0),
+                            route_p2p(dest1, hops1.clone(), 0),
+                        ],
                         fragment_rows: 1,
                         num_positions: 0,
                         scatter: true,
@@ -2488,8 +2492,7 @@ mod tests {
                     input_slot: 0,
                     scale_slot: 1,
                     gamma_slot: 2,
-                    output_dests: vec![(collect, hops_to_collect)],
-                    payload_slots: vec![0],
+                    routes: vec![route_p2p(collect, hops_to_collect, 0)],
                     slice_offset: 0,
                     slice_size: 2,
                 },
@@ -2507,8 +2510,7 @@ mod tests {
                     num_tiles: 1,
                     feature_count: 2,
                     eps: 1e-6,
-                    tile_dests: vec![(tile, hops_to_tile)],
-                    scale_slot: 1,
+                    routes: vec![route_p2p(tile, hops_to_tile, 1)],
                 },
                 trigger_slot: 0,
             },
@@ -2606,8 +2608,7 @@ mod tests {
                     input_slot: 0,
                     scale_slot: 1,
                     gamma_slot: 2,
-                    output_dests: vec![(collect0, hops_to_collect0)],
-                    payload_slots: vec![0],
+                    routes: vec![route_p2p(collect0, hops_to_collect0, 0)],
                     slice_offset: 0,
                     slice_size: 2,
                 },
@@ -2641,8 +2642,7 @@ mod tests {
                     input_slot: 0,
                     scale_slot: 1,
                     gamma_slot: 2,
-                    output_dests: vec![(collect1, hops_to_collect1)],
-                    payload_slots: vec![0],
+                    routes: vec![route_p2p(collect1, hops_to_collect1, 0)],
                     slice_offset: 2,
                     slice_size: 2,
                 },
@@ -2662,11 +2662,10 @@ mod tests {
                         num_tiles: 2,
                         feature_count: 4,
                         eps: 1e-6,
-                        tile_dests: vec![
-                            (tile0, hops_to_tile0.clone()),
-                            (tile1, hops_to_tile1.clone()),
+                        routes: vec![
+                            route_p2p(tile0, hops_to_tile0.clone(), 1),
+                            route_p2p(tile1, hops_to_tile1.clone(), 1),
                         ],
-                        scale_slot: 1,
                     },
                     trigger_slot: trigger,
                 },

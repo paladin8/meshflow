@@ -5,6 +5,7 @@ import numpy as np
 from meshflow.compiler.config import CompilerConfig, RoutingStrategy
 from meshflow.compiler.schedule_ir import (
     AddEntry,
+    BroadcastRoute,
     CollectOutputEntry,
     ConcatCollectEntry,
     ConcatCollectForwardEntry,
@@ -153,13 +154,18 @@ def _route_xy(
             remainder = collect.total_rows % collect.num_fragments
 
             if is_intermediate:
-                route_dests: list[tuple[tuple[int, int], list[Direction]]] = []
-                collect_payload_slots: list[int] = []
+                collect_routes: list[BroadcastRoute] = []
                 for edge in outgoing:
                     dst = node_map[edge.dst_node]
                     tile_hops = _generate_route_xy(node.coord, dst.coord)
-                    route_dests.append((dst.coord, tile_hops))
-                    collect_payload_slots.append(edge.dst_slot)
+                    collect_routes.append(
+                        BroadcastRoute(
+                            dest=dst.coord,
+                            hops=tile_hops,
+                            deliver_at=[],
+                            payload_slot=edge.dst_slot,
+                        )
+                    )
 
                 # Detect scatter: when routing to multiple attention PEs
                 # and delivering to the Q slot (0), scatter Q rows instead
@@ -185,8 +191,7 @@ def _route_xy(
                             fragment_offset=frag_offset,
                             fragment_rows=tile_rows,
                             activation=collect.activation,
-                            route_dests=list(route_dests),
-                            payload_slots=list(collect_payload_slots),
+                            routes=list(collect_routes),
                             scatter=use_scatter,
                         )
                     )
@@ -326,15 +331,20 @@ def _route_rmsnorm_tile(
 
     # Phase 2: RmsNormNormalize — find outgoing inter-group edges (not internal)
     # Inter-group edges go to nodes that are NOT the reduce PE
-    outgoing_dests: list[tuple[tuple[int, int], list[Direction]]] = []
-    outgoing_payload_slots: list[int] = []
+    normalize_routes: list[BroadcastRoute] = []
     for e in spatial.edges:
         if e.src_node == node.id:
             dst = node_map[e.dst_node]
             if dst.kind != PlacedNodeKind.RMSNORM_REDUCE:
                 hops = _generate_route_xy(node.coord, dst.coord)
-                outgoing_dests.append((dst.coord, hops))
-                outgoing_payload_slots.append(e.dst_slot)
+                normalize_routes.append(
+                    BroadcastRoute(
+                        dest=dst.coord,
+                        hops=hops,
+                        deliver_at=[],
+                        payload_slot=e.dst_slot,
+                    )
+                )
 
     pe_tasks[node.coord].append(
         RmsNormNormalizeEntry(
@@ -342,8 +352,7 @@ def _route_rmsnorm_tile(
             input_slot=0,
             scale_slot=1,
             gamma_slot=2,
-            output_dests=outgoing_dests,
-            payload_slots=outgoing_payload_slots,
+            routes=normalize_routes,
             slice_offset=tile.feature_slice_offset,
             slice_size=tile.feature_slice_size,
         )
@@ -371,13 +380,21 @@ def _route_rmsnorm_reduce(
     assert isinstance(reduce, PlacedRmsNormReduceData)
 
     # Find tile_dests: outgoing edges from reduce → tile PEs (scale broadcast)
-    tile_dests: list[tuple[tuple[int, int], list[Direction]]] = []
+    # Each route carries payload_slot=1 (the scale slot on tile PEs)
+    reduce_routes: list[BroadcastRoute] = []
     for e in spatial.edges:
         if e.src_node == node.id:
             dst = node_map[e.dst_node]
             if dst.kind == PlacedNodeKind.RMSNORM_TILE:
                 hops = _generate_route_xy(node.coord, dst.coord)
-                tile_dests.append((dst.coord, hops))
+                reduce_routes.append(
+                    BroadcastRoute(
+                        dest=dst.coord,
+                        hops=hops,
+                        deliver_at=[],
+                        payload_slot=1,
+                    )
+                )
 
     # Generate one RmsNormReduceEntry per partial sum slot
     for i in range(reduce.num_tiles):
@@ -387,8 +404,7 @@ def _route_rmsnorm_reduce(
                 num_tiles=reduce.num_tiles,
                 feature_count=reduce.feature_count,
                 eps=reduce.eps,
-                tile_dests=list(tile_dests),
-                scale_slot=1,
+                routes=list(reduce_routes),
             )
         )
 
@@ -433,7 +449,7 @@ def _route_attention_pe(
                 cols=attn.d_model,
                 transpose=False,
                 output_slot=qkt_output_slot,
-                output_dests=[],  # local write only
+                routes=[],  # local write only
             )
         )
 
@@ -451,15 +467,20 @@ def _route_attention_pe(
     # matrix=V(seq_len, d_model), vector=softmax(seq_len), transpose=true → (d_model,)
     if attn.av_matmul_id is not None:
         # Find outgoing edges from this attention PE (inter-group, to downstream)
-        outgoing_dests: list[tuple[tuple[int, int], list[Direction]]] = []
-        av_payload_slots: list[int] = []
+        av_routes: list[BroadcastRoute] = []
         for e in spatial.edges:
             if e.src_node == node.id:
                 dst = node_map[e.dst_node]
                 if dst.kind != PlacedNodeKind.ATTENTION_PE:
                     hops = _generate_route_xy(node.coord, dst.coord)
-                    outgoing_dests.append((dst.coord, hops))
-                    av_payload_slots.append(e.dst_slot)
+                    av_routes.append(
+                        BroadcastRoute(
+                            dest=dst.coord,
+                            hops=hops,
+                            deliver_at=[],
+                            payload_slot=e.dst_slot,
+                        )
+                    )
 
         # Two TaskConfig entries: trigger on V (slot 2) and softmax output (slot 4)
         for trigger in [v_slot, softmax_output_slot]:
@@ -472,8 +493,7 @@ def _route_attention_pe(
                     cols=attn.d_model,
                     transpose=True,
                     output_slot=av_output_slot,
-                    output_dests=outgoing_dests,
-                    payload_slots=av_payload_slots,
+                    routes=av_routes,
                 )
             )
 
@@ -495,15 +515,20 @@ def _route_add(
     # Output slot is after the input slots
     output_slot = max(input_slot_a, input_slot_b) + 1
 
-    # Build outgoing destinations with payload_slots from edge dst_slot
-    outgoing_dests: list[tuple[tuple[int, int], list[Direction]]] = []
-    add_payload_slots: list[int] = []
+    # Build outgoing routes from edge dst_slot
+    add_routes: list[BroadcastRoute] = []
     for e in spatial.edges:
         if e.src_node == node.id:
             dst = node_map[e.dst_node]
             hops = _generate_route_xy(node.coord, dst.coord)
-            outgoing_dests.append((dst.coord, hops))
-            add_payload_slots.append(e.dst_slot)
+            add_routes.append(
+                BroadcastRoute(
+                    dest=dst.coord,
+                    hops=hops,
+                    deliver_at=[],
+                    payload_slot=e.dst_slot,
+                )
+            )
 
     # Generate one AddEntry per input slot. The runtime has_slot guard
     # ensures only the second trigger (when both inputs are present) computes.
@@ -514,8 +539,7 @@ def _route_add(
                 input_slot_a=input_slot_a,
                 input_slot_b=input_slot_b,
                 output_slot=output_slot,
-                output_dests=outgoing_dests,
-                payload_slots=add_payload_slots,
+                routes=add_routes,
             )
         )
 

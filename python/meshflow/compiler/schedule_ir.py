@@ -11,6 +11,22 @@ class Direction(Enum):
     WEST = "west"
 
 
+@dataclass
+class BroadcastRoute:
+    """A single route in a broadcast fan-out.
+
+    dest: (x, y) coordinate of the final destination.
+    hops: ordered Direction list from source to destination.
+    deliver_at: hop indices for intermediate delivery (empty = point-to-point).
+    payload_slot: SRAM slot to deliver into on the destination PE.
+    """
+
+    dest: tuple[int, int] = (0, 0)
+    hops: list[Direction] = field(default_factory=list)
+    deliver_at: list[int] = field(default_factory=list)
+    payload_slot: int = 0
+
+
 # ---------------------------------------------------------------------------
 # Per-kind task entries
 # ---------------------------------------------------------------------------
@@ -70,8 +86,7 @@ class ConcatCollectForwardEntry:
     num_positions: int = 0
     scatter: bool = False
     activation: str | None = None
-    route_dests: list[tuple[tuple[int, int], list[Direction]]] = field(default_factory=list)
-    payload_slots: list[int] = field(default_factory=list)
+    routes: list[BroadcastRoute] = field(default_factory=list)
 
 
 @dataclass
@@ -81,8 +96,7 @@ class AddEntry:
     input_slot_a: int = 0
     input_slot_b: int = 1
     output_slot: int = 2
-    output_dests: list[tuple[tuple[int, int], list[Direction]]] = field(default_factory=list)
-    payload_slots: list[int] = field(default_factory=list)
+    routes: list[BroadcastRoute] = field(default_factory=list)
 
 
 @dataclass
@@ -103,8 +117,7 @@ class MatMulEntry:
     cols: int = 0
     transpose: bool = False
     output_slot: int = 0
-    output_dests: list[tuple[tuple[int, int], list[Direction]]] = field(default_factory=list)
-    payload_slots: list[int] = field(default_factory=list)
+    routes: list[BroadcastRoute] = field(default_factory=list)
 
 
 @dataclass
@@ -127,8 +140,7 @@ class RmsNormNormalizeEntry:
     input_slot: int = 0
     scale_slot: int = 1
     gamma_slot: int = 2
-    output_dests: list[tuple[tuple[int, int], list[Direction]]] = field(default_factory=list)
-    payload_slots: list[int] = field(default_factory=list)
+    routes: list[BroadcastRoute] = field(default_factory=list)
     slice_offset: int = 0
     slice_size: int = 0
 
@@ -140,8 +152,7 @@ class RmsNormReduceEntry:
     num_tiles: int = 0
     feature_count: int = 0
     eps: float = 1e-6
-    tile_dests: list[tuple[tuple[int, int], list[Direction]]] = field(default_factory=list)
-    scale_slot: int = 1
+    routes: list[BroadcastRoute] = field(default_factory=list)
 
 
 TaskEntry = (

@@ -42,6 +42,20 @@ pub struct PE {
     pub counters: PeCounters,
 }
 
+/// A single route in a broadcast fan-out (runtime form).
+///
+/// `dest` is the final destination coordinate (used for Message.dest / profiling).
+/// `hops` is the ordered direction list from source to destination.
+/// `deliver_at` lists hop indices for intermediate delivery (empty = point-to-point).
+/// `payload_slot` is the SRAM slot to deliver into on the destination PE.
+#[derive(Debug, Clone)]
+pub struct BroadcastRouteRuntime {
+    pub dest: Coord,
+    pub hops: Vec<Direction>,
+    pub deliver_at: Vec<usize>,
+    pub payload_slot: SlotId,
+}
+
 /// A task configuration assigned to a PE.
 ///
 /// The `trigger_slot` determines when this task fires: whenever a message
@@ -99,9 +113,7 @@ pub enum TaskKind {
         total_rows: u32,
         fragment_offset: u32,
         activation: Option<Activation>,
-        route_dests: Vec<(Coord, Vec<Direction>)>,
-        /// Per-destination payload slots (which SRAM slot to deliver into).
-        payload_slots: Vec<SlotId>,
+        routes: Vec<BroadcastRouteRuntime>,
         /// Expected single-position fragment size for this tile (0 = legacy).
         fragment_rows: u32,
         /// Number of sequence positions (0 = infer from fragment_rows).
@@ -114,8 +126,7 @@ pub enum TaskKind {
         input_slot_a: SlotId,
         input_slot_b: SlotId,
         output_slot: SlotId,
-        output_dests: Vec<(Coord, Vec<Direction>)>,
-        payload_slots: Vec<SlotId>,
+        routes: Vec<BroadcastRouteRuntime>,
     },
     /// Numerically stable row-wise softmax (in-place on a single PE).
     Softmax {
@@ -130,8 +141,7 @@ pub enum TaskKind {
         cols: u32,
         transpose: bool,
         output_slot: SlotId,
-        output_dests: Vec<(Coord, Vec<Direction>)>,
-        payload_slots: Vec<SlotId>,
+        routes: Vec<BroadcastRouteRuntime>,
     },
     /// RMSNorm phase 1: compute sum(x^2) for local slice, send to reduce PE.
     RmsNormPartialSum {
@@ -151,8 +161,7 @@ pub enum TaskKind {
         input_slot: SlotId,
         scale_slot: SlotId,
         gamma_slot: SlotId,
-        output_dests: Vec<(Coord, Vec<Direction>)>,
-        payload_slots: Vec<SlotId>,
+        routes: Vec<BroadcastRouteRuntime>,
         slice_offset: u32,
         slice_size: u32,
     },
@@ -161,8 +170,7 @@ pub enum TaskKind {
         num_tiles: u32,
         feature_count: u32,
         eps: f32,
-        tile_dests: Vec<(Coord, Vec<Direction>)>,
-        scale_slot: SlotId,
+        routes: Vec<BroadcastRouteRuntime>,
     },
 }
 

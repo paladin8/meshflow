@@ -359,8 +359,8 @@ class TestMultiLayerRouting:
             assert task.total_rows == 6
             assert task.activation == "relu"
             # Routes to l2 tile PEs at (1, 0), (1, 1), (1, 2)
-            assert len(task.route_dests) == 3
-            dest_coords = [coord for coord, _ in task.route_dests]
+            assert len(task.routes) == 3
+            dest_coords = [r.dest for r in task.routes]
             assert dest_coords == [(1, 0), (1, 1), (1, 2)]
 
     def test_terminal_collect_has_concat_tasks(self) -> None:
@@ -389,19 +389,19 @@ class TestMultiLayerRouting:
         assert isinstance(task, ConcatCollectForwardEntry)
 
         # (0,3) → (1,0): 1 east, 3 south
-        coord_0, hops_0 = task.route_dests[0]
-        assert coord_0 == (1, 0)
-        assert hops_0 == [Direction.EAST, Direction.SOUTH, Direction.SOUTH, Direction.SOUTH]
+        r0 = task.routes[0]
+        assert r0.dest == (1, 0)
+        assert r0.hops == [Direction.EAST, Direction.SOUTH, Direction.SOUTH, Direction.SOUTH]
 
         # (0,3) → (1,1): 1 east, 2 south
-        coord_1, hops_1 = task.route_dests[1]
-        assert coord_1 == (1, 1)
-        assert hops_1 == [Direction.EAST, Direction.SOUTH, Direction.SOUTH]
+        r1 = task.routes[1]
+        assert r1.dest == (1, 1)
+        assert r1.hops == [Direction.EAST, Direction.SOUTH, Direction.SOUTH]
 
         # (0,3) → (1,2): 1 east, 1 south
-        coord_2, hops_2 = task.route_dests[2]
-        assert coord_2 == (1, 2)
-        assert hops_2 == [Direction.EAST, Direction.SOUTH]
+        r2 = task.routes[2]
+        assert r2.dest == (1, 2)
+        assert r2.hops == [Direction.EAST, Direction.SOUTH]
 
     def test_only_first_layer_has_input_slots(self) -> None:
         graph = self._make_mlp_graph()
@@ -550,9 +550,10 @@ class TestRmsNormRouting:
             assert task.num_tiles == 4
             assert task.feature_count == 4
             assert abs(task.eps - 1e-6) < 1e-10
-            assert task.scale_slot == 1
-            # tile_dests should point back to the 4 tile PEs
-            assert len(task.tile_dests) == 4
+            # routes should point back to the 4 tile PEs (each with payload_slot=1)
+            assert len(task.routes) == 4
+            for r in task.routes:
+                assert r.payload_slot == 1
 
     def test_rmsnorm_gamma_in_sram(self) -> None:
         graph = self._make_rmsnorm_graph()
@@ -584,9 +585,9 @@ class TestRmsNormRouting:
         tile_pe = next(p for p in schedule.pe_schedules if p.coord == (1, 0))
         norm_task = tile_pe.tasks[1]
         assert isinstance(norm_task, RmsNormNormalizeEntry)
-        assert len(norm_task.output_dests) >= 1
+        assert len(norm_task.routes) >= 1
         # The RMSNorm collect PE is within the same column
-        dest_coords = [coord for coord, _ in norm_task.output_dests]
+        dest_coords = [r.dest for r in norm_task.routes]
         # Collect PE is at (1, num_tiles + 1) = (1, 5) for 4 tiles
         assert (1, 5) in dest_coords
 
@@ -702,10 +703,10 @@ class TestAttentionRouting:
         attn_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 0))
         av_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulEntry) and t.output_slot == 5]
         assert len(av_tasks) > 0
-        # All AV entries share the same output_dests
+        # All AV entries share the same routes
         av = av_tasks[0]
-        assert len(av.output_dests) >= 1
-        dest_coords = [coord for coord, _ in av.output_dests]
+        assert len(av.routes) >= 1
+        dest_coords = [r.dest for r in av.routes]
         # AV routes to attention collect PE (in same column)
         assert len(dest_coords) >= 1
 
@@ -762,9 +763,9 @@ class TestAddRouting:
         add_pe = next(p for p in schedule.pe_schedules if p.coord == (2, 0))
         task = add_pe.tasks[0]
         assert isinstance(task, AddEntry)
-        assert len(task.output_dests) >= 1
+        assert len(task.routes) >= 1
         # collect PE is at (3, 0)
-        dest_coords = [coord for coord, _ in task.output_dests]
+        dest_coords = [r.dest for r in task.routes]
         assert (3, 0) in dest_coords
 
 

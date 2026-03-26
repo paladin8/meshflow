@@ -3,6 +3,7 @@
 from meshflow.compiler import CompilerConfig, compile
 from meshflow.compiler.artifact import (
     AddTask,
+    BroadcastRouteTask,
     ForwardActivationTask,
     MatMulTask,
     RmsNormNormalizeTask,
@@ -17,6 +18,7 @@ from meshflow.compiler.passes.place import place
 from meshflow.compiler.passes.route import route
 from meshflow.compiler.schedule_ir import (
     AddEntry,
+    BroadcastRoute,
     Direction,
     MatMulEntry,
     RmsNormNormalizeEntry,
@@ -123,8 +125,10 @@ class TestLowerNewTasks:
             input_slot_a=0,
             input_slot_b=1,
             output_slot=2,
-            output_dests=[((2, 0), [Direction.EAST])],
-            payload_slots=[0, 1],
+            routes=[
+                BroadcastRoute(dest=(2, 0), hops=[Direction.EAST], payload_slot=0),
+                BroadcastRoute(dest=(2, 1), hops=[Direction.EAST, Direction.NORTH], payload_slot=1),
+            ],
         )
         task = _lower_task(entry)
         assert isinstance(task, AddTask)
@@ -133,8 +137,11 @@ class TestLowerNewTasks:
         assert task.input_slot_a == 0
         assert task.input_slot_b == 1
         assert task.output_slot == 2
-        assert task.output_dests == [((2, 0), ["east"])]
-        assert task.payload_slots == [0, 1]
+        assert len(task.routes) == 2
+        assert task.routes[0] == BroadcastRouteTask(dest=(2, 0), hops=["east"], payload_slot=0)
+        assert task.routes[1] == BroadcastRouteTask(
+            dest=(2, 1), hops=["east", "north"], payload_slot=1
+        )
 
     def test_lower_softmax_entry(self) -> None:
         entry = SoftmaxEntry(trigger_slot=5, input_slot=5, output_slot=6)
@@ -154,8 +161,7 @@ class TestLowerNewTasks:
             cols=2,
             transpose=False,
             output_slot=3,
-            output_dests=[((1, 0), [Direction.EAST])],
-            payload_slots=[0],
+            routes=[BroadcastRoute(dest=(1, 0), hops=[Direction.EAST], payload_slot=0)],
         )
         task = _lower_task(entry)
         assert isinstance(task, MatMulTask)
@@ -166,7 +172,8 @@ class TestLowerNewTasks:
         assert task.cols == 2
         assert task.transpose is False
         assert task.output_slot == 3
-        assert task.output_dests == [((1, 0), ["east"])]
+        assert len(task.routes) == 1
+        assert task.routes[0] == BroadcastRouteTask(dest=(1, 0), hops=["east"], payload_slot=0)
 
     def test_lower_rms_norm_partial_sum_entry(self) -> None:
         entry = RmsNormPartialSumEntry(
@@ -191,8 +198,9 @@ class TestLowerNewTasks:
             input_slot=0,
             scale_slot=1,
             gamma_slot=2,
-            output_dests=[((1, 0), [Direction.EAST])],
-            payload_slots=[0, 1, 2],
+            routes=[
+                BroadcastRoute(dest=(1, 0), hops=[Direction.EAST], payload_slot=0),
+            ],
         )
         task = _lower_task(entry)
         assert isinstance(task, RmsNormNormalizeTask)
@@ -201,8 +209,8 @@ class TestLowerNewTasks:
         assert task.input_slot == 0
         assert task.scale_slot == 1
         assert task.gamma_slot == 2
-        assert task.output_dests == [((1, 0), ["east"])]
-        assert task.payload_slots == [0, 1, 2]
+        assert len(task.routes) == 1
+        assert task.routes[0] == BroadcastRouteTask(dest=(1, 0), hops=["east"], payload_slot=0)
 
     def test_lower_rms_norm_reduce_entry(self) -> None:
         entry = RmsNormReduceEntry(
@@ -210,11 +218,12 @@ class TestLowerNewTasks:
             num_tiles=3,
             feature_count=8,
             eps=1e-6,
-            tile_dests=[
-                ((0, 0), [Direction.SOUTH, Direction.SOUTH]),
-                ((0, 1), [Direction.SOUTH]),
+            routes=[
+                BroadcastRoute(
+                    dest=(0, 0), hops=[Direction.SOUTH, Direction.SOUTH], payload_slot=1
+                ),
+                BroadcastRoute(dest=(0, 1), hops=[Direction.SOUTH], payload_slot=1),
             ],
-            scale_slot=1,
         )
         task = _lower_task(entry)
         assert isinstance(task, RmsNormReduceTask)
@@ -223,11 +232,11 @@ class TestLowerNewTasks:
         assert task.num_tiles == 3
         assert task.feature_count == 8
         assert abs(task.eps - 1e-6) < 1e-10
-        assert task.tile_dests == [
-            ((0, 0), ["south", "south"]),
-            ((0, 1), ["south"]),
-        ]
-        assert task.scale_slot == 1
+        assert len(task.routes) == 2
+        assert task.routes[0] == BroadcastRouteTask(
+            dest=(0, 0), hops=["south", "south"], payload_slot=1
+        )
+        assert task.routes[1] == BroadcastRouteTask(dest=(0, 1), hops=["south"], payload_slot=1)
 
     def test_lower_rmsnorm_full_pipeline(self) -> None:
         """End-to-end: FORWARD → RMSNORM → COLLECT through all passes."""
@@ -342,6 +351,6 @@ class TestLowerNewTasks:
 
         # Verify direction strings are lowered
         for t in matmul_tasks:
-            for _, hops in t.output_dests:
-                for h in hops:
+            for r in t.routes:
+                for h in r.hops:
                     assert h in ("north", "south", "east", "west")

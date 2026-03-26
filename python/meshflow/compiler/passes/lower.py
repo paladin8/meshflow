@@ -2,6 +2,7 @@
 
 from meshflow.compiler.artifact import (
     AddTask,
+    BroadcastRouteTask,
     CollectOutputTask,
     ConcatCollectForwardTask,
     ConcatCollectTask,
@@ -21,6 +22,7 @@ from meshflow.compiler.artifact import (
 from meshflow.compiler.config import CompilerConfig
 from meshflow.compiler.schedule_ir import (
     AddEntry,
+    BroadcastRoute,
     CollectOutputEntry,
     ConcatCollectEntry,
     ConcatCollectForwardEntry,
@@ -34,6 +36,16 @@ from meshflow.compiler.schedule_ir import (
     SoftmaxEntry,
     TaskEntry,
 )
+
+
+def _lower_route(route: BroadcastRoute) -> BroadcastRouteTask:
+    """Convert a schedule-IR BroadcastRoute to artifact BroadcastRouteTask."""
+    return BroadcastRouteTask(
+        dest=route.dest,
+        hops=[d.value for d in route.hops],
+        deliver_at=list(route.deliver_at),
+        payload_slot=route.payload_slot,
+    )
 
 
 def _lower_task(task: TaskEntry) -> TaskProgram:
@@ -83,8 +95,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             num_positions=task.num_positions,
             scatter=task.scatter,
             activation=task.activation,
-            route_dests=[(coord, [d.value for d in hops]) for coord, hops in task.route_dests],
-            payload_slots=list(task.payload_slots),
+            routes=[_lower_route(r) for r in task.routes],
         )
     if isinstance(task, AddEntry):
         return AddTask(
@@ -92,8 +103,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             input_slot_a=task.input_slot_a,
             input_slot_b=task.input_slot_b,
             output_slot=task.output_slot,
-            output_dests=[(coord, [d.value for d in hops]) for coord, hops in task.output_dests],
-            payload_slots=list(task.payload_slots),
+            routes=[_lower_route(r) for r in task.routes],
         )
     if isinstance(task, SoftmaxEntry):
         return SoftmaxTask(
@@ -110,8 +120,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             cols=task.cols,
             transpose=task.transpose,
             output_slot=task.output_slot,
-            output_dests=[(coord, [d.value for d in hops]) for coord, hops in task.output_dests],
-            payload_slots=list(task.payload_slots),
+            routes=[_lower_route(r) for r in task.routes],
         )
     if isinstance(task, RmsNormPartialSumEntry):
         return RmsNormPartialSumTask(
@@ -130,8 +139,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             input_slot=task.input_slot,
             scale_slot=task.scale_slot,
             gamma_slot=task.gamma_slot,
-            output_dests=[(coord, [d.value for d in hops]) for coord, hops in task.output_dests],
-            payload_slots=list(task.payload_slots),
+            routes=[_lower_route(r) for r in task.routes],
             slice_offset=task.slice_offset,
             slice_size=task.slice_size,
         )
@@ -141,8 +149,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             num_tiles=task.num_tiles,
             feature_count=task.feature_count,
             eps=task.eps,
-            tile_dests=[(coord, [d.value for d in hops]) for coord, hops in task.tile_dests],
-            scale_slot=task.scale_slot,
+            routes=[_lower_route(r) for r in task.routes],
         )
     raise ValueError(f"unknown task entry type: {type(task)!r}")
 
