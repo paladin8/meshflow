@@ -358,6 +358,7 @@ mod tests {
             payload: vec![1.0],
             payload_slot: 0,
             timestamp: 0,
+            deliver_at: vec![],
         };
         let msg2 = crate::message::Message {
             id: 2,

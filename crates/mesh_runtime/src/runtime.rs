@@ -158,6 +158,7 @@ impl Simulator {
             payload: msg.payload,
             payload_slot: msg.payload_slot,
             timestamp: 0,
+            deliver_at: vec![],
         };
 
         // Enqueue at the source PE at timestamp 0.
@@ -261,7 +262,25 @@ impl Simulator {
         pe.counters.messages_received += 1;
 
         if !message.is_arrived() {
-            // INTERMEDIATE HOP: forward to next PE without touching SRAM
+            // INTERMEDIATE BROADCAST DELIVERY: if current_hop is in deliver_at,
+            // clone payload to SRAM and trigger tasks at this PE before forwarding.
+            if message.deliver_at.contains(&message.current_hop) {
+                pe.write_slot(message.payload_slot, message.payload.clone());
+                pe.counters.slots_written += 1;
+                self.profile.total_messages += 1;
+
+                // Trigger tasks waiting on this slot
+                let triggered = pe.triggered_tasks(message.payload_slot);
+                for task_index in triggered {
+                    self.queue.push(
+                        timestamp + self.config.task_base_latency,
+                        coord,
+                        EventKind::ExecuteTask { task_index },
+                    );
+                }
+            }
+
+            // Forward to next PE
             let dir = message
                 .next_hop()
                 .expect("message not arrived but no next hop");
@@ -833,6 +852,34 @@ impl Simulator {
             payload,
             payload_slot,
             timestamp,
+            deliver_at: vec![],
+        };
+        self.next_message_id += 1;
+        self.enqueue_deliver(timestamp, source, source, message);
+    }
+
+    /// Create and enqueue a broadcast message that delivers at intermediate stops.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn emit_broadcast_message(
+        &mut self,
+        timestamp: u64,
+        source: Coord,
+        dest: Coord,
+        hops: Vec<Direction>,
+        deliver_at: Vec<usize>,
+        payload: Vec<f32>,
+        payload_slot: SlotId,
+    ) {
+        let message = Message {
+            id: self.next_message_id,
+            source,
+            dest,
+            hops,
+            current_hop: 0,
+            payload,
+            payload_slot,
+            timestamp,
+            deliver_at,
         };
         self.next_message_id += 1;
         self.enqueue_deliver(timestamp, source, source, message);
@@ -2716,6 +2763,184 @@ mod tests {
             "out1[3]: {} vs {}",
             out1[3],
             8.0 * scale1
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Broadcast delivery tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_broadcast_delivery_column() {
+        // 1x4 mesh. Source (0,0), broadcast with hops=[N,N,N], deliver_at=[1,2].
+        // PEs (0,1), (0,2), (0,3) should all receive the payload.
+        let mut s = sim(1, 4);
+
+        // Add CollectOutput tasks on PEs (0,1), (0,2), (0,3) triggered by slot 0
+        for y in 1..=3 {
+            s.add_task_direct(
+                Coord::new(0, y),
+                TaskConfig {
+                    kind: TaskKind::CollectOutput { input_slot: 0 },
+                    trigger_slot: 0,
+                },
+            );
+        }
+
+        // Inject broadcast message from (0,0) to (0,3) with intermediate deliveries
+        let source = Coord::new(0, 0);
+        let dest = Coord::new(0, 3);
+        let hops = vec![Direction::North, Direction::North, Direction::North];
+        let deliver_at = vec![1, 2]; // deliver at (0,1) and (0,2); (0,3) is final
+        let payload = vec![10.0, 20.0, 30.0];
+
+        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0);
+
+        let result = s.run();
+
+        // All 3 PEs should have collected the output
+        assert_eq!(
+            result.outputs.get(&Coord::new(0, 1)),
+            Some(&vec![10.0, 20.0, 30.0]),
+            "PE (0,1) should receive broadcast payload"
+        );
+        assert_eq!(
+            result.outputs.get(&Coord::new(0, 2)),
+            Some(&vec![10.0, 20.0, 30.0]),
+            "PE (0,2) should receive broadcast payload"
+        );
+        assert_eq!(
+            result.outputs.get(&Coord::new(0, 3)),
+            Some(&vec![10.0, 20.0, 30.0]),
+            "PE (0,3) should receive broadcast payload"
+        );
+    }
+
+    #[test]
+    fn test_broadcast_empty_deliver_at() {
+        // Same setup but deliver_at=vec![]. Only final PE (0,3) should receive.
+        let mut s = sim(1, 4);
+
+        for y in 1..=3 {
+            s.add_task_direct(
+                Coord::new(0, y),
+                TaskConfig {
+                    kind: TaskKind::CollectOutput { input_slot: 0 },
+                    trigger_slot: 0,
+                },
+            );
+        }
+
+        let source = Coord::new(0, 0);
+        let dest = Coord::new(0, 3);
+        let hops = vec![Direction::North, Direction::North, Direction::North];
+        let deliver_at = vec![]; // point-to-point
+        let payload = vec![10.0, 20.0, 30.0];
+
+        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0);
+
+        let result = s.run();
+
+        // Only (0,3) should have output (final delivery)
+        assert!(
+            result.outputs.get(&Coord::new(0, 1)).is_none(),
+            "PE (0,1) should NOT receive with empty deliver_at"
+        );
+        assert!(
+            result.outputs.get(&Coord::new(0, 2)).is_none(),
+            "PE (0,2) should NOT receive with empty deliver_at"
+        );
+        assert_eq!(
+            result.outputs.get(&Coord::new(0, 3)),
+            Some(&vec![10.0, 20.0, 30.0]),
+            "PE (0,3) should receive final delivery"
+        );
+    }
+
+    #[test]
+    fn test_broadcast_profiling() {
+        // Broadcast to 3 PEs. Verify total_messages=3, total_hops=3.
+        let mut s = sim(1, 4);
+
+        for y in 1..=3 {
+            s.add_task_direct(
+                Coord::new(0, y),
+                TaskConfig {
+                    kind: TaskKind::CollectOutput { input_slot: 0 },
+                    trigger_slot: 0,
+                },
+            );
+        }
+
+        let source = Coord::new(0, 0);
+        let dest = Coord::new(0, 3);
+        let hops = vec![Direction::North, Direction::North, Direction::North];
+        let deliver_at = vec![1, 2];
+        let payload = vec![1.0, 2.0, 3.0];
+
+        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0);
+
+        let result = s.run();
+
+        // 3 deliveries (2 intermediate + 1 final)
+        assert_eq!(
+            result.profile.total_messages, 3,
+            "total_messages should count all deliveries"
+        );
+        // total_hops = path length (3), only counted at final delivery
+        assert_eq!(
+            result.profile.total_hops, 3,
+            "total_hops should be path length, not 3 * path_length"
+        );
+        // Source PE forwards once (through process_deliver forwarding)
+        let pe00 = result.profile.per_pe.get(&Coord::new(0, 0)).unwrap();
+        assert_eq!(
+            pe00.messages_sent, 1,
+            "source forwards one broadcast message"
+        );
+    }
+
+    #[test]
+    fn test_broadcast_payload_not_consumed() {
+        // Broadcast delivers [1.0, 2.0, 3.0] to 3 PEs.
+        // Verify all 3 receive identical data (payload clone not consumed).
+        let mut s = sim(1, 4);
+
+        for y in 1..=3 {
+            s.add_task_direct(
+                Coord::new(0, y),
+                TaskConfig {
+                    kind: TaskKind::CollectOutput { input_slot: 0 },
+                    trigger_slot: 0,
+                },
+            );
+        }
+
+        let source = Coord::new(0, 0);
+        let dest = Coord::new(0, 3);
+        let hops = vec![Direction::North, Direction::North, Direction::North];
+        let deliver_at = vec![1, 2];
+        let payload = vec![1.0, 2.0, 3.0];
+
+        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0);
+
+        let result = s.run();
+
+        let expected = vec![1.0, 2.0, 3.0];
+        assert_eq!(
+            result.outputs.get(&Coord::new(0, 1)),
+            Some(&expected),
+            "PE (0,1) should receive identical payload"
+        );
+        assert_eq!(
+            result.outputs.get(&Coord::new(0, 2)),
+            Some(&expected),
+            "PE (0,2) should receive identical payload"
+        );
+        assert_eq!(
+            result.outputs.get(&Coord::new(0, 3)),
+            Some(&expected),
+            "PE (0,3) should receive identical payload"
         );
     }
 }

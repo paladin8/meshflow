@@ -21,6 +21,11 @@ pub struct Message {
     pub payload_slot: SlotId,
     /// Logical timestamp when this message was created.
     pub timestamp: u64,
+    /// Hop indices for intermediate broadcast delivery.
+    /// Empty = point-to-point (deliver only at final destination).
+    /// When non-empty, payload is delivered to intermediate PEs at these hop indices
+    /// in addition to the final destination.
+    pub deliver_at: Vec<usize>,
 }
 
 impl Message {
@@ -54,6 +59,7 @@ mod tests {
             payload: vec![1.0, 2.0, 3.0],
             payload_slot: 0,
             timestamp: 0,
+            deliver_at: vec![],
         }
     }
 
