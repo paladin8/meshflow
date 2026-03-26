@@ -76,6 +76,7 @@ def _route_xy(
                         input_slot=0,
                         route_dest=dst_node.coord,
                         route_hops=hops,
+                        payload_slot=edge.dst_slot,
                     )
                 )
 

@@ -48,6 +48,8 @@ enum TaskProgram {
         input_slot: u32,
         route_dest: (u32, u32),
         route_hops: Vec<String>,
+        #[serde(default)]
+        payload_slot: u32,
     },
     #[serde(rename = "collect_output")]
     CollectOutput { trigger_slot: u32, input_slot: u32 },
@@ -397,6 +399,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             input_slot,
             route_dest,
             route_hops,
+            payload_slot,
         } => {
             let dest = Coord::new(route_dest.0, route_dest.1);
             validate_coord(dest, width, height)?;
@@ -409,6 +412,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     input_slot: *input_slot,
                     route_dest: dest,
                     hops,
+                    payload_slot: *payload_slot,
                 },
                 trigger_slot: *trigger_slot,
             })

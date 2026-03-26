@@ -61,6 +61,8 @@ pub enum TaskKind {
         input_slot: SlotId,
         route_dest: Coord,
         hops: Vec<Direction>,
+        /// SRAM slot to deliver into on the destination PE (default 0).
+        payload_slot: SlotId,
     },
     /// Consume payload from input_slot and mark it as simulation output.
     CollectOutput { input_slot: SlotId },
@@ -377,6 +379,7 @@ mod tests {
                 input_slot: 0,
                 route_dest: Coord::new(1, 0),
                 hops: vec![Direction::East],
+                payload_slot: 0,
             },
             trigger_slot: 0,
         });

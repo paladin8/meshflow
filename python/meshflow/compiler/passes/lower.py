@@ -44,6 +44,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             input_slot=task.input_slot,
             route_dest=task.route_dest,
             route_hops=[d.value for d in task.route_hops],
+            payload_slot=task.payload_slot,
         )
     if isinstance(task, CollectOutputEntry):
         return CollectOutputTask(

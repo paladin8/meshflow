@@ -1,5 +1,8 @@
 """Reference implementations for numerical correctness testing."""
 
+from typing import Any
+
+import numpy as np
 import torch
 
 
@@ -30,4 +33,65 @@ def reference_mlp(
         x = torch.nn.functional.linear(x, W, b)
         if i < len(layers) - 1:  # no activation on final layer
             x = torch.relu(x)
+    return x
+
+
+def _to_tensor(w: Any) -> torch.Tensor:
+    """Convert numpy array or tensor to torch.Tensor."""
+    if isinstance(w, np.ndarray):
+        return torch.from_numpy(w)
+    return w
+
+
+def reference_transformer_block(
+    x: torch.Tensor,
+    weights: dict[str, dict[str, Any]],
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Reference single-head transformer block.
+
+    Args:
+        x: Input tensor of shape (seq_len, d_model).
+        weights: Dict mapping node IDs to weight dicts (numpy or torch).
+        eps: RMSNorm epsilon.
+
+    Returns:
+        Output tensor of shape (seq_len, d_model).
+    """
+    # Sublayer 1: pre-norm attention
+    normed1 = reference_rmsnorm(x, _to_tensor(weights["rn1"]["gamma"]), eps)
+
+    Q = reference_linear(
+        normed1, _to_tensor(weights["q_proj"]["weight"]), _to_tensor(weights["q_proj"]["bias"])
+    )
+    K = reference_linear(
+        normed1, _to_tensor(weights["k_proj"]["weight"]), _to_tensor(weights["k_proj"]["bias"])
+    )
+    V = reference_linear(
+        normed1, _to_tensor(weights["v_proj"]["weight"]), _to_tensor(weights["v_proj"]["bias"])
+    )
+
+    scores = Q @ K.T  # (seq_len, seq_len)
+    attn_weights = torch.softmax(scores, dim=-1)
+    attn_out = attn_weights @ V  # (seq_len, d_model)
+
+    proj_out = reference_linear(
+        attn_out,
+        _to_tensor(weights["out_proj"]["weight"]),
+        _to_tensor(weights["out_proj"]["bias"]),
+    )
+    x = x + proj_out  # residual add1
+
+    # Sublayer 2: pre-norm FFN
+    normed2 = reference_rmsnorm(x, _to_tensor(weights["rn2"]["gamma"]), eps)
+
+    ffn1_out = reference_linear(
+        normed2, _to_tensor(weights["ffn1"]["weight"]), _to_tensor(weights["ffn1"]["bias"])
+    )
+    ffn1_relu = torch.relu(ffn1_out)
+    ffn2_out = reference_linear(
+        ffn1_relu, _to_tensor(weights["ffn2"]["weight"]), _to_tensor(weights["ffn2"]["bias"])
+    )
+    x = x + ffn2_out  # residual add2
+
     return x

@@ -32,16 +32,14 @@ Residual connections wrap both sublayers: attention output + input → Add1, FFN
 
 ## Input Flow
 
-The transformer block input enters through a FORWARD node that fans out to four destinations:
+The transformer block input enters through a FORWARD node that fans out to:
 
-1. **RMSNorm1 tile PEs** — main path into the attention sublayer.
-2. **K projection tile PEs** — key input (same as query input for self-attention).
-3. **V projection tile PEs** — value input (same as query input for self-attention).
-4. **Add1 PEs (skip connection)** — residual path that bypasses the attention sublayer.
+1. **RMSNorm1 tile PEs** — main path into the attention sublayer. RMSNorm1 normalizes the input, then its output fans out to Q/K/V projection tile PEs.
+2. **Add1 PE (skip connection)** — residual path that bypasses the attention sublayer.
 
-The compiler generates broadcast routes from the FORWARD node to all destinations. For self-attention, Q/K/V all receive the same input. The skip connection arrives at the Add1 PEs early and waits in SRAM until the main path completes.
+For self-attention, Q/K/V projections all receive the same normalized input from RMSNorm1's output. The skip connection carries the *unnormalized* original input to Add1.
 
-**SRAM pressure from skip connections**: Skip-connection data occupies SRAM until the main path catches up. For seq_len=4, d_model=8, this is 32 floats (128 bytes) per tile PE — negligible. At larger dimensions, this pressure should be monitored via the existing profiling counters.
+**SRAM pressure from skip connections**: Skip-connection data occupies SRAM until the main path catches up. For seq_len=4, d_model=8, this is 32 floats (128 bytes) — negligible. At larger dimensions, this pressure should be monitored via the existing profiling counters.
 
 ---
 
@@ -51,20 +49,20 @@ The compiler generates broadcast routes from the FORWARD node to all destination
 
 Normalizes over the feature dimension using root mean square: `x / sqrt(mean(x^2) + eps) * gamma`.
 
-**Graph IR**: `OpType.RMSNORM`, attrs `{eps: float}`. Learned `gamma` weights provided as operator weights. Validation: `eps` attr required, gamma weights required.
+**Graph IR**: `OpType.RMSNORM`, attrs `{eps: float, feature_count: int}`. Learned `gamma` weights provided as operator weights. Validation: `eps` and `feature_count` attrs required, gamma weights required.
 
 **Spatial execution (two-phase reduce-broadcast)**:
 
-1. **Phase 1 — partial sums**: Each tile PE computes `sum(x^2)` for its local feature slice. Sends the partial sum (a single float) to the designated reduce PE.
-2. **Reduce**: The reduce PE receives all partial sums, computes `1 / sqrt(total_sum / feature_count + eps)`, broadcasts the scale factor back to all tile PEs.
-3. **Phase 2 — apply**: Each tile PE multiplies `x * scale * gamma` (gamma is resident in SRAM). Routes normalized output onward.
+1. **Phase 1 — partial sums**: Each tile PE computes `sum(x^2)` for its local feature slice (using `slice_offset` and `slice_size` to index into position-major data). For multi-position inputs, computes per-position partial sums. Sends the partial sum vector to the designated reduce PE.
+2. **Reduce**: The reduce PE receives all partial sums, computes per-position `1 / sqrt(total_sum / feature_count + eps)`, broadcasts the scale factor vector back to all tile PEs.
+3. **Phase 2 — apply**: Each tile PE multiplies `x * scale * gamma` per position (gamma is resident in SRAM). Outputs in row-major order (rows outer, positions inner) for ConcatCollect fragment placement. Routes normalized output onward.
 
 **Tile count**: Matches the preceding layer's output tile count so fragments arrive 1:1 without reshuffling.
 
 **Rust TaskKind variants**:
-- `RmsNormReduce` — reduce PE. Uses counter-based accumulation (same pattern as ConcatCollect): triggers on every partial sum arrival, increments an internal counter, only computes when counter reaches `num_tiles`. Computes scale factor and broadcasts to all tile PEs.
-- `RmsNormPartialSum` — tile PEs, phase 1. Triggered when activation arrives (slot 0). Computes `sum(x^2)` for the local slice, sends partial sum to reduce PE. Completes normally.
-- `RmsNormNormalize` — tile PEs, phase 2. Triggered when scale factor arrives (slot 1). Reads activation from slot 0 (still resident), scale factor from slot 1, gamma weights from slot 2. Computes `x * scale * gamma`, routes normalized output onward.
+- `RmsNormReduce { num_tiles, feature_count, eps, tile_dests, scale_slot }` — reduce PE. Uses counter-based accumulation (same pattern as ConcatCollect): triggers on every partial sum arrival, increments an internal counter, only computes when counter reaches `num_tiles`. Computes per-position scale factor and broadcasts to all tile PEs.
+- `RmsNormPartialSum { input_slot, reduce_dest, reduce_hops, partial_sum_slot, slice_offset, slice_size, feature_count }` — tile PEs, phase 1. Triggered when activation arrives (slot 0). Computes per-position `sum(x^2)` for the local slice using `slice_offset`/`slice_size` to index into position-major data. Sends partial sum vector to reduce PE.
+- `RmsNormNormalize { input_slot, scale_slot, gamma_slot, output_dests, payload_slots, slice_offset, slice_size }` — tile PEs, phase 2. Triggered when scale factor arrives (slot 1). Reads activation from slot 0 (still resident), per-position scale factor from slot 1, gamma weights from slot 2. Computes `x * scale * gamma` per position, outputs in row-major order. Routes normalized output onward.
 
 **Two separate TaskConfig entries on each tile PE**:
 - TaskConfig A: `kind=RmsNormPartialSum`, `trigger_slot=0`.
@@ -90,35 +88,38 @@ Row-wise numerically stable softmax: `exp(x - max(x)) / sum(exp(x - max(x)))`.
 **Rust TaskKind**: `Softmax` — reads score row from SRAM slot, computes stable softmax, writes result to a separate output slot. The AV MatMul task watches this output slot as one of its trigger conditions.
 
 **SRAM slot layout on attention PEs** (see MatMul section for full layout):
-- Softmax reads from the QK^T result slot (slot `seq_len + 1`).
-- Softmax writes to the softmax output slot (slot `seq_len + 2`).
+- Softmax reads from the QK^T result slot (slot 3).
+- Softmax writes to the softmax output slot (slot 4).
 
 ### MATMUL
 
-General local matrix-vector or dot-product computation.
+Matrix-vector multiply: `M @ v` (transpose=false, output has `rows` elements) or `M^T @ v` (transpose=true, output has `cols` elements).
 
-**Graph IR**: `OpType.MATMUL`, no attrs. Validation: connectivity depends on role (QK^T vs AV), validated by the model helper's graph construction. Used for both QK^T and attention_weights @ V.
+**Graph IR**: `OpType.MATMUL`, attrs `{seq_len: int, d_model: int}`. Validation: `seq_len` attr required. Used for both QK^T and AV within attention chains.
 
-**Spatial execution (row-parallel attention)**: `seq_len` PEs, each handling one query position.
-- **QK^T**: PE holds one row of Q (from Q projection). Receives all K vectors via broadcast. Computes `seq_len` dot products, producing one row of the attention score matrix.
-- **AV**: PE holds its softmax output row. Receives all V vectors via broadcast. Computes weighted sum, producing one row of the attention output.
+**Spatial execution (row-parallel attention)**: `seq_len` PEs, each handling one query position. The expand pass detects MATMUL → SOFTMAX → MATMUL chains and co-locates all three operations on the same set of attention PEs.
 
-**Broadcast routing**: K and V each originate from their projection's collect PEs and need to reach all `seq_len` attention PEs. Implemented as N separate point-to-point routes from the same source — one hop list per destination. Same mechanism as ConcatCollectForward's multi-destination emission.
+- **QK^T**: `K @ Q` where K is the full key matrix (seq_len × d_model) broadcast to all attention PEs, and Q is a single row scattered per PE. `transpose=false` produces a score vector of length `seq_len`.
+- **AV**: `V^T @ softmax_weights` where V is the full value matrix (seq_len × d_model) broadcast to all attention PEs. `transpose=true` produces an output vector of length `d_model`.
 
-**SRAM slot layout on attention PEs** (seq_len=4 example):
-- Slot 0: Q row (from Q projection collect, one row per attention PE)
-- Slots 1..4: K vectors (slots 1, 2, 3, 4 — one per sequence position, broadcast from K projection)
-- Slots 5..8: V vectors (slots 5, 6, 7, 8 — one per sequence position, broadcast from V projection)
-- Slot `2*seq_len + 1` (=9 for seq_len=4): QK^T result row (written by QK^T MatMul)
-- Slot `2*seq_len + 2` (=10 for seq_len=4): Softmax output row (written by Softmax)
-- Slot `2*seq_len + 3` (=11 for seq_len=4): AV result row (written by AV MatMul, routed onward)
+**Broadcast vs scatter routing**: K and V projection collect PEs **broadcast** the full matrix to all attention PEs (each PE gets the complete K/V). Q projection collect PE **scatters** — row i goes to attention PE i. The route pass auto-detects scatter mode when a collect PE routes to multiple ATTENTION_PEs at Q slot (slot 0).
 
-**Task triggering chain on each attention PE**:
-1. **QK^T MatMul** (TaskConfig): `trigger_slot` = last K slot (slot `seq_len`). Uses ConcatCollect-like counter to detect when all K slots are populated. Q row in slot 0 is pre-populated from Q projection. Reads slots 0..seq_len, computes dot products, writes score row to slot `2*seq_len + 1`.
-2. **Softmax** (TaskConfig): `trigger_slot = 2*seq_len + 1`. Reads score row, computes stable softmax, writes result to slot `2*seq_len + 2`.
-3. **AV MatMul** (TaskConfig): `trigger_slot = 2*seq_len + 2`. By this point V slots (slots `seq_len+1..2*seq_len`) are already populated (V vectors arrive via broadcast in parallel with the QK^T computation). Reads softmax output + V slots, computes weighted sum, writes to slot `2*seq_len + 3`, routes result onward.
+**SRAM slot layout on attention PEs** (fixed, independent of seq_len):
+- Slot 0: Q row (`d_model` floats, scattered from Q projection collect)
+- Slot 1: K matrix (`seq_len × d_model` floats, broadcast from K projection collect)
+- Slot 2: V matrix (`seq_len × d_model` floats, broadcast from V projection collect)
+- Slot 3: QK^T result (`seq_len` floats, written by QK^T MatMul)
+- Slot 4: Softmax output (`seq_len` floats, written by Softmax)
+- Slot 5: AV result (`d_model` floats, written by AV MatMul, routed onward)
 
-**Note on V arrival timing**: V vectors arrive independently of the QK^T → Softmax chain. They may arrive before or after Softmax completes. The AV MatMul only triggers on the Softmax output slot, so V vectors simply wait in their slots until AV fires. If V arrives after Softmax, the ordering works naturally through the event queue.
+**Task triggering chain on each attention PE** (dual-trigger with has_slot guard):
+1. **QK^T MatMul**: Two TaskConfig entries with `trigger_slot=0` (Q) and `trigger_slot=1` (K). Both fire, but a `has_slot` guard ensures computation only runs when both Q and K are present. Both input slots are consumed after computation to prevent re-triggering. Writes score vector to slot 3.
+2. **Softmax**: Single TaskConfig with `trigger_slot=3`. Reads QK^T scores, computes stable softmax, writes result to slot 4. The `task_write_slot` helper ensures co-located tasks (AV MatMul) are properly triggered.
+3. **AV MatMul**: Two TaskConfig entries with `trigger_slot=2` (V) and `trigger_slot=4` (softmax output). Same has_slot guard pattern — computes only when both V and softmax output are present. Both consumed after computation. Writes to slot 5, routes result onward.
+
+**Note on V arrival timing**: V vectors arrive independently of the QK^T → Softmax chain. They may arrive before or after Softmax completes. The AV MatMul has_slot guard handles both orderings naturally.
+
+**Attention output gathering** (seq_len > 1): When seq_len > 1, each attention PE produces one row of the output. An attention collect PE (ConcatCollect) gathers these rows before routing to the next operator. For seq_len = 1, the single attention PE routes directly downstream.
 
 ### ADD (Residual)
 
@@ -126,17 +127,18 @@ Element-wise addition of two activation tensors.
 
 **Graph IR**: `OpType.ADD`, no attrs. Validation: exactly two incoming edges. Two inputs (main path + skip connection), one output.
 
-**Spatial execution**: ADD runs on its own set of tile PEs (one per feature slice, matching the tile count of adjacent layers). Each PE receives two inputs in separate SRAM slots, adds them element-wise, and routes the result onward.
+**Spatial execution**: ADD is a **single-PE operation** — it expands as a PassthroughGroup, not a tiled group. The upstream collect PE already gathers fragments into a single vector, so there is no need to tile the addition across multiple PEs.
 
-**Rust TaskKind**: `Add` — reads slot 0 (main path) and slot 1 (skip connection), writes element-wise sum to output slot, routes result onward.
+**Rust TaskKind**: `Add { input_slot_a, input_slot_b, output_slot, output_dests, payload_slots }` — reads two input slots, writes element-wise sum to output slot, routes result to all downstream destinations with per-destination payload slots.
 
-**SRAM slot layout for ADD PEs**:
-- Slot 0: main path input (e.g., attention output from output projection collect)
-- Slot 1: skip-connection input (e.g., original input routed around the sublayer)
+**SRAM slot layout for ADD PE**:
+- Slot 0: first input (whichever edge the compiler maps to dst_slot 0)
+- Slot 1: second input (mapped to dst_slot 1)
+- Slot 2: output (written by Add, routed onward)
 
-**Trigger**: Uses slot-based readiness. The ADD task triggers when slot 0 is written (the later-arriving input). The skip connection in slot 1 typically arrives first and waits. If the main path arrives first, the same mechanism works — the task triggers when the second slot is written. The compiler sets `trigger_slot` to whichever input arrives last based on the dataflow graph depth.
+**Trigger (dual-trigger with has_slot guard)**: The compiler generates **two AddEntry TaskConfig entries** — one per input slot. Both fire when their respective input arrives, but a `has_slot` guard in the runtime ensures computation only runs when both inputs are present. Both input slots are consumed after computation to prevent re-triggering. This pattern is identical to MatMul's dual-trigger approach.
 
-**Co-location note**: ADD PEs are distinct PEs in the placement, not co-located on other operator PEs. This keeps slot assignments simple and avoids conflicts with the consumer's own slots. The cost is a small number of additional PEs (equal to the tile count) with minimal SRAM usage.
+**Single-PE note**: ADD PEs are distinct PEs in the placement, not co-located on other operator PEs. Unlike the original design (which proposed tile_count ADD PEs), the single-PE approach is simpler and sufficient because the upstream collect already gathers into a single vector.
 
 ---
 
@@ -145,12 +147,12 @@ Element-wise addition of two activation tensors.
 The attention sublayer output reaches the first residual add through the following path:
 
 1. **Output projection (LINEAR)**: Tiled like other linear layers. Each tile PE computes its fragment of the output vector.
-2. **Output projection collect (ConcatCollect/ConcatCollectForward)**: Existing mechanism. Collect PE(s) accumulate fragments from output projection tiles. Once complete, routes the collected output to Add1 PEs.
-3. **Add1 PEs**: Receive the attention output in slot 0, skip-connection (original input) in slot 1. Compute element-wise sum. Route result to both:
+2. **Output projection collect (ConcatCollect/ConcatCollectForward)**: Existing mechanism. Collect PE gathers fragments from output projection tiles. Once complete, routes the collected output to the Add1 PE.
+3. **Add1 PE** (single PE): Receives the attention output in one slot and the skip-connection (original input) in another. Computes element-wise sum. Routes result to both:
    - RMSNorm2 tile PEs (main path into FFN sublayer)
-   - Add2 PEs (skip connection around FFN sublayer)
+   - Add2 PE (skip connection around FFN sublayer)
 4. **RMSNorm2 → FFN1 → ReLU → FFN2**: Standard pipeline using existing LINEAR + ReLU infrastructure.
-5. **FFN2 collect → Add2 PEs**: FFN output collected, routed to Add2 PEs. Add2 receives FFN output + Add1 output, sums them, routes to Collect.
+5. **FFN2 collect → Add2 PE**: FFN output collected, routed to Add2 PE. Add2 receives FFN output + Add1 output, sums them, routes to Collect.
 
 ---
 
@@ -158,29 +160,41 @@ The attention sublayer output reaches the first residual add through the followi
 
 ### expand.py
 
-Biggest changes. Currently handles LINEAR → TiledComputeGroup with optional fused activation. New expansion logic per operator:
+Biggest changes. Handles LINEAR → TiledComputeGroup with optional fused activation. New expansion logic per operator:
 
-- **RMSNORM**: Creates a tile group (one PE per feature slice) + one reduce PE. Wires two-phase connections: tile PEs → reduce PE (partial sums), reduce PE → tile PEs (scale factor). Each tile PE gets two TaskConfig entries (phase 1 and phase 2).
-- **SOFTMAX**: Co-located on attention PEs. Adds a Softmax TaskConfig entry to each attention PE, positioned between QK^T and AV in the trigger chain. No additional PEs allocated.
-- **MATMUL**: Creates `seq_len` attention PEs. Wires broadcast edges from K/V sources to all attention PEs. Two MATMUL TaskConfig entries on each attention PE (QK^T and AV), chained through the Softmax TaskConfig.
-- **ADD**: Creates `tile_count` ADD PEs. Wires main path and skip-connection inputs to separate slots. Routes ADD output to downstream consumer.
+- **RMSNORM**: Creates an `RmsNormGroup` (tile PEs + reduce PE + collect PE). Uses `reserved_rows=2` for reduce + collect when computing tile count. `NodeExpansion` maps input_pe_ids to tile PEs and output_pe_ids to the collect PE.
+- **SOFTMAX + MATMUL (attention chains)**: The `_detect_attention_chains()` function identifies MATMUL → SOFTMAX → MATMUL patterns. The first MATMUL creates an `AttentionGroup` with `seq_len` PEs. SOFTMAX and AV MATMUL are marked as fused (added to `fused_nodes` set, skipped in the main loop). For seq_len > 1, an attention collect PE is added to output_pe_ids for gathering per-position outputs.
+- **ADD**: Expands as a `PassthroughGroup` (single PE). No tiling — the upstream collect already gathers into a single vector.
+- **Standalone SOFTMAX**: Also a `PassthroughGroup` (single PE).
+
+### expanded_ir.py
+
+Group types: `TiledComputeGroup`, `RmsNormGroup`, `AttentionGroup`, `PassthroughGroup`. Each group tracks an `origin_id` back to the GraphIR node. `NodeExpansion` tracks `input_pe_ids` and `output_pe_ids` for inter-group edge generation.
 
 ### place.py
 
-Currently uses sequential column-based placement. Changes:
+Column-per-group layout for mixed graphs (passthrough-only graphs use row-major). Changes:
 
-- Attention PEs get their own column (`seq_len` PEs arranged vertically, like LINEAR tiles).
-- RMSNorm tile PEs arranged vertically in a column; reduce PE placed adjacent to minimize hops.
-- ADD PEs arranged vertically in a column, adjacent to their consumer.
-- Mesh may need to be wider for transformer blocks (more columns than MLP alone). Mesh dimensions are derived from the placement result.
+- Attention PEs get their own column (`seq_len` PEs arranged vertically). For seq_len > 1, an attention collect PE is placed below.
+- RMSNorm: tile PEs vertically in a column, reduce PE and collect PE placed below.
+- ADD PE gets its own column (single PE).
+- Internal edges (tile→reduce, reduce→tile, tile→collect, attn→collect) are generated within the placement pass.
+- Inter-group edges are generated from original GraphIR edges mapped through `NodeExpansion`.
+- `PlacedNodeKind` enum provides clean dispatch: FORWARD, COLLECT_SIMPLE, LINEAR_TILE, LINEAR_COLLECT, RMSNORM_TILE, RMSNORM_REDUCE, ATTENTION_PE, ADD, SOFTMAX.
+- Mesh dimensions are derived from the placement result.
 
 ### route.py
 
-Currently generates single point-to-point hop lists. Changes:
+Dispatches on `PlacedNodeKind` for each node. Key routing patterns:
 
-- **Broadcast routes**: One source PE, multiple destination PEs. Implemented as N separate point-to-point routes sharing the same source. No tree-broadcast primitive needed.
-- **Skip-connection routes**: Residual input routed in parallel with the main path, arriving at ADD PEs. Just additional route entries.
-- Existing XY routing works for all new patterns.
+- **LINEAR_COLLECT**: Detects scatter mode when routing to multiple ATTENTION_PEs at Q slot (slot 0). Uses `ConcatCollectForward` with `scatter=True` for Q distribution, `scatter=False` (broadcast) for K/V.
+- **ATTENTION_PE**: Generates co-located tasks — QK^T MatMul (dual trigger on Q/K slots), Softmax (trigger on QK^T output), AV MatMul (dual trigger on V/softmax output). Fixed 6-slot SRAM layout.
+- **ADD**: Generates dual AddEntry tasks (one per input slot) with has_slot guard pattern. Output slot = max(input slots) + 1.
+- **RMSNORM_TILE**: Phase 1 (PartialSum with slice params) + Phase 2 (Normalize with output routing). Gamma weights loaded into SRAM slot 2.
+- **RMSNORM_REDUCE**: Counter-based accumulation entries (one per partial sum slot).
+- **Broadcast routes**: One source, multiple destinations. N separate point-to-point XY routes.
+- **ConcatCollectForward `fragment_rows`**: Set from the base/remainder tile distribution for exact `num_positions` inference in the runtime.
+- **`payload_slots`**: Per-destination slot assignment. Used by ConcatCollectForward, Add, MatMul, and RmsNormNormalize to deliver data to the correct SRAM slot on each destination PE.
 
 ### lower.py
 
@@ -193,9 +207,9 @@ New TaskEntry variants for the new task kinds. Same structure as today: task kin
 ### graph_ir.py — validation updates
 
 - **RMSNORM**: Requires `eps` and `feature_count` attrs. Weights must include `gamma`.
-- **ADD**: Requires exactly two incoming edges. `num_tiles` attr set by model helper.
+- **ADD**: Requires exactly two incoming edges. No special attrs needed.
 - **SOFTMAX**: Requires exactly one incoming edge.
-- **MATMUL**: Requires `seq_len` attr. Specific connectivity validated by the model helper's graph construction rather than generic validation (since QK^T and AV have different input patterns).
+- **MATMUL**: Requires `seq_len` attr. `d_model` attr optional (used by attention PE routing for SRAM layout). Specific connectivity validated by the model helper's graph construction.
 
 ### No new IR stages
 
@@ -205,57 +219,67 @@ The existing pipeline stays the same: `GraphIR → Expand → SpatialIR → Rout
 
 ## Runtime Changes (Rust)
 
-### New TaskKind variants (pe.rs)
+### TaskKind variants (pe.rs)
 
-Six new variants added to the `TaskKind` enum:
+Six new variants added to the `TaskKind` enum (11 total including existing ForwardActivation, CollectOutput, Linear, ConcatCollect, ConcatCollectForward):
 
-| Variant | Triggers on | Computes | Emits |
-|---------|------------|----------|-------|
-| `RmsNormReduce` | Each partial sum slot (counter-based, fires when all N arrive) | `1/sqrt(sum/count + eps)` | Scale factor broadcast to N tile PEs |
-| `RmsNormPartialSum` | Slot 0 (activation) | `sum(x^2)` for local slice | Partial sum to reduce PE |
-| `RmsNormNormalize` | Slot 1 (scale factor) | `x * scale * gamma` (slots 0, 1, 2) | Normalized output |
-| `Softmax` | Score row slot | `exp(x-max)/sum(exp(x-max))` | Result to separate output slot (local) |
-| `MatMul` | Last operand slot written | Dot products or vector-matrix | Result row (routed) |
-| `Add` | Later-arriving input slot | Element-wise `a + b` (slots 0, 1) | Sum (routed) |
+| Variant | Trigger pattern | Computes | Emits |
+|---------|----------------|----------|-------|
+| `RmsNormReduce` | Counter-based (fires when all N partial sums arrive) | Per-position `1/sqrt(sum/count + eps)` | Scale factor vector broadcast to N tile PEs |
+| `RmsNormPartialSum` | Slot 0 (activation) | Per-position `sum(x^2)` for local slice | Partial sum vector to reduce PE |
+| `RmsNormNormalize` | Slot 1 (scale factor) | Per-position `x * scale * gamma` (slots 0, 1, 2) | Normalized output (row-major) |
+| `Softmax` | QK^T result slot | `exp(x-max)/sum(exp(x-max))` | Result to local output slot |
+| `MatMul` | Dual trigger + has_slot guard | `M @ v` or `M^T @ v` | Result vector (routed) |
+| `Add` | Dual trigger + has_slot guard | Element-wise `a + b` | Sum (routed) |
 
-### Task parameters
+### Task parameters (pe.rs)
 
-Each new TaskKind carries explicit parameters in the Rust enum. Like existing variants (e.g., `ForwardActivation`, `Linear`), all tasks that emit messages include their routing info:
+Each TaskKind carries explicit parameters. Full parameter lists:
 
-- `RmsNormReduce { num_tiles: u32, feature_count: u32, eps: f32, tile_dests: Vec<(Coord, Vec<Direction>)> }` — broadcasts scale factor to all tile PEs.
-- `RmsNormPartialSum { reduce_dest: Coord, reduce_hops: Vec<Direction> }` — tile PE phase 1: sends partial sum to reduce PE.
-- `RmsNormNormalize { output_dests: Vec<(Coord, Vec<Direction>)> }` — tile PE phase 2: sends normalized output onward.
-- `Softmax { input_slot: u32, output_slot: u32 }` — writes to local SRAM slot only, no routing needed (co-located with MatMul).
-- `MatMul { operand_slots: Vec<u32>, output_slot: u32, output_dests: Vec<(Coord, Vec<Direction>)> }` — routes result to downstream PEs.
-- `Add { input_slot_a: u32, input_slot_b: u32, output_slot: u32, output_dests: Vec<(Coord, Vec<Direction>)> }` — routes sum to downstream PEs. Add1 fans out to both RMSNorm2 tiles and Add2 PEs.
+- `RmsNormReduce { num_tiles, feature_count, eps, tile_dests, scale_slot }` — broadcasts per-position scale factor to all tile PEs.
+- `RmsNormPartialSum { input_slot, reduce_dest, reduce_hops, partial_sum_slot, slice_offset, slice_size, feature_count }` — phase 1: per-position partial sums using slice params.
+- `RmsNormNormalize { input_slot, scale_slot, gamma_slot, output_dests, payload_slots, slice_offset, slice_size }` — phase 2: per-position normalization, row-major output.
+- `Softmax { input_slot, output_slot }` — writes to local SRAM slot only, no routing. Uses `task_write_slot` helper to trigger co-located tasks.
+- `MatMul { matrix_slot, vector_slot, rows, cols, transpose, output_slot, output_dests, payload_slots }` — explicit matrix-vector multiply. `transpose=false` → output length `rows`, `transpose=true` → output length `cols`.
+- `Add { input_slot_a, input_slot_b, output_slot, output_dests, payload_slots }` — routes sum to downstream PEs with per-destination payload slots.
 
-**Note**: Splitting RmsNormApply into `RmsNormPartialSum` and `RmsNormNormalize` as separate TaskKind variants (rather than a single variant with a phase flag) is cleaner — each variant has exactly the parameters it needs, and the runtime match arm is unambiguous.
+### has_slot guard pattern
+
+MatMul and Add use a dual-trigger pattern: two TaskConfig entries (one per input slot), both fire when their respective input arrives. A `has_slot` check ensures computation only runs when both inputs are present. After computation, both input slots are consumed (`pe.remove_slot`) to prevent double execution on re-trigger.
+
+### Multi-position support
+
+LINEAR, RmsNorm, and ConcatCollect all support `num_positions > 1`:
+- **LINEAR**: Infers `num_positions = input.len() / tile_cols`, loops over positions, outputs row-major (rows outer, positions inner).
+- **ConcatCollect**: Uses `fragment_rows` field for exact `num_positions = fragment.len() / fragment_rows` inference. Transposes completed buffer from row-major to position-major on completion.
+- **RmsNormPartialSum/Normalize**: Uses `slice_offset`/`slice_size` with `feature_count` to handle position-major input, output in row-major for ConcatCollect.
+- **RmsNormReduce**: Per-position accumulation and per-position scale computation.
 
 ### Task execution (runtime.rs — process_execute)
 
-**Add**: Read two slots, write element-wise sum, route onward. Simplest new task.
+**Add**: has_slot guard → read two slots → element-wise sum → consume both inputs → write output → route. Counter incremented after guard (counts completions, not triggers).
 
-**Softmax**: Read score row from input slot, compute max-subtracted stable softmax, write result to output slot. The output slot write triggers the AV MatMul task.
+**Softmax**: Read score vector from input slot → compute max-subtracted stable softmax → write result to output slot via `task_write_slot` (triggers co-located tasks like AV MatMul).
 
-**MatMul**: Read operand slots (Q row + K vectors, or softmax output + V vectors), compute dot products, write result to output slot. Route onward.
+**MatMul**: has_slot guard → read matrix and vector slots → multiply (`M @ v` or `M^T @ v`) → consume both inputs → write output → route. Counter incremented after guard.
 
-**RmsNormPartialSum**: Triggered by activation arrival in slot 0. Compute `sum(x^2)` for local slice. Emit partial sum message to reduce PE. Execution completes normally — PE then waits for phase 2's trigger (slot 1 write).
+**RmsNormPartialSum**: Triggered by activation arrival. Compute per-position `sum(x^2)` for local slice. Emit partial sum vector to reduce PE. Activation stays in SRAM for phase 2.
 
-**RmsNormNormalize**: Triggered by scale factor arrival in slot 1. Read activation from slot 0 (still resident), scale factor from slot 1, gamma weights from slot 2. Compute `x * scale * gamma`. Route normalized output to downstream PEs.
+**RmsNormNormalize**: Triggered by scale factor arrival. Read activation (slot 0), scale (slot 1), gamma (slot 2). Compute per-position `x * scale * gamma`. Output in row-major order. Route to downstream PEs.
 
-**RmsNormReduce**: Counter-based accumulation (like ConcatCollect). Triggers on every partial sum slot write. Increments `received_fragments` counter. When counter equals `num_tiles`, sums all partial sums from slots 0..N-1, computes `1/sqrt(total/feature_count + eps)`, broadcasts scale factor to all tile PEs via N messages.
+**RmsNormReduce**: Counter-based accumulation. Triggers on every partial sum slot write. When counter equals `num_tiles`, sums all per-position partial sums, computes per-position `1/sqrt(total/feature_count + eps)`, broadcasts scale vector to all tile PEs.
 
 ### Broadcast message emission
 
-Same pattern as existing ConcatCollectForward: emit N separate messages with individual hop lists. No new routing primitive in the runtime.
+Same pattern as ConcatCollectForward: emit N separate messages with individual hop lists and per-destination `payload_slots`. No new routing primitive.
 
-### Display impl for new TaskKind variants
+### Display impl
 
-Extend the existing `Display` impl with serde-compatible strings: `"rms_norm_reduce"`, `"rms_norm_partial_sum"`, `"rms_norm_normalize"`, `"softmax"`, `"mat_mul"`, `"add"`. Used by profiling trace events and operator timing.
+All TaskKind variants have serde-compatible Display strings: `"rms_norm_reduce"`, `"rms_norm_partial_sum"`, `"rms_norm_normalize"`, `"softmax"`, `"mat_mul"`, `"add"`. Used by profiling trace events and operator timing.
 
 ---
 
-## Model Helper
+## Model Helper — NOT YET IMPLEMENTED (CP5)
 
 ### `python/meshflow/models/transformer.py`
 
@@ -263,41 +287,60 @@ Extend the existing `Display` impl with serde-compatible strings: `"rms_norm_red
 def transformer_block(seq_len: int, d_model: int, d_ff: int, eps: float = 1e-6) -> GraphIR:
 ```
 
-Constructs the full transformer block graph with all nodes and edges. Also provides a weight generation helper:
+Constructs the full transformer block GraphIR with all nodes and edges:
+- FORWARD node (input)
+- RMSNorm1 node (pre-attention normalization)
+- Q/K/V LINEAR projection nodes
+- QK^T MATMUL → SOFTMAX → AV MATMUL attention chain
+- Output projection LINEAR
+- Add1 (residual: attention output + original input)
+- RMSNorm2 (pre-FFN normalization)
+- FFN1 LINEAR → ReLU → FFN2 LINEAR
+- Add2 (residual: FFN output + Add1 output)
+- COLLECT node (output)
+
+Edge connectivity must match the block structure diagram. Self-attention: Q/K/V projections all receive the same input (RMSNorm1 output). Skip connections carry data from FORWARD→Add1 and Add1→Add2.
 
 ```python
 def transformer_weights(seq_len: int, d_model: int, d_ff: int) -> dict[str, Any]:
 ```
 
-Returns a dict of all required weights: Q/K/V/output projection matrices and biases, FFN1/FFN2 matrices and biases, two sets of RMSNorm gamma vectors.
+Returns a dict of all required weights keyed by node ID: Q/K/V/output projection matrices (d_model × d_model) and biases, FFN1 matrix (d_model × d_ff) and bias, FFN2 matrix (d_ff × d_model) and bias, two RMSNorm gamma vectors (d_model).
 
 ### `python/meshflow/models/reference.py`
 
 Extended with a torch reference for the transformer block:
 
 ```python
-def transformer_block_reference(inputs: np.ndarray, weights: dict, seq_len: int, d_model: int, d_ff: int, eps: float = 1e-6) -> np.ndarray:
+def reference_transformer_block(x: np.ndarray, weights: dict, seq_len: int, d_model: int, d_ff: int, eps: float = 1e-6) -> np.ndarray:
 ```
 
-Runs the equivalent computation in pure PyTorch, returns expected output for numerical validation.
+Runs the equivalent computation using existing `reference_linear()` and `reference_rmsnorm()` plus torch attention math, returns expected output for numerical validation.
 
 ---
 
 ## Testing Strategy
 
-### Rust unit tests (per operator)
+### Rust unit tests (per operator) — COMPLETE
 
-- **MatMul**: Dot product correctness on small vectors, vector-matrix product matches numpy.
-- **Softmax**: Numerical stability with large values, output sums to 1.0, matches reference.
-- **RmsNormReduce / RmsNormApply**: Partial sum accumulation, scale factor correctness, normalized output matches reference.
-- **Add**: Element-wise addition correctness.
+91 Rust tests covering all task kinds:
 
-### Python end-to-end tests
+- **MatMul**: Matrix-vector multiply correctness, transpose mode, has_slot guard, slot consumption.
+- **Softmax**: Numerical stability with large values, output sums to 1.0, task_write_slot triggering.
+- **RmsNormPartialSum / RmsNormNormalize / RmsNormReduce**: Partial sum accumulation, per-position scale factor, normalized output, slice offset/size handling.
+- **Add**: Element-wise addition, has_slot guard, slot consumption, dual-trigger pattern.
+- **ConcatCollect**: fragment_rows-based num_positions inference, row-major → position-major transpose.
 
-- `test_transformer_block_basic`: seq_len=4, d_model=8, d_ff=16. Compile, run, compare against torch reference. Tolerance: `atol=1e-5, rtol=1e-5`.
+### Python end-to-end tests — PARTIALLY COMPLETE
+
+Existing tests in `tests/python/runtime/test_num_positions.py`:
+- `TestBatchedLinear`: Identity 2-position, torch-validated 2-position.
+- `TestMultiPositionRmsNorm`: Single position, two positions — compared against `reference_rmsnorm()`.
+- `TestAttentionMatMulChain`: seq_len=1 identity projections, seq_len=4 torch-validated.
+
+**Still needed (CP5)**:
+- `test_transformer_block_basic`: seq_len=4, d_model=8, d_ff=16. Full block with RMSNorm + attention + FFN + residual. Compare against torch reference. Tolerance: `atol=1e-4`.
 - `test_transformer_block_identity_weights`: Identity-like weights for analytically predictable output.
-- `test_rmsnorm_standalone`: Single RMSNorm node → compile → run → validate.
-- `test_attention_standalone`: QKV projections + matmul + softmax + AV + output projection (no FFN/norm).
 - `test_residual_passthrough`: Verify residual connections preserve skip input correctly.
 
 ### Profiling validation

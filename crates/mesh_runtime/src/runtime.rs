@@ -106,6 +106,7 @@ impl Simulator {
                     input_slot,
                     route_dest,
                     hops,
+                    payload_slot: 0,
                 }
             }
             InjectTaskKind::CollectOutput { input_slot } => TaskKind::CollectOutput { input_slot },
@@ -342,6 +343,7 @@ impl Simulator {
                 input_slot,
                 route_dest,
                 hops,
+                payload_slot,
             } => {
                 let pe = self.mesh.pe_mut(coord);
                 let data = pe.read_slot(input_slot).clone();
@@ -356,7 +358,7 @@ impl Simulator {
                     hops,
                     current_hop: 0,
                     payload: data,
-                    payload_slot: 0, // convention: deliver to slot 0
+                    payload_slot,
                     timestamp,
                 };
                 self.next_message_id += 1;

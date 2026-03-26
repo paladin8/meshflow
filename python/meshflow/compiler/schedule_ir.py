@@ -23,6 +23,7 @@ class ForwardActivationEntry:
     input_slot: int = 0
     route_dest: tuple[int, int] = (0, 0)
     route_hops: list[Direction] = field(default_factory=list)
+    payload_slot: int = 0
 
 
 @dataclass
