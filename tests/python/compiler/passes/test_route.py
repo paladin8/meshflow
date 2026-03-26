@@ -6,9 +6,10 @@ from meshflow.compiler import CompilerConfig
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
 from meshflow.compiler.passes.expand import expand
 from meshflow.compiler.passes.place import place
-from meshflow.compiler.passes.route import _generate_route_xy, route
+from meshflow.compiler.passes.route import _generate_route_xy, _try_linear_broadcast, route
 from meshflow.compiler.schedule_ir import (
     AddEntry,
+    BroadcastRoute,
     ConcatCollectForwardEntry,
     Direction,
     MatMulEntry,
@@ -826,3 +827,64 @@ class TestForwardBroadcast:
         assert len(fwd_pe.tasks) == 2
         for task in fwd_pe.tasks:
             assert task.kind == "forward_activation"
+
+
+class TestBroadcastDetection:
+    """Unit tests for _try_linear_broadcast and route-pass broadcast detection."""
+
+    def test_linear_broadcast_detection_column(self) -> None:
+        """Multiple same-column destinations collapse into one broadcast route.
+
+        Source at (0, 3), destinations at (1, 0), (1, 1), (1, 2) — all in column 1.
+        Expected: 1 route with dest=(1, 0) (farthest south) and deliver_at=[1, 2]
+        (one per intermediate PE above it, sorted closest-first).
+        """
+        dests = [
+            BroadcastRoute(dest=(1, 0), hops=[], deliver_at=[], payload_slot=1),
+            BroadcastRoute(dest=(1, 1), hops=[], deliver_at=[], payload_slot=1),
+            BroadcastRoute(dest=(1, 2), hops=[], deliver_at=[], payload_slot=1),
+        ]
+        result = _try_linear_broadcast((0, 3), dests)
+
+        assert len(result) == 1, f"expected 1 broadcast route, got {len(result)}: {result}"
+        r = result[0]
+        assert r.dest == (1, 0), f"expected dest=(1,0), got {r.dest}"
+        assert len(r.deliver_at) > 0, "broadcast route should have non-empty deliver_at"
+        # Intermediate PEs (1,2) and (1,1) should be in deliver_at
+        assert len(r.deliver_at) == 2, f"expected 2 intermediate deliveries, got {r.deliver_at}"
+
+    def test_single_dest_no_broadcast(self) -> None:
+        """A single destination is returned as-is (no broadcast optimisation).
+
+        _try_linear_broadcast returns the original list unchanged when there is
+        only one destination, and deliver_at should be empty.
+        """
+        dests = [
+            BroadcastRoute(dest=(1, 0), hops=[Direction.EAST], deliver_at=[], payload_slot=0),
+        ]
+        result = _try_linear_broadcast((0, 0), dests)
+
+        assert len(result) == 1
+        assert result[0].deliver_at == [], (
+            f"single-destination route should have empty deliver_at, got {result[0].deliver_at}"
+        )
+
+    def test_non_column_fallback(self) -> None:
+        """Destinations in different columns cannot be collapsed into a broadcast.
+
+        _try_linear_broadcast must return N separate routes with empty deliver_at
+        when destinations have different X coordinates.
+        """
+        dests = [
+            BroadcastRoute(dest=(1, 0), hops=[], deliver_at=[], payload_slot=0),
+            BroadcastRoute(dest=(2, 0), hops=[], deliver_at=[], payload_slot=0),
+            BroadcastRoute(dest=(3, 0), hops=[], deliver_at=[], payload_slot=0),
+        ]
+        result = _try_linear_broadcast((0, 0), dests)
+
+        # Should be returned unchanged (3 separate routes, no broadcast)
+        assert len(result) == 3, f"expected 3 separate routes, got {len(result)}"
+        for r in result:
+            assert r.deliver_at == [], (
+                f"non-column routes should have empty deliver_at, got {r.deliver_at}"
+            )
