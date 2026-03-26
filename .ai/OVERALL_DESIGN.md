@@ -108,33 +108,27 @@ This is a **resident-weights, activation-flow** design.
 
 ---
 
-## 5. Initial model scope
+## 5. Model scope
 
-### 5.1 v1 target model
+### 5.1 MLP pipeline (complete)
 
-The initial supported model should be a small feed-forward network or MLP stack, for example:
+The first supported model was a small feed-forward network:
 
 ```text
 Input -> Linear -> ReLU -> Linear -> ReLU -> Linear -> Output
 ```
 
-This gives us:
+This established: matrix-vector compute with row-tiling, explicit activation routing between layers, fragment collection, and straightforward numerical validation.
 
-* matrix-vector or matrix-batch-vector style compute,
-* explicit activation movement between layers,
-* straightforward validation,
-* no attention or KV-cache complexity.
+### 5.2 Single-head transformer block (complete)
 
-### 5.2 v2 target model
+After the MLP pipeline stabilized, a single-head transformer block was implemented:
 
-After the MLP pipeline works, the next target should be a tiny decoder-style block with:
+```text
+Input → RMSNorm → Q/K/V proj → attention (QK^T → Softmax → AV) → out_proj → Add → RMSNorm → FFN → Add → Output
+```
 
-* layer norm,
-* a simplified attention implementation,
-* an MLP block,
-* residual connections.
-
-This should only happen after the spatial pipeline and tooling are stable.
+This added: RMSNorm (two-phase reduce-broadcast), MatMul (matrix-vector multiply), Softmax (numerically stable row-wise), Add (element-wise residual), skip connections, scatter/broadcast routing, and multi-position (seq_len > 1) support. See `.ai/specs/MILESTONE_7.md` for full details.
 
 ---
 
@@ -142,15 +136,14 @@ This should only happen after the spatial pipeline and tooling are stable.
 
 ### 6.1 Processing element (PE)
 
-Each PE in the simulated mesh will contain:
+Each PE in the simulated mesh contains:
 
-* a unique `(x, y)` coordinate,
-* a local SRAM buffer,
-* an input queue or a small set of input queues,
-* a set of configured tasks,
-* local registers / scratch state,
-* profiling counters,
-* routing metadata for outbound messages.
+* a unique `(col, row)` coordinate,
+* a slot-addressed local SRAM (named `f32` vector slots),
+* an input queue for arriving messages,
+* a set of configured tasks (each with a trigger slot),
+* an optional SRAM capacity limit in bytes,
+* profiling counters (tasks executed, messages sent/received, hops).
 
 A PE is not a scalar CPU core. It is a configurable execution cell with local memory and message-driven computation.
 
@@ -158,141 +151,101 @@ A PE is not a scalar CPU core. It is a configurable execution cell with local me
 
 A message represents an activation payload moving through the mesh.
 
-Initial message fields:
+Message fields:
 
-* source PE,
-* destination PE or route id,
-* tensor fragment id,
-* sequence / token / batch index,
-* payload buffer id or inline numeric payload,
-* logical timestamp for the simulator.
+* `id` — unique message identifier,
+* `source` / `dest` — PE coordinates,
+* `hops` — pre-computed hop list (sequence of N/S/E/W directions),
+* `current_hop` — progress index into the hop list,
+* `payload` — inline `Vec<f32>` data,
+* `payload_slot` — destination SRAM slot on the receiving PE,
+* `timestamp` — logical time for the simulator.
 
 ### 6.3 Task
 
-A task is a unit of computation triggered when a PE has the required local state and inputs.
+A task is a unit of computation triggered when a PE has the required local state and inputs. Tasks are configured statically by the compiler via `TaskConfig` entries, each specifying a `TaskKind` and a `trigger_slot`.
 
-Examples:
+Current `TaskKind` variants:
 
-* `RecvInput`
-* `MatVecPartial`
-* `BiasAdd`
-* `ActivationRelu`
-* `ReduceAccumulate`
-* `ForwardActivation`
-* `EmitOutput`
+* `ForwardActivation` — read input and route to a destination PE,
+* `CollectOutput` — mark input as simulation output,
+* `Linear` — compute `W @ x + b` for a weight tile, emit output fragment,
+* `ConcatCollect` — accumulate fragments into a single output vector,
+* `ConcatCollectForward` — accumulate fragments, optionally apply activation, broadcast/scatter onward,
+* `Add` — element-wise addition of two SRAM slots (dual-trigger with has_slot guard),
+* `Softmax` — numerically stable row-wise softmax (in-place on a single PE),
+* `MatMul` — matrix-vector multiply with optional transpose (dual-trigger with has_slot guard),
+* `RmsNormPartialSum` — compute local `sum(x^2)` slice, send to reduce PE,
+* `RmsNormReduce` — accumulate partial sums, compute scale factor, broadcast,
+* `RmsNormNormalize` — apply `x * scale * gamma` per position.
 
-Tasks will be configured statically by the compiler.
+### 6.4 Operator groups
 
-### 6.4 Region
+An operator group is a set of PEs assigned to one operator or one operator partition. The compiler's expand pass decomposes GraphIR nodes into groups:
 
-A region is a rectangular submesh assigned to one operator or one operator partition.
+* `TiledComputeGroup` — LINEAR operators: tile PEs (each holding a weight tile) + a collect PE,
+* `RmsNormGroup` — tile PEs + reduce PE + collect PE,
+* `AttentionGroup` — `seq_len` attention PEs (co-located QK^T MatMul + Softmax + AV MatMul) + optional collect PE,
+* `PassthroughGroup` — single PE for ADD, standalone SOFTMAX, or other non-tiled ops.
 
-A region owns:
-
-* a subset of PEs,
-* a weight layout,
-* an operator implementation,
-* routing endpoints,
-* scheduling metadata.
+Groups are placed column-per-group on the mesh, with tile PEs arranged vertically.
 
 ### 6.5 Compiled artifact
 
-The compiler output should be a serialized artifact containing:
+The compiler output is a versioned msgpack-serialized `RuntimeProgram` containing:
 
-* model metadata,
-* mesh dimensions,
-* region assignments,
-* task programs,
-* routing tables,
-* weight blobs,
-* input/output bindings,
-* optional debugging symbols.
-
-Initial format can be JSON + binary blobs. We can tighten this later.
+* `version` — artifact format version (currently 1),
+* `mesh` — mesh dimensions (width × height),
+* `pes` — per-PE programs, each with:
+  * task programs (one per configured task),
+  * initial SRAM contents (pre-loaded weights and biases),
+* `inputs` — input slot bindings (which PE/slot receives external input).
 
 ---
 
 ## 7. Intermediate representations
 
-We will use custom IRs rather than LLVM.
+Custom IRs are used throughout. No LLVM.
 
 ### 7.1 Graph IR
 
-Represents the imported model at an operator graph level.
+Represents the model at an operator graph level. Defined in `compiler/graph_ir.py`.
 
-Example node types:
+Node types (`OpType`): `FORWARD`, `COLLECT`, `LINEAR`, `RELU`, `ADD`, `SOFTMAX`, `RMSNORM`, `MATMUL`.
 
-* `Input`
-* `Linear`
-* `ReLU`
-* `Add`
-* `LayerNorm`
-* `Output`
+Each node has an `id`, an `op` type, and optional `attrs` (e.g., `in_features`, `out_features` for LINEAR; `eps`, `feature_count` for RMSNORM; `seq_len`, `d_model` for MATMUL).
 
-Properties:
+Edges connect `(src_node, src_slot)` → `(dst_node, dst_slot)`. Slot indices determine SRAM placement on destination PEs.
 
-* tensor shapes,
-* dtypes,
-* parameter references,
-* graph edges.
+Purpose: correctness-oriented model representation, input to compiler passes. Includes DAG validation and per-op-type attribute/connectivity checks.
 
-Purpose:
+### 7.2 Expanded IR
 
-* correctness-oriented model representation,
-* input to compiler passes.
+Represents the graph after operator decomposition. Defined in `compiler/expanded_ir.py`.
 
-### 7.2 Spatial IR
+Each GraphIR node is expanded into an operator group (see Section 6.4). The expansion pass determines tile counts, creates internal PEs (tile, reduce, collect), and records `NodeExpansion` mappings (input_pe_ids, output_pe_ids) for inter-group edge generation.
 
-Represents the graph after spatial partitioning.
+Questions answered here: how many tiles per operator, which PEs are tile/reduce/collect, what internal edges exist within each group.
 
-Adds:
+### 7.3 Spatial IR
 
-* region assignments,
-* operator tiling decisions,
-* weight placement,
-* tensor partitioning strategy.
+Represents the graph after physical placement. Defined in `compiler/spatial_ir.py`.
 
-Example questions answered here:
+Each expanded node is assigned a `(col, row)` coordinate. Groups are laid out column-per-group with tile PEs vertically. Internal edges (tile→reduce, reduce→tile, tile→collect) and inter-group edges are generated. `PlacedNodeKind` provides clean dispatch: FORWARD, COLLECT_SIMPLE, LINEAR_TILE, LINEAR_COLLECT, RMSNORM_TILE, RMSNORM_REDUCE, ATTENTION_PE, ADD, SOFTMAX.
 
-* which mesh region owns `Linear_1`?
-* how is the hidden dimension sharded?
-* where do weight tiles live?
-* where are reductions performed?
-
-### 7.3 Route IR
-
-Represents connectivity between regions and PEs.
-
-Contains:
-
-* logical routes,
-* source and sink endpoints,
-* hop paths or route descriptors,
-* message classes,
-* buffering assumptions.
+Mesh dimensions are derived from the placement result.
 
 ### 7.4 Schedule IR
 
-Represents execution order and activation movement semantics.
+Represents per-PE task configurations and routing. Defined in `compiler/schedule_ir.py`.
 
-Contains:
-
-* readiness conditions,
-* task dependency edges,
-* pipelining constraints,
-* optional timing estimates.
+The route pass dispatches on `PlacedNodeKind` to generate task entries (one per PE task), SRAM pre-loads (weights, biases, gamma), and XY hop lists for inter-PE communication. Contains `TaskEntry` variants matching all `TaskKind` variants in the runtime.
 
 ### 7.5 Runtime Program
 
-The final low-level form consumed by Rust.
+The final low-level form consumed by Rust. Defined in `compiler/artifact.py`, loaded in `program.rs`.
 
-Contains:
-
-* PE-local task lists,
-* local memory allocations,
-* routing entries,
-* weight buffers,
-* static operator descriptors.
+Contains: per-PE task programs, initial SRAM contents, input slot bindings, mesh dimensions, and a version field. Serialized as msgpack via `serialize()` / `deserialize()`.
 
 ---
 
@@ -300,80 +253,74 @@ Contains:
 
 ### 8.1 Compiler pipeline
 
-The compiler should initially have the following stages:
+The compiler has four passes, invoked via `compile(graph, config, weights)`:
 
-1. **Import**
+1. **Expand** (`passes/expand.py`)
 
-   * Load a small model description from Python.
-   * Produce Graph IR.
+   * Decompose each GraphIR node into an operator group (tiled, RmsNorm, attention, or passthrough).
+   * Determine tile counts based on `mesh_height` and reserved rows.
+   * Detect attention chains (MATMUL → SOFTMAX → MATMUL) and fuse them into a single AttentionGroup.
+   * Produce Expanded IR with `NodeExpansion` mappings.
 
-2. **Normalization**
+2. **Place** (`passes/place.py`)
 
-   * Canonicalize graph forms.
-   * Fuse trivial ops where useful.
+   * Assign each expanded node a `(col, row)` coordinate on the mesh.
+   * Column-per-group layout: each operator group gets its own column, tile PEs arranged vertically.
+   * Generate internal edges (tile→reduce, reduce→tile, tile→collect, attn→collect) and inter-group edges.
+   * Derive mesh dimensions from the placement result.
+   * Produce Spatial IR.
 
-3. **Partitioning / placement**
+3. **Route** (`passes/route.py`)
 
-   * Assign operators or operator fragments to mesh regions.
+   * For each placed node, generate task entries, SRAM pre-loads, and XY hop lists.
+   * Dispatch on `PlacedNodeKind` for operator-specific routing logic.
+   * Handle broadcast (one source → N destinations) and scatter (row i → destination i) patterns.
+   * Split weights into tiles and assign to PE SRAM slots.
+   * Produce Schedule IR.
 
-4. **Weight layout**
+4. **Lower** (`passes/lower.py`)
 
-   * Split and place weights into PE-local SRAM.
+   * Mechanical translation from Schedule IR task entries to Runtime Program task programs.
+   * Emit per-PE programs with task configs and initial SRAM.
+   * Serialize as msgpack artifact.
 
-5. **Routing**
+### 8.2 Placement strategy
 
-   * Generate routes for inter-region activation movement.
+Column-per-group layout:
 
-6. **Scheduling**
+* each operator group gets its own column of PEs,
+* tile PEs are arranged vertically within the column,
+* collect and reduce PEs are placed below the tiles,
+* mesh dimensions grow to accommodate the widest group,
+* for mixed graphs (not passthrough-only), columns are assigned left to right.
 
-   * Define readiness and forwarding behavior.
-
-7. **Artifact emission**
-
-   * Serialize the runtime program.
-
-### 8.2 Placement strategy for v1
-
-Use a simple heuristic:
-
-* one operator per contiguous rectangular region,
-* region sizes are determined by output dimension and local memory needs,
-* layers are laid out left-to-right across the mesh when possible,
-* reductions happen in dedicated edge or collector PEs.
-
-This should be intentionally simple. We can improve placement later.
-
-### 8.3 Weight layout strategy for v1
+### 8.3 Weight layout strategy
 
 For a `Linear(in_dim, out_dim)` operator:
 
-* partition weights by output rows across region PEs,
-* each PE holds a tile of the row space,
-* input activation fragments are broadcast or routed to the PEs holding the relevant rows,
-* partial outputs are either emitted directly or reduced locally depending on the partition scheme.
+* partition weights by output rows: `base = out_dim // num_tiles`, first `remainder` tiles get `base + 1` rows,
+* each tile PE holds its weight tile and bias slice in SRAM (slots 1, 2),
+* input activation is broadcast to all tile PEs (arrives at slot 0),
+* each tile computes its partial output and routes the fragment to the collect PE.
 
-### 8.4 Routing strategy for v1
+### 8.4 Routing strategy
 
-Use deterministic shortest-path routing on a 2D Manhattan mesh.
+Deterministic XY dimension-ordered routing on a 2D Manhattan mesh:
 
-Start with:
-
-* single message class,
-* single routing policy,
-* no adaptive routing,
-* bounded queue depth,
+* messages first move horizontally (East/West), then vertically (North/South),
+* pre-computed hop lists stored in each task (no runtime route computation),
+* single message class, no adaptive routing,
 * explicit hop counting for profiling.
 
-### 8.5 Scheduling strategy for v1
+### 8.5 Scheduling strategy
 
-Use message-driven readiness:
+Message-driven readiness:
 
-* a task fires when all required inputs have arrived,
-* tasks consume input payloads,
-* tasks update local state,
-* tasks optionally emit messages to downstream PEs.
-
-This gives a clean event-driven simulator model without cycle accuracy.
+* each task has a `trigger_slot` — the task fires when a write to that SRAM slot occurs,
+* single-trigger tasks (e.g., Linear, ForwardActivation) execute immediately on trigger,
+* dual-trigger tasks (e.g., Add, MatMul) use a `has_slot` guard — two TaskConfig entries, each triggers on one input, but computation only runs when both inputs are present,
+* counter-based tasks (e.g., ConcatCollect, RmsNormReduce) accumulate fragments and only compute when all have arrived,
+* tasks consume input slots after computation to prevent re-triggering.
 
 ---
 
@@ -487,166 +434,170 @@ This gives:
 
 ## 11. API design
 
-### 11.1 Initial API scope
+### 11.1 API scope
 
-The first API should be intentionally small.
+Five endpoints implemented in FastAPI (`api/server.py`):
 
-Endpoints:
+* `POST /compile` — compile a GraphIR + weights into a stored artifact. Accepts `graph_ir` (JSON), `weights` (nested float arrays), and `config` (mesh_height, etc.).
+* `POST /run/{artifact_id}` — run a compiled artifact with input tensors. Accepts `inputs: dict[str, list[float]]`. Returns output tensors and profiling summary.
+* `GET /artifacts` — list all stored artifacts.
+* `DELETE /artifacts/{artifact_id}` — delete a stored artifact.
+* `GET /health` — health check.
 
-* `POST /v1/infer`
-* `GET /healthz`
-* `GET /v1/models`
+Artifacts are stored on disk via `ArtifactStore` (`api/store.py`), which manages msgpack files in a configurable directory.
 
-Optional later endpoint:
-
-* `POST /v1/completions`
-
-The first version can simply accept numeric tensors rather than text prompts.
-
-### 11.2 Suggested payload
+### 11.2 Example payload
 
 ```json
+POST /run/abc123
 {
-  "model": "mlp_tiny",
-  "inputs": [0.1, 0.2, 0.3, 0.4],
-  "trace": false
+  "inputs": {"input": [0.1, 0.2, 0.3, 0.4]}
 }
 ```
 
 ### 11.3 API implementation
 
-Use **FastAPI** in Python.
+FastAPI in Python, with Pydantic request/response models (`api/schemas.py`).
 
-Rationale:
+### 11.4 Future enhancements (not yet implemented)
 
-* quick iteration,
-* clean request/response models,
-* good fit with uv,
-* good enough for local development.
+* Optional `trace` flag on `/run` to return trace events in the response.
+* Raw trace export to JSON/CSV files for offline analysis.
 
 ---
 
 ## 12. Observability and debugging
 
-This project needs strong introspection or it will become opaque.
+### 12.1 Implemented diagnostics
 
-### 12.1 Required diagnostics in v1
+All of the following are implemented:
 
-* mesh layout dump,
-* region assignment dump,
-* route dump,
-* local SRAM usage by PE,
-* total message count,
-* per-route hop counts,
-* per-operator latency,
-* total inference latency,
-* output correctness comparison vs reference.
+* **Mesh layout dump** — `viz/dump.py`: ASCII mesh state visualization.
+* **SRAM usage by PE** — `viz/sram.py`: horizontal bar chart of per-PE float counts.
+* **PE utilization heatmap** — `viz/heatmap.py`: 2D heatmap colored by metric (tasks executed, messages sent, etc.).
+* **Route contention** — `viz/contention.py`: colored edges on 2D mesh grid showing message counts per link.
+* **Event timeline** — `viz/timeline.py`: scatter plot of events over logical time (X = timestamp, Y = PE index).
+* **Operator latency breakdown** — `viz/latency.py`: per-operator timing visualization.
+* **Queue depth analysis** — `viz/queue.py`: queue depth over time.
+* **Profiling counters** — per-PE counters for tasks executed, messages sent/received, hops. Exposed via PyO3 bridge.
+* **Trace events** — structured trace events collected during simulation, accessible via `SimResult.trace_events`.
+* **Numerical correctness** — reference implementations in `models/reference.py` for all supported operators.
 
-### 12.2 Nice-to-have diagnostics
+All visualization functions export to `artifacts/traces/` as PNG files.
 
-* timeline view of events,
-* heatmap of PE utilization,
-* queue occupancy histogram,
-* routing contention visualization,
-* step-by-step trace replay.
+### 12.2 Future enhancements (not yet implemented)
+
+* Step-by-step trace replay for interactive debugging.
+* Raw trace export to JSON/CSV files.
+* Golden/snapshot artifact tests that detect unintended compiler changes.
 
 ### 12.3 Debug philosophy
 
-Prefer plain data dumps first.
-
-Do not start with an elaborate UI. A few good machine-readable trace files plus small Python plotting helpers are enough.
+Plain data dumps and simple matplotlib visualizations. No elaborate UI. Machine-readable trace events plus Python plotting helpers.
 
 ---
 
 ## 13. Project structure
-
-Initial project structure:
 
 ```text
 meshflow/
 ├── pyproject.toml
 ├── uv.lock
 ├── README.md
-├── .python-version
 ├── rust-toolchain.toml
 ├── Cargo.toml
-├── Cargo.lock
+├── CLAUDE.md
 ├── crates/
 │   └── mesh_runtime/
 │       ├── Cargo.toml
 │       └── src/
-│           ├── lib.rs
-│           ├── mesh.rs
-│           ├── pe.rs
-│           ├── message.rs
-│           ├── route.rs
-│           ├── task.rs
-│           ├── event.rs
-│           ├── runtime.rs
-│           ├── artifact.rs
-│           └── profiling.rs
+│           ├── lib.rs                    # PyO3 module registration
+│           ├── bridge.rs                 # PyO3-exposed classes + run_program()
+│           ├── coords.rs                 # Coord, Direction enums
+│           ├── message.rs                # Message struct
+│           ├── pe.rs                     # PE, TaskConfig, TaskKind enum
+│           ├── mesh.rs                   # 2D PE mesh grid
+│           ├── route.rs                  # XY route generation
+│           ├── event.rs                  # Event queue (min-heap)
+│           ├── runtime.rs               # Simulator loop + task execution
+│           ├── program.rs               # Artifact deserialization
+│           ├── profiling.rs             # Counters, trace events, summaries
+│           └── compiler_test_helpers.rs # Test artifact builders
 ├── python/
 │   └── meshflow/
 │       ├── __init__.py
 │       ├── api/
-│       │   ├── __init__.py
-│       │   └── server.py
+│       │   ├── server.py                # FastAPI app + endpoints
+│       │   ├── schemas.py               # Pydantic request/response models
+│       │   └── store.py                 # Artifact file storage
 │       ├── compiler/
-│       │   ├── __init__.py
-│       │   ├── import_model.py
-│       │   ├── graph_ir.py
-│       │   ├── spatial_ir.py
-│       │   ├── route_ir.py
-│       │   ├── schedule_ir.py
-│       │   ├── placement.py
-│       │   ├── routing.py
-│       │   ├── scheduling.py
-│       │   ├── lowering.py
-│       │   └── artifact.py
+│       │   ├── __init__.py              # compile() entry point
+│       │   ├── config.py                # CompilerConfig
+│       │   ├── graph_ir.py              # GraphIR, Node, Edge, OpType
+│       │   ├── expanded_ir.py           # Operator groups + NodeExpansion
+│       │   ├── spatial_ir.py            # PlacedNode, PlacedEdge, PlacedNodeKind
+│       │   ├── schedule_ir.py           # Per-PE task entries + routes
+│       │   ├── artifact.py              # RuntimeProgram + serialize/deserialize
+│       │   └── passes/
+│       │       ├── expand.py            # GraphIR → ExpandedIR
+│       │       ├── place.py             # ExpandedIR → SpatialIR
+│       │       ├── route.py             # SpatialIR → ScheduleIR
+│       │       └── lower.py             # ScheduleIR → RuntimeProgram
 │       ├── models/
-│       │   ├── __init__.py
-│       │   ├── mlp.py
-│       │   └── reference.py
-│       ├── runtime/
-│       │   ├── __init__.py
-│       │   └── runner.py
+│       │   ├── reference.py             # Torch reference implementations
+│       │   └── transformer.py           # Transformer block model helper
 │       ├── tools/
-│       │   ├── __init__.py
-│       │   ├── compile_model.py
-│       │   ├── run_infer.py
-│       │   └── dump_trace.py
-│       ├── viz/
-│       │   ├── __init__.py
-│       │   ├── heatmap.py
-│       │   └── timeline.py
-│       └── utils/
-│           ├── __init__.py
-│           └── serialization.py
+│       │   └── inspect_artifact.py      # CLI to dump .msgpack as JSON
+│       └── viz/
+│           ├── dump.py                  # ASCII mesh state
+│           ├── heatmap.py               # PE utilization heatmaps
+│           ├── sram.py                  # SRAM usage visualization
+│           ├── contention.py            # Route contention analysis
+│           ├── latency.py               # Operator latency breakdown
+│           ├── queue.py                 # Queue depth analysis
+│           └── timeline.py              # Event timeline
 ├── tests/
 │   ├── python/
-│   │   ├── test_graph_ir.py
-│   │   ├── test_placement.py
-│   │   ├── test_routing.py
-│   │   ├── test_artifact_roundtrip.py
-│   │   ├── test_reference_mlp.py
-│   │   └── test_end_to_end_mlp.py
-│   └── rust/
-│       └── integration.rs
+│   │   ├── compiler/
+│   │   │   ├── test_graph_ir.py
+│   │   │   ├── test_expanded_ir.py
+│   │   │   ├── test_artifact.py
+│   │   │   ├── test_compile.py
+│   │   │   └── passes/
+│   │   │       ├── test_expand.py
+│   │   │       ├── test_place.py
+│   │   │       ├── test_route.py
+│   │   │       └── test_lower.py
+│   │   ├── runtime/
+│   │   │   ├── test_bridge.py
+│   │   │   ├── test_end_to_end.py
+│   │   │   ├── test_num_positions.py
+│   │   │   └── test_transformer_block.py
+│   │   ├── api/
+│   │   │   ├── test_store.py
+│   │   │   └── test_api.py
+│   │   └── viz/
+│   │       └── test_viz.py
+│   └── rust/                            # Rust tests are inline in src files
 ├── artifacts/
-│   ├── compiled/
-│   └── traces/
-└── scripts/
-    ├── dev.sh
-    ├── test.sh
-    └── lint.sh
+│   ├── compiled/                        # Generated .msgpack artifacts
+│   └── traces/                          # Generated visualization PNGs
+├── scripts/
+│   ├── test.sh
+│   └── lint.sh
+└── .ai/
+    ├── OVERALL_DESIGN.md                # This document
+    ├── specs/                           # Milestone specifications
+    │   ├── MILESTONE_1.md through MILESTONE_7.md
+    └── plans/                           # Implementation plans
 ```
 
 Notes:
 
-* `python/` contains the Python package.
-* `crates/mesh_runtime/` contains the Rust simulator core.
-* `artifacts/` stores generated compiled programs and traces.
-* `tests/python/` and `tests/rust/` keep test boundaries explicit.
+* `python/` contains the Python package. `crates/mesh_runtime/` contains the Rust simulator core.
+* `artifacts/` stores generated compiled programs and trace visualizations.
+* `tests/python/` uses subdirectories matching the package structure. Rust tests are inline in source files.
+* `.ai/` contains design documents and milestone specs.
 
 ---
 
@@ -684,55 +635,33 @@ Recommended approach:
 * use `uv run maturin develop` during local development,
 * use `uv run maturin build` when producing wheels or testing packaging.
 
-### 14.4 Recommended Python dependencies
+### 14.4 Python dependencies
 
-Core:
+Core (runtime):
 
-* `fastapi`
-* `uvicorn`
-* `pydantic`
-* `numpy`
-* `orjson`
+* `fastapi`, `uvicorn`, `pydantic` — API layer
+* `numpy` — tensor operations
+* `orjson` — fast JSON serialization
+* `msgpack` — artifact serialization
+* `matplotlib` — visualization
 
-Compiler / tooling:
+Dev:
 
-* `networkx` (optional, useful early for graph work)
-* `rich` (optional for dumps)
-* `typer` (optional for CLIs)
+* `pytest`, `pytest-cov` — testing
+* `ruff`, `mypy` — linting and type checking
+* `maturin` — Rust extension build
+* `torch` — numerical reference implementations
+* `httpx` — API test client
 
-Testing:
+### 14.5 Rust dependencies
 
-* `pytest`
-* `pytest-cov`
+* `pyo3` (0.23, extension-module) — Python bindings
+* `serde` (1, derive) — serialization framework
+* `rmp-serde` (1) — msgpack serialization
+* `serde_json` (1) — JSON support for tests/debugging
+* `thiserror` (2) — error types
 
-Linting / formatting:
-
-* `ruff`
-* `mypy`
-
-Build:
-
-* `maturin`
-
-Optional later:
-
-* `matplotlib` for simple visualization
-* `torch` only if we want PyTorch import and numerical reference support
-
-### 14.5 Recommended Rust dependencies
-
-Initial candidates:
-
-* `pyo3`
-* `serde`
-* `serde_json`
-* `thiserror`
-* `anyhow`
-* `smallvec`
-* `hashbrown`
-* `petgraph` only if it actually earns its keep
-
-Keep the Rust dependency set conservative.
+The Rust dependency set is intentionally minimal.
 
 ---
 
@@ -765,11 +694,10 @@ or
 uv run uvicorn meshflow.api.server:app --reload
 ```
 
-### 15.3 Running compiler tooling locally
+### 15.3 Inspecting a compiled artifact
 
 ```bash
-uv run python -m meshflow.tools.compile_model
-uv run python -m meshflow.tools.run_infer
+uv run python -m meshflow.tools.inspect_artifact artifacts/compiled/model.msgpack
 ```
 
 ### 15.4 Rebuilding Rust after changes
@@ -777,8 +705,6 @@ uv run python -m meshflow.tools.run_infer
 ```bash
 uv run maturin develop
 ```
-
-Later we can add a watcher, but this is enough initially.
 
 ---
 
@@ -831,25 +757,21 @@ cargo test -p mesh_runtime
 uv run pytest tests/python
 ```
 
-### 16.4 Golden tests
+### 16.4 Artifact tests
 
-We should add golden tests for compiled artifacts.
+Round-trip serialization tests verify that artifacts survive serialize/deserialize without loss. These cover all task types and SRAM configurations.
 
-Examples:
-
-* compile a tiny 2-layer MLP,
-* snapshot the emitted region layout and routes,
-* fail if a compiler change unexpectedly alters the artifact.
+Golden/snapshot tests (that fail on unintended compiler changes) are not yet implemented.
 
 ### 16.5 Numerical correctness tests
 
 For every supported operator and model:
 
-* run a reference Python implementation,
-* run the compiled simulator path,
-* compare outputs within a small tolerance.
+* run a reference Python/torch implementation (`models/reference.py`),
+* run the compiled simulator path (`compile()` + `run_program()`),
+* compare outputs within tolerance (`atol=1e-3` to `1e-4`).
 
-These tests are mandatory.
+Current coverage: LINEAR, ReLU, RMSNorm, Softmax, MatMul, Add, full MLP, full transformer block. All validated with multiple dimension configurations including non-divisible dimensions.
 
 ---
 
@@ -881,370 +803,102 @@ The project should stay readable as a systems artifact.
 
 ## 18. Milestones
 
-## Milestone 0: repository bootstrap
+## Milestone 0: repository bootstrap — COMPLETE
 
-### Objective
+Repo skeleton: `pyproject.toml` with uv, Cargo workspace with `mesh_runtime` crate, PyO3 + maturin wired up, basic package import, CI-ready test commands, README.
 
-Create the repo skeleton, dependency setup, and dev workflow.
+## Milestone 1: minimal mesh simulator — COMPLETE
 
-### Deliverables
+Rust runtime skeleton: PE and mesh data structures, message queues, deterministic XY routing, event loop, ForwardActivation + CollectOutput tasks, profiling counters.
 
-* `pyproject.toml` with uv-managed dependencies,
-* Cargo workspace and `mesh_runtime` crate,
-* PyO3 + maturin wired up,
-* basic package import works,
-* CI-ready test commands documented,
-* README with setup instructions.
+## Milestone 2: Graph IR and compiler skeleton — COMPLETE
 
-### Exit criteria
+Python compiler pipeline: GraphIR definitions, Expanded IR, Spatial IR, Schedule IR, artifact serialization (msgpack), round-trip tests.
 
-The following commands work:
+## Milestone 3: single LINEAR operator — COMPLETE
 
-```bash
-uv sync
-uv run maturin develop
-uv run python -c "import meshflow"
-cargo test -p mesh_runtime
-uv run pytest tests/python
-```
+Linear task in Rust with row-tiled weight distribution, ConcatCollect for fragment gathering, Python reference implementation, end-to-end compile → run → compare tests.
 
----
+## Milestone 4: multi-layer MLP pipeline — COMPLETE
 
-## Milestone 1: minimal mesh simulator
+ReLU fusion via ConcatCollectForward, column-per-layer placement, inter-layer routing, uneven tile distribution (remainder handling), 2- and 3-layer MLP execution with torch validation.
 
-### Objective
+## Milestone 5: inference API — COMPLETE
 
-Build the Rust runtime skeleton and a minimal event-driven mesh.
+FastAPI server with 5 endpoints (compile, run, artifacts, delete, health), Pydantic schemas, ArtifactStore for disk persistence, httpx-based API tests.
 
-### Deliverables
+## Milestone 6: observability and profiling — COMPLETE
 
-* PE and mesh data structures,
-* message queues,
-* deterministic routing on a 2D grid,
-* event loop,
-* a trivial task type such as `ForwardActivation`,
-* profiling counters for hops and events.
+Rust profiling enrichment (per-PE counters, trace events, operator timing), PyO3 bridge for profiling data, matplotlib visualization functions (heatmap, timeline, SRAM, contention, latency, queue depth).
 
-### Exit criteria
+## Milestone 7: single-head transformer block — COMPLETE
 
-* a message can enter one PE, traverse a route, and exit another PE,
-* route latency and hop counts are reported,
-* Rust unit tests cover the basic execution path.
+Six new Rust TaskKind variants (RmsNormPartialSum, RmsNormReduce, RmsNormNormalize, Softmax, MatMul, Add). Two-phase reduce-broadcast for RMSNorm. Row-parallel attention with co-located QK^T + Softmax + AV. Dual-trigger has_slot guard pattern for Add and MatMul. Skip connections via ForwardActivation payload_slot. Multi-position (seq_len > 1) support across all operators. Scatter/broadcast routing. Full end-to-end tests including non-divisible dimensions. See `.ai/specs/MILESTONE_7.md` for complete details.
 
 ---
 
-## Milestone 2: Graph IR and compiler skeleton
+## 19. Implementation order (completed)
 
-### Objective
+The actual implementation order followed the planned sequence:
 
-Build the Python-side compiler pipeline for a tiny MLP.
+1. Repo bootstrap (M0)
+2. Rust mesh and route primitives (M1)
+3. Python IR definitions + artifact format (M2)
+4. Linear operator execution (M3)
+5. Multi-layer MLP with ReLU (M4)
+6. API layer (M5)
+7. Profiling and visualization (M6)
+8. Transformer block operators (M7)
 
-### Deliverables
-
-* Graph IR definitions,
-* simple model import for a hand-authored MLP,
-* Spatial IR,
-* naive rectangular placement,
-* Route IR generation,
-* artifact serialization.
-
-### Exit criteria
-
-* a tiny MLP can be compiled into a serialized artifact,
-* layout, routing, and weight placement dumps are inspectable,
-* artifact round-trip tests pass.
+The first working vertical slice was kept extremely small (single message forwarding), then expanded incrementally.
 
 ---
 
-## Milestone 3: first real operator execution
+## 20. Risks and mitigations (retrospective)
 
-### Objective
+### 20.1 Simulator realism
 
-Execute a real linear layer on the mesh.
+Risk: making the simulator too realistic too early. Mitigation: coarse timing model, deterministic XY routing, event-driven (not cycle-accurate). This held — the timing model remains simple and the routing is fully deterministic.
 
-### Deliverables
+### 20.2 Artifact boundary stability
 
-* `Linear` operator task implementation in Rust,
-* PE-local weight storage,
-* input activation delivery,
-* output fragment generation,
-* Python reference implementation for comparison.
+Risk: compiler and runtime co-evolving without a stable artifact boundary. Mitigation: versioned artifact format defined early, round-trip serialization tests, msgpack format. The artifact format has been stable since M2 with backward-compatible additions via `#[serde(default)]`.
 
-### Exit criteria
+### 20.3 Python/Rust boundary
 
-* simulator output for one linear layer matches Python reference within tolerance,
-* profiling reports at least operator latency and message counts,
-* end-to-end test covers compile -> load -> run -> compare.
+Risk: chatty and awkward boundary. Mitigation: pass whole compiled artifacts, keep the simulator loop entirely in Rust, return summary data. This held — the boundary is `compile()` (Python) → `serialize()` → `run_program()` (Rust) → `SimResult` (Python).
 
 ---
 
-## Milestone 4: multi-layer MLP pipeline
+## 21. Design decisions (resolved)
 
-### Objective
+These were open questions at design time, now resolved:
 
-Support a sequence of linear and activation operators across multiple mesh regions.
-
-### Deliverables
-
-* `ReLU` task implementation,
-* multi-region execution,
-* inter-layer activation routing,
-* end-to-end compiled MLP execution,
-* correctness and trace tests.
-
-### Exit criteria
-
-* a 2- or 3-layer MLP runs end to end,
-* outputs match the reference model,
-* activation flow across the mesh is visible in dumps or trace files.
+* **Batch size**: Started with 1, now supports `num_positions > 1` (seq_len). Multi-position support was added during M7 for attention.
+* **Routes**: Explicit hop lists, pre-computed by the compiler. Stored per-task, not generated at runtime.
+* **Artifact format**: msgpack (binary), not JSON. Fast serialization, compact, versioned.
+* **Model definitions**: Hand-authored GraphIR via model helpers (`transformer_block()`, direct `GraphIR` construction for MLPs). No PyTorch import.
+* **Tensor representation**: Dense fragments everywhere. No fragment views.
 
 ---
 
-## Milestone 5: inference API
+## 22. Definition of done for v1
 
-### Objective
+All of the following are true:
 
-Expose the engine through a small HTTP API.
+* a small MLP compiles into a spatial artifact — **done**,
+* the Rust simulator loads the artifact and executes it — **done**,
+* weights are resident in PE-local memory — **done**,
+* activations traverse explicit routes across the mesh — **done**,
+* outputs match a Python reference implementation — **done** (MLP + transformer block),
+* the system is callable through an HTTP API — **done**,
+* traces and profiling are sufficient to explain the run — **done**,
+* the repo has repeatable setup, lint, and test commands — **done**.
 
-### Deliverables
-
-* FastAPI server,
-* model loading,
-* `POST /v1/infer`,
-* optional trace flag,
-* basic health endpoint,
-* local manual integration test.
-
-### Exit criteria
-
-* a client can send an input tensor and receive output from the simulator,
-* trace mode returns useful execution metadata,
-* API tests pass.
+Additionally: a single-head transformer block (beyond the original v1 scope) compiles and executes correctly with RMSNorm, attention, FFN, and residual connections.
 
 ---
 
-## Milestone 6: observability and profiling
+## 23. Current status
 
-### Objective
-
-Make the system explain itself.
-
-### Deliverables
-
-* per-PE memory usage dump,
-* route heatmap data,
-* per-operator latency summary,
-* event timeline export,
-* Python helper scripts to visualize results.
-
-### Exit criteria
-
-* a run produces enough artifacts to explain performance bottlenecks,
-* simple visualizations can be generated locally,
-* debugging a bad route or placement decision is practical.
-
----
-
-## Milestone 7: richer operator set or tiny decoder block
-
-### Objective
-
-Extend beyond the MLP once the core architecture is stable.
-
-### Deliverables
-
-One of the following paths:
-
-1. add residual/add/norm support, or
-2. implement a tiny decoder block with simplified attention.
-
-### Exit criteria
-
-* the system supports at least one architecture more interesting than an MLP,
-* the compiler remains comprehensible,
-* tests continue to cover numerical correctness.
-
----
-
-## 19. Suggested implementation order inside milestones
-
-Within the milestones above, the likely coding order should be:
-
-1. repo bootstrap,
-2. Rust mesh and route primitives,
-3. Python IR definitions,
-4. artifact format,
-5. one simple message-forwarding end-to-end path,
-6. linear operator execution,
-7. multi-layer MLP,
-8. API layer,
-9. traces and visualization,
-10. richer ops.
-
-This is important. The first working vertical slice should be extremely small.
-
----
-
-## 20. Risks
-
-### 20.1 Biggest technical risk
-
-The main risk is trying to make the simulator too realistic too early.
-
-Mitigation:
-
-* keep the timing model coarse,
-* keep routing deterministic,
-* keep the operator set tiny.
-
-### 20.2 Biggest project risk
-
-The main project risk is letting the compiler and runtime co-evolve without a stable artifact boundary.
-
-Mitigation:
-
-* define the compiled artifact format early,
-* add round-trip and golden tests,
-* version the artifact format if needed.
-
-### 20.3 Another risk
-
-The Python/Rust boundary could become chatty and awkward.
-
-Mitigation:
-
-* pass whole compiled artifacts, not tiny callbacks,
-* keep the simulator loop entirely in Rust,
-* return summary data rather than per-event Python objects by default.
-
----
-
-## 21. Open questions
-
-These do not block Milestone 0 or 1.
-
-* Should batch size be fixed to 1 initially, or should we support a tiny microbatch abstraction from the start?
-* Should routes be stored explicitly as hop lists, or generated from source/sink coordinates at load time?
-* Should the artifact format be human-readable JSON first, or a binary format from the beginning?
-* How much PyTorch support do we want in the importer, versus hand-authored model definitions?
-* Should we represent tensors densely everywhere, or introduce fragment views early?
-
-Recommended answers for now:
-
-* batch size 1,
-* explicit routes for easier debugging,
-* JSON + binary blobs,
-* hand-authored models first,
-* dense fragments first.
-
----
-
-## 22. Initial `pyproject.toml` shape
-
-This is illustrative rather than final.
-
-```toml
-[project]
-name = "meshflow"
-version = "0.1.0"
-description = "Cerebras-inspired spatial inference engine"
-readme = "README.md"
-requires-python = ">=3.12"
-dependencies = [
-  "fastapi>=0.115",
-  "uvicorn>=0.30",
-  "pydantic>=2.8",
-  "numpy>=2.0",
-  "orjson>=3.10",
-]
-
-[dependency-groups]
-dev = [
-  "pytest>=8.0",
-  "pytest-cov>=5.0",
-  "ruff>=0.6",
-  "mypy>=1.11",
-  "maturin>=1.7",
-]
-
-[build-system]
-requires = ["maturin>=1.7,<2.0"]
-build-backend = "maturin"
-
-[tool.maturin]
-module-name = "meshflow._mesh_runtime"
-python-source = "python"
-manifest-path = "crates/mesh_runtime/Cargo.toml"
-
-[tool.ruff]
-line-length = 100
-
-[tool.pytest.ini_options]
-testpaths = ["tests/python"]
-```
-
-We can refine this once the actual packaging path is wired up.
-
----
-
-## 23. Initial scripts
-
-### `scripts/test.sh`
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-cargo test -p mesh_runtime
-uv run pytest tests/python
-```
-
-### `scripts/lint.sh`
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-uv run ruff check python tests
-uv run ruff format --check python tests
-uv run mypy python/meshflow
-cargo fmt --check
-cargo clippy -p mesh_runtime -- -D warnings
-```
-
-### `scripts/dev.sh`
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-uv sync
-uv run maturin develop
-uv run uvicorn meshflow.api.server:app --reload
-```
-
----
-
-## 24. Definition of done for v1
-
-Meshflow v1 is done when all of the following are true:
-
-* a small MLP can be compiled into a spatial artifact,
-* the Rust simulator loads the artifact and executes it,
-* weights are resident in PE-local memory,
-* activations traverse explicit routes across the mesh,
-* outputs match a Python reference implementation,
-* the system is callable through an HTTP API,
-* traces and profiling are sufficient to explain the run,
-* the repo has repeatable setup, lint, and test commands.
-
----
-
-## 25. Next step
-
-The immediate next step after approving this design doc is:
-
-**Implement Milestone 0 and Milestone 1 only.**
-
-Do not start by importing real models.
-Do not start by adding attention.
-Do not start by polishing the API.
-
-The first concrete target is a tiny Rust mesh runtime that can route and deliver activation messages, plus a Python package skeleton that can compile a trivial graph into a loadable artifact.
+91 Rust tests, 252 Python tests, all passing. All lints clean. Milestones 0–7 complete.

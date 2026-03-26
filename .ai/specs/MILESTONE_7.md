@@ -279,7 +279,7 @@ All TaskKind variants have serde-compatible Display strings: `"rms_norm_reduce"`
 
 ---
 
-## Model Helper — NOT YET IMPLEMENTED (CP5)
+## Model Helper — COMPLETE (CP5)
 
 ### `python/meshflow/models/transformer.py`
 
@@ -287,7 +287,7 @@ All TaskKind variants have serde-compatible Display strings: `"rms_norm_reduce"`
 def transformer_block(seq_len: int, d_model: int, d_ff: int, eps: float = 1e-6) -> GraphIR:
 ```
 
-Constructs the full transformer block GraphIR with all nodes and edges:
+Constructs the full transformer block GraphIR with 16 nodes and 19 edges:
 - FORWARD node (input)
 - RMSNorm1 node (pre-attention normalization)
 - Q/K/V LINEAR projection nodes
@@ -299,23 +299,23 @@ Constructs the full transformer block GraphIR with all nodes and edges:
 - Add2 (residual: FFN output + Add1 output)
 - COLLECT node (output)
 
-Edge connectivity must match the block structure diagram. Self-attention: Q/K/V projections all receive the same input (RMSNorm1 output). Skip connections carry data from FORWARD→Add1 and Add1→Add2.
+Edge connectivity matches the block structure diagram. Self-attention: Q/K/V projections all receive the same input (RMSNorm1 output). Skip connections carry data from FORWARD→Add1 (dst_slot=1) and Add1→Add2 (dst_slot=1).
 
 ```python
-def transformer_weights(seq_len: int, d_model: int, d_ff: int) -> dict[str, Any]:
+def transformer_weights(d_model: int, d_ff: int, seed: int = 0) -> dict[str, dict[str, np.ndarray]]:
 ```
 
-Returns a dict of all required weights keyed by node ID: Q/K/V/output projection matrices (d_model × d_model) and biases, FFN1 matrix (d_model × d_ff) and bias, FFN2 matrix (d_ff × d_model) and bias, two RMSNorm gamma vectors (d_model).
+Returns weights keyed by node ID with Xavier-like initialization: Q/K/V/output projection matrices (d_model × d_model) and zero biases, FFN1 matrix (d_model × d_ff) and zero bias, FFN2 matrix (d_ff × d_model) and zero bias, two RMSNorm gamma vectors (ones, d_model). The `seed` parameter controls the random number generator for reproducible tests.
 
 ### `python/meshflow/models/reference.py`
 
 Extended with a torch reference for the transformer block:
 
 ```python
-def reference_transformer_block(x: np.ndarray, weights: dict, seq_len: int, d_model: int, d_ff: int, eps: float = 1e-6) -> np.ndarray:
+def reference_transformer_block(x: torch.Tensor, weights: dict[str, dict[str, Any]], eps: float = 1e-6) -> torch.Tensor:
 ```
 
-Runs the equivalent computation using existing `reference_linear()` and `reference_rmsnorm()` plus torch attention math, returns expected output for numerical validation.
+Runs the equivalent computation using existing `reference_linear()` and `reference_rmsnorm()` plus torch attention math (`Q @ K.T → softmax → @ V`). Dimensions are inferred from tensor shapes — no redundant `seq_len`/`d_model`/`d_ff` parameters. A `_to_tensor()` helper converts numpy weight arrays to torch tensors on the fly.
 
 ---
 
@@ -331,25 +331,22 @@ Runs the equivalent computation using existing `reference_linear()` and `referen
 - **Add**: Element-wise addition, has_slot guard, slot consumption, dual-trigger pattern.
 - **ConcatCollect**: fragment_rows-based num_positions inference, row-major → position-major transpose.
 
-### Python end-to-end tests — PARTIALLY COMPLETE
+### Python end-to-end tests — COMPLETE
 
-Existing tests in `tests/python/runtime/test_num_positions.py`:
+Per-operator tests in `tests/python/runtime/test_num_positions.py`:
 - `TestBatchedLinear`: Identity 2-position, torch-validated 2-position.
 - `TestMultiPositionRmsNorm`: Single position, two positions — compared against `reference_rmsnorm()`.
 - `TestAttentionMatMulChain`: seq_len=1 identity projections, seq_len=4 torch-validated.
 
-**Still needed (CP5)**:
-- `test_transformer_block_basic`: seq_len=4, d_model=8, d_ff=16. Full block with RMSNorm + attention + FFN + residual. Compare against torch reference. Tolerance: `atol=1e-4`.
-- `test_transformer_block_identity_weights`: Identity-like weights for analytically predictable output.
-- `test_residual_passthrough`: Verify residual connections preserve skip input correctly.
+Full transformer block tests in `tests/python/runtime/test_transformer_block.py`:
+- `test_residual_passthrough`: Zero weights → output equals input. Validates skip connections preserve input through both Add1 and Add2.
+- `test_basic_with_torch_validation`: seq_len=4, d_model=8, d_ff=16. Random weights, compared against `reference_transformer_block()`. Tolerance: `atol=1e-3`.
+- `test_small_dimensions`: seq_len=2, d_model=4, d_ff=8. Smaller dimensions for fast debugging.
+- `test_non_divisible_dimensions`: seq_len=3, d_model=7, d_ff=11, mesh_height=5. Nothing divides evenly — exercises remainder logic in tile distribution, ConcatCollect fragment handling, and RMSNorm slicing.
 
-### Profiling validation
+### Profiling validation (deferred)
 
-Run the transformer block through M6 visualization tools. Verify:
-- All new operators appear in the event timeline.
-- Operator latency chart shows meaningful data for new task kinds.
-- PE heatmap reflects the wider mesh usage.
-- Route contention shows broadcast patterns.
+The transformer block can be run through M6 visualization tools to verify new operators appear in the event timeline, operator latency chart, PE heatmap, and route contention visualization. Not yet formally validated.
 
 ---
 
