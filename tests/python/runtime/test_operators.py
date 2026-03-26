@@ -8,7 +8,8 @@ from meshflow.compiler import CompilerConfig, compile
 from meshflow.compiler.artifact import serialize
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
 from meshflow.models.mlp import mlp_block, mlp_weights
-from meshflow.models.reference import reference_mlp, reference_rmsnorm
+from meshflow.models.reference import reference_mlp, reference_rmsnorm, reference_transformer_block
+from meshflow.models.transformer import transformer_block, transformer_weights
 
 
 def _run_graph(
@@ -206,4 +207,196 @@ class TestRmsNorm:
         assert torch.allclose(actual, expected, atol=1e-4), (
             f"non-divisible RmsNorm mismatch:\ngot      {actual}\nexpected {expected}\n"
             f"diff={actual - expected}"
+        )
+
+
+class TestSoftmax:
+    """End-to-end tests for SOFTMAX via a transformer block attention chain.
+
+    Softmax is tested through the attention chain because the route pass only generates
+    co-located Softmax tasks within attention chains.
+    """
+
+    def test_softmax_in_attention_chain(self) -> None:
+        """seq_len=2, d_model=4, d_ff=8 — full transformer block matches reference."""
+        seq_len = 2
+        d_model = 4
+        d_ff = 8
+        eps = 1e-6
+
+        graph = transformer_block(seq_len, d_model, d_ff, eps)
+        weights = transformer_weights(d_model, d_ff, seed=5)
+
+        torch.manual_seed(17)
+        x = torch.randn(seq_len, d_model)
+
+        output = _run_graph(
+            graph,
+            weights,
+            mesh_height=6,
+            inputs={"input": x.flatten().tolist()},
+        )
+
+        expected = reference_transformer_block(x, weights, eps)
+        actual = torch.tensor(output).reshape(seq_len, d_model)
+
+        assert torch.allclose(actual, expected, atol=1e-3), (
+            f"softmax attention chain mismatch:\ngot\n{actual}\nexpected\n{expected}\n"
+            f"diff=\n{actual - expected}"
+        )
+
+    def test_softmax_numerical_stability(self) -> None:
+        """Scale Q/K weights by 100x — verify no NaN/Inf and match reference within atol=1e-2."""
+        seq_len = 2
+        d_model = 4
+        d_ff = 8
+        eps = 1e-6
+
+        graph = transformer_block(seq_len, d_model, d_ff, eps)
+        weights = transformer_weights(d_model, d_ff, seed=5)
+
+        # Scale up Q and K projection weights to produce large attention scores
+        weights["q_proj"]["weight"] = (weights["q_proj"]["weight"] * 100.0).astype(np.float32)
+        weights["k_proj"]["weight"] = (weights["k_proj"]["weight"] * 100.0).astype(np.float32)
+
+        torch.manual_seed(17)
+        x = torch.randn(seq_len, d_model)
+
+        output = _run_graph(
+            graph,
+            weights,
+            mesh_height=6,
+            inputs={"input": x.flatten().tolist()},
+        )
+
+        actual = torch.tensor(output).reshape(seq_len, d_model)
+
+        assert not torch.any(torch.isnan(actual)), f"NaN detected in output: {actual}"
+        assert not torch.any(torch.isinf(actual)), f"Inf detected in output: {actual}"
+
+        expected = reference_transformer_block(x, weights, eps)
+        assert torch.allclose(actual, expected, atol=1e-2), (
+            f"softmax numerical stability mismatch:\ngot\n{actual}\nexpected\n{expected}\n"
+            f"diff=\n{actual - expected}"
+        )
+
+
+class TestAdd:
+    """End-to-end tests for a standalone ADD graph: two FORWARD nodes → ADD → COLLECT."""
+
+    @staticmethod
+    def _make_add_graph() -> GraphIR:
+        """Build a minimal two-input ADD GraphIR."""
+        return GraphIR(
+            nodes=[
+                Node(id="input_a", op=OpType.FORWARD),
+                Node(id="input_b", op=OpType.FORWARD),
+                Node(id="add", op=OpType.ADD),
+                Node(id="output", op=OpType.COLLECT),
+            ],
+            edges=[
+                Edge(src_node="input_a", src_slot=0, dst_node="add", dst_slot=0),
+                Edge(src_node="input_b", src_slot=0, dst_node="add", dst_slot=1),
+                Edge(src_node="add", src_slot=0, dst_node="output", dst_slot=0),
+            ],
+        )
+
+    def test_basic(self) -> None:
+        """[1,2,3,4] + [10,20,30,40] = [11,22,33,44]."""
+        a = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        b = torch.tensor([10.0, 20.0, 30.0, 40.0])
+
+        graph = self._make_add_graph()
+        output = _run_graph(
+            graph, weights={}, inputs={"input_a": a.tolist(), "input_b": b.tolist()}
+        )
+
+        expected = a + b
+        actual = torch.tensor(output)
+
+        assert torch.allclose(actual, expected), (
+            f"basic ADD mismatch:\ngot      {actual}\nexpected {expected}\ndiff={actual - expected}"
+        )
+
+    def test_multi_position(self) -> None:
+        """8-element vectors added element-wise."""
+        torch.manual_seed(55)
+        a = torch.randn(8)
+        b = torch.randn(8)
+
+        graph = self._make_add_graph()
+        output = _run_graph(
+            graph, weights={}, inputs={"input_a": a.tolist(), "input_b": b.tolist()}
+        )
+
+        expected = a + b
+        actual = torch.tensor(output)
+
+        assert torch.allclose(actual, expected), (
+            f"multi-position ADD mismatch:\ngot      {actual}\nexpected {expected}\n"
+            f"diff={actual - expected}"
+        )
+
+
+class TestMatMul:
+    """End-to-end tests for MATMUL via a transformer block attention chain.
+
+    MatMul is tested through the attention chain because standalone MATMUL routing
+    is not supported; the route pass only generates MatMul tasks within attention chains.
+    """
+
+    def test_attention_matmul_small(self) -> None:
+        """seq_len=2, d_model=4, d_ff=8 — transformer block with small dimensions."""
+        seq_len = 2
+        d_model = 4
+        d_ff = 8
+        eps = 1e-6
+
+        graph = transformer_block(seq_len, d_model, d_ff, eps)
+        weights = transformer_weights(d_model, d_ff, seed=3)
+
+        torch.manual_seed(41)
+        x = torch.randn(seq_len, d_model)
+
+        output = _run_graph(
+            graph,
+            weights,
+            mesh_height=6,
+            inputs={"input": x.flatten().tolist()},
+        )
+
+        expected = reference_transformer_block(x, weights, eps)
+        actual = torch.tensor(output).reshape(seq_len, d_model)
+
+        assert torch.allclose(actual, expected, atol=1e-3), (
+            f"attention matmul small mismatch:\ngot\n{actual}\nexpected\n{expected}\n"
+            f"diff=\n{actual - expected}"
+        )
+
+    def test_attention_matmul_larger(self) -> None:
+        """seq_len=4, d_model=8, d_ff=16 — transformer block with larger dimensions."""
+        seq_len = 4
+        d_model = 8
+        d_ff = 16
+        eps = 1e-6
+
+        graph = transformer_block(seq_len, d_model, d_ff, eps)
+        weights = transformer_weights(d_model, d_ff, seed=9)
+
+        torch.manual_seed(61)
+        x = torch.randn(seq_len, d_model)
+
+        output = _run_graph(
+            graph,
+            weights,
+            mesh_height=6,
+            inputs={"input": x.flatten().tolist()},
+        )
+
+        expected = reference_transformer_block(x, weights, eps)
+        actual = torch.tensor(output).reshape(seq_len, d_model)
+
+        assert torch.allclose(actual, expected, atol=1e-3), (
+            f"attention matmul larger mismatch:\ngot\n{actual}\nexpected\n{expected}\n"
+            f"diff=\n{actual - expected}"
         )
