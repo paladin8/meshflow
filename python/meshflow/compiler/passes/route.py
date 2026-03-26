@@ -180,6 +180,10 @@ def _route_xy(
                     if all_attn and all_q_slot:
                         use_scatter = True
 
+                # Apply broadcast detection for non-scatter routes
+                if not use_scatter:
+                    collect_routes = _try_linear_broadcast(node.coord, collect_routes)
+
                 for i in range(collect.num_fragments):
                     frag_offset = i * base + min(i, remainder)
                     tile_rows = base + 1 if i < remainder else base
@@ -346,6 +350,8 @@ def _route_rmsnorm_tile(
                     )
                 )
 
+    normalize_routes = _try_linear_broadcast(node.coord, normalize_routes)
+
     pe_tasks[node.coord].append(
         RmsNormNormalizeEntry(
             trigger_slot=1,
@@ -395,6 +401,8 @@ def _route_rmsnorm_reduce(
                         payload_slot=1,
                     )
                 )
+
+    reduce_routes = _try_linear_broadcast(node.coord, reduce_routes)
 
     # Generate one RmsNormReduceEntry per partial sum slot
     for i in range(reduce.num_tiles):
@@ -482,6 +490,8 @@ def _route_attention_pe(
                         )
                     )
 
+        av_routes = _try_linear_broadcast(node.coord, av_routes)
+
         # Two TaskConfig entries: trigger on V (slot 2) and softmax output (slot 4)
         for trigger in [v_slot, softmax_output_slot]:
             pe_tasks[node.coord].append(
@@ -530,6 +540,8 @@ def _route_add(
                 )
             )
 
+    add_routes = _try_linear_broadcast(node.coord, add_routes)
+
     # Generate one AddEntry per input slot. The runtime has_slot guard
     # ensures only the second trigger (when both inputs are present) computes.
     for trigger_slot in [input_slot_a, input_slot_b]:
@@ -542,6 +554,126 @@ def _route_add(
                 routes=add_routes,
             )
         )
+
+
+def _try_linear_broadcast(
+    source_coord: tuple[int, int],
+    dests: list[BroadcastRoute],
+) -> list[BroadcastRoute]:
+    """Detect column-aligned broadcasts and collapse into 1-2 broadcast routes.
+
+    If all destinations share the same X coordinate and the same payload_slot,
+    we can replace N point-to-point routes with 1 or 2 broadcast routes (one
+    per Y-direction from the column entry point).  Each broadcast route carries
+    ``deliver_at`` indices so that intermediate PEs along the path copy the
+    payload into their local SRAM.
+
+    Returns the (possibly optimised) route list.
+    """
+    # 1. Single destination — nothing to optimise
+    if len(dests) <= 1:
+        return dests
+
+    # 2. All destinations must share the same X coordinate
+    dest_xs = {d.dest[0] for d in dests}
+    if len(dest_xs) != 1:
+        return dests
+
+    # 3. All destinations must share the same payload_slot
+    slots = {d.payload_slot for d in dests}
+    if len(slots) != 1:
+        return dests
+
+    dest_x = dest_xs.pop()
+    payload_slot = slots.pop()
+    src_x, src_y = source_coord
+
+    # Determine the column entry point.  If source is already in the target
+    # column, the entry point is the source itself; otherwise we route
+    # horizontally first and the entry Y is the source Y in the target column.
+    entry_y = src_y  # Y coordinate when we arrive at dest_x column
+
+    # Count horizontal hops needed to reach the target column
+    x_hops: list[Direction] = []
+    cx = src_x
+    while cx != dest_x:
+        if dest_x > cx:
+            x_hops.append(Direction.EAST)
+            cx += 1
+        else:
+            x_hops.append(Direction.WEST)
+            cx -= 1
+
+    # Partition destinations into north / south groups relative to entry_y.
+    # Destinations at entry_y itself are "same-Y" and get 0 Y-hops.
+    north: list[tuple[int, int]] = []  # (x, y) with y > entry_y
+    south: list[tuple[int, int]] = []  # (x, y) with y < entry_y
+    same: list[tuple[int, int]] = []  # y == entry_y
+
+    for d in dests:
+        dy = d.dest[1]
+        if dy > entry_y:
+            north.append(d.dest)
+        elif dy < entry_y:
+            south.append(d.dest)
+        else:
+            same.append(d.dest)
+
+    result: list[BroadcastRoute] = []
+
+    def _build_broadcast(
+        group: list[tuple[int, int]],
+        direction: Direction,
+    ) -> BroadcastRoute:
+        """Build one BroadcastRoute for a uni-directional column group."""
+        # Sort by distance from entry_y (ascending)
+        if direction == Direction.NORTH:
+            group.sort(key=lambda c: c[1])  # ascending Y
+        else:
+            group.sort(key=lambda c: -c[1])  # descending Y (closest first)
+
+        farthest = group[-1]
+        y_distance = abs(farthest[1] - entry_y)
+        y_hops: list[Direction] = [direction] * y_distance
+        hops = list(x_hops) + y_hops
+
+        # deliver_at: hop indices for all destinations *except* the farthest
+        # (farthest is the final dest of the message).
+        x_offset = len(x_hops)
+        deliver_at: list[int] = []
+        for coord in group[:-1]:
+            y_dist = abs(coord[1] - entry_y)
+            hop_idx = x_offset + y_dist
+            deliver_at.append(hop_idx)
+
+        return BroadcastRoute(
+            dest=farthest,
+            hops=hops,
+            deliver_at=deliver_at,
+            payload_slot=payload_slot,
+        )
+
+    # Handle same-Y destinations (source column entry = destination)
+    # These are unusual but handle gracefully: wrap into the nearest group
+    # or emit a standalone if no directional groups exist.
+    if same and not north and not south:
+        # All destinations are at the entry_y — each is 0 Y-hops from source.
+        # Just return point-to-point (no broadcast gain).
+        return dests
+
+    # Merge same-Y destinations into whichever group exists, preferring north
+    if same:
+        if north:
+            north = same + north
+        elif south:
+            south = same + south
+
+    if north:
+        result.append(_build_broadcast(north, Direction.NORTH))
+    if south:
+        result.append(_build_broadcast(south, Direction.SOUTH))
+
+    return result
 
 
 def _generate_route_xy(src: tuple[int, int], dst: tuple[int, int]) -> list[Direction]:

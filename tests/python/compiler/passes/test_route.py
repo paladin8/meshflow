@@ -358,10 +358,14 @@ class TestMultiLayerRouting:
             assert task.num_fragments == 3
             assert task.total_rows == 6
             assert task.activation == "relu"
-            # Routes to l2 tile PEs at (1, 0), (1, 1), (1, 2)
-            assert len(task.routes) == 3
-            dest_coords = [r.dest for r in task.routes]
-            assert dest_coords == [(1, 0), (1, 1), (1, 2)]
+            # Broadcast detection: 3 destinations at X=1, same payload_slot
+            # collapses to 1 broadcast route from (0,3) south to (1,0)
+            # with deliver_at for (1,2) and (1,1).
+            assert len(task.routes) == 1
+            r = task.routes[0]
+            assert r.dest == (1, 0)
+            assert r.payload_slot == 0
+            assert r.deliver_at == [2, 3]
 
     def test_terminal_collect_has_concat_tasks(self) -> None:
         graph = self._make_mlp_graph()
@@ -377,7 +381,7 @@ class TestMultiLayerRouting:
             assert task.kind == "concat_collect"
 
     def test_inter_layer_route_hops(self) -> None:
-        """Route from l1 collect (0,3) to l2 tiles: east then south."""
+        """Route from l1 collect (0,3) to l2 tiles: broadcast east then south."""
         graph = self._make_mlp_graph()
         config = CompilerConfig(mesh_height=4)
         expanded = expand(graph, config)
@@ -388,20 +392,14 @@ class TestMultiLayerRouting:
         task = l1_collect.tasks[0]
         assert isinstance(task, ConcatCollectForwardEntry)
 
-        # (0,3) → (1,0): 1 east, 3 south
-        r0 = task.routes[0]
-        assert r0.dest == (1, 0)
-        assert r0.hops == [Direction.EAST, Direction.SOUTH, Direction.SOUTH, Direction.SOUTH]
-
-        # (0,3) → (1,1): 1 east, 2 south
-        r1 = task.routes[1]
-        assert r1.dest == (1, 1)
-        assert r1.hops == [Direction.EAST, Direction.SOUTH, Direction.SOUTH]
-
-        # (0,3) → (1,2): 1 east, 1 south
-        r2 = task.routes[2]
-        assert r2.dest == (1, 2)
-        assert r2.hops == [Direction.EAST, Direction.SOUTH]
+        # Broadcast detection collapses 3 routes into 1 broadcast:
+        # (0,3) → (1,0): 1 east, 3 south, delivering at (1,2) and (1,1)
+        assert len(task.routes) == 1
+        r = task.routes[0]
+        assert r.dest == (1, 0)
+        assert r.hops == [Direction.EAST, Direction.SOUTH, Direction.SOUTH, Direction.SOUTH]
+        # deliver_at: (1,2) at hop 2, (1,1) at hop 3
+        assert r.deliver_at == [2, 3]
 
     def test_only_first_layer_has_input_slots(self) -> None:
         graph = self._make_mlp_graph()
@@ -550,10 +548,14 @@ class TestRmsNormRouting:
             assert task.num_tiles == 4
             assert task.feature_count == 4
             assert abs(task.eps - 1e-6) < 1e-10
-            # routes should point back to the 4 tile PEs (each with payload_slot=1)
-            assert len(task.routes) == 4
-            for r in task.routes:
-                assert r.payload_slot == 1
+            # Broadcast detection: 4 tile PEs at (1,0)-(1,3) all share X=1,
+            # payload_slot=1. Collapses to 1 broadcast route from (1,4) south
+            # to (1,0) with deliver_at for (1,3), (1,2), (1,1).
+            assert len(task.routes) == 1
+            r = task.routes[0]
+            assert r.dest == (1, 0)
+            assert r.payload_slot == 1
+            assert r.deliver_at == [1, 2, 3]
 
     def test_rmsnorm_gamma_in_sram(self) -> None:
         graph = self._make_rmsnorm_graph()
