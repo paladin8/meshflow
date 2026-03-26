@@ -24,6 +24,7 @@ from meshflow.compiler.schedule_ir import (
 from meshflow.compiler.spatial_ir import (
     PlacedAttentionPeData,
     PlacedCollectData,
+    PlacedEdge,
     PlacedNode,
     PlacedNodeKind,
     PlacedRmsNormReduceData,
@@ -31,6 +32,32 @@ from meshflow.compiler.spatial_ir import (
     PlacedTileData,
     SpatialIR,
 )
+
+
+def _outgoing_edges(spatial: SpatialIR, node_id: str) -> list[PlacedEdge]:
+    """Return all edges originating from a given node."""
+    return [e for e in spatial.edges if e.src_node == node_id]
+
+
+def _load_linear_weights(
+    pe_sram: dict[tuple[int, int], dict[int, list[float]]],
+    coord: tuple[int, int],
+    weights: dict[str, dict[str, np.ndarray]] | None,
+    origin_id: str,
+    fragment_offset: int,
+    tile_rows: int,
+    weight_slot: int = 1,
+    bias_slot: int = 2,
+) -> None:
+    """Load weight and bias tiles into a PE's SRAM slots."""
+    if weights is None or origin_id not in weights:
+        return
+    w = weights[origin_id]["weight"]
+    b = weights[origin_id]["bias"]
+    pe_sram[coord][weight_slot] = (
+        w[fragment_offset : fragment_offset + tile_rows, :].flatten().tolist()
+    )
+    pe_sram[coord][bias_slot] = b[fragment_offset : fragment_offset + tile_rows].flatten().tolist()
 
 
 def route(
@@ -63,7 +90,7 @@ def _route_xy(
 
     for node in spatial.nodes:
         if node.kind == PlacedNodeKind.FORWARD:
-            outgoing = [e for e in spatial.edges if e.src_node == node.id]
+            outgoing = _outgoing_edges(spatial, node.id)
             if not outgoing:
                 continue
             # Generate one ForwardActivationEntry per outgoing edge (broadcast)
@@ -83,7 +110,7 @@ def _route_xy(
         elif node.kind == PlacedNodeKind.LINEAR_TILE:
             assert isinstance(node.data, PlacedTileData)
             tile = node.data
-            outgoing = [e for e in spatial.edges if e.src_node == node.id]
+            outgoing = _outgoing_edges(spatial, node.id)
             if not outgoing:
                 raise ValueError(f"LINEAR tile node {node.id!r} has no outgoing edge")
             collect_node = node_map[outgoing[0].dst_node]
@@ -105,28 +132,21 @@ def _route_xy(
             )
 
             # Weight/bias SRAM
-            if weights is not None and tile.origin_id in weights:
-                w = weights[tile.origin_id]["weight"]
-                b = weights[tile.origin_id]["bias"]
-                weight_tile = (
-                    w[tile.fragment_offset : tile.fragment_offset + tile.tile_rows, :]
-                    .flatten()
-                    .tolist()
-                )
-                bias_tile = (
-                    b[tile.fragment_offset : tile.fragment_offset + tile.tile_rows]
-                    .flatten()
-                    .tolist()
-                )
-                pe_sram[node.coord][1] = weight_tile
-                pe_sram[node.coord][2] = bias_tile
+            _load_linear_weights(
+                pe_sram,
+                node.coord,
+                weights,
+                tile.origin_id,
+                tile.fragment_offset,
+                tile.tile_rows,
+            )
 
         elif node.kind == PlacedNodeKind.LINEAR_COLLECT:
             assert isinstance(node.data, PlacedCollectData)
             collect = node.data
 
             # Determine intermediate vs terminal from explicit outgoing edges
-            outgoing = [e for e in spatial.edges if e.src_node == node.id]
+            outgoing = _outgoing_edges(spatial, node.id)
             is_intermediate = len(outgoing) > 0
 
             base = collect.total_rows // collect.num_fragments
