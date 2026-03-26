@@ -12,6 +12,7 @@ class MeshProgramConfig:
     height: int
     hop_latency: int = 1
     task_base_latency: int = 1
+    cost_per_element: int = 1
     max_events: int = 100_000
 
 

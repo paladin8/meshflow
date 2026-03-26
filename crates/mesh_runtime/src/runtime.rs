@@ -15,6 +15,7 @@ pub struct SimConfig {
     pub height: u32,
     pub hop_latency: u64,
     pub task_base_latency: u64,
+    pub cost_per_element: u64,
     pub max_events: u64,
 }
 
@@ -25,6 +26,7 @@ impl Default for SimConfig {
             height: 4,
             hop_latency: 1,
             task_base_latency: 1,
+            cost_per_element: 1,
             max_events: 100_000,
         }
     }
@@ -91,6 +93,12 @@ impl Simulator {
             max_pending: HashMap::new(),
             config,
         }
+    }
+
+    /// Compute task execution cost: fixed overhead + work-proportional cost.
+    #[allow(dead_code)]
+    fn task_cost(&self, elements: u64) -> u64 {
+        self.config.task_base_latency + elements * self.config.cost_per_element
     }
 
     /// Configure a task on a PE. Hop lists for ForwardActivation tasks

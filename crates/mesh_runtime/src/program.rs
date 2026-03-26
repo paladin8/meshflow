@@ -27,7 +27,13 @@ struct MeshProgramConfig {
     height: u32,
     hop_latency: u64,
     task_base_latency: u64,
+    #[serde(default = "default_cost_per_element")]
+    cost_per_element: u64,
     max_events: u64,
+}
+
+fn default_cost_per_element() -> u64 {
+    1
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +239,7 @@ pub fn load_program(bytes: &[u8]) -> Result<LoadedProgram, ProgramError> {
         height,
         hop_latency: program.mesh_config.hop_latency,
         task_base_latency: program.mesh_config.task_base_latency,
+        cost_per_element: program.mesh_config.cost_per_element,
         max_events: program.mesh_config.max_events,
     };
 

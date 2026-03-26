@@ -26,18 +26,21 @@ pub struct MeshConfig {
     #[pyo3(get, set)]
     pub task_base_latency: u64,
     #[pyo3(get, set)]
+    pub cost_per_element: u64,
+    #[pyo3(get, set)]
     pub max_events: u64,
 }
 
 #[pymethods]
 impl MeshConfig {
     #[new]
-    #[pyo3(signature = (width, height, hop_latency=1, task_base_latency=1, max_events=100_000))]
+    #[pyo3(signature = (width, height, hop_latency=1, task_base_latency=1, cost_per_element=1, max_events=100_000))]
     fn new(
         width: u32,
         height: u32,
         hop_latency: u64,
         task_base_latency: u64,
+        cost_per_element: u64,
         max_events: u64,
     ) -> Self {
         Self {
@@ -45,6 +48,7 @@ impl MeshConfig {
             height,
             hop_latency,
             task_base_latency,
+            cost_per_element,
             max_events,
         }
     }
@@ -57,6 +61,7 @@ impl From<&MeshConfig> for SimConfig {
             height: cfg.height,
             hop_latency: cfg.hop_latency,
             task_base_latency: cfg.task_base_latency,
+            cost_per_element: cfg.cost_per_element,
             max_events: cfg.max_events,
         }
     }
