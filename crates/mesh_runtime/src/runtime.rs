@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::coords::Coord;
+use crate::coords::{Coord, Direction};
 use crate::event::{EventKind, EventQueue};
 use crate::mesh::Mesh;
 use crate::message::{Message, SlotId};
@@ -351,21 +351,9 @@ impl Simulator {
                 pe.counters.messages_sent += 1;
                 self.profile.total_tasks_executed += 1;
 
-                let message = Message {
-                    id: self.next_message_id,
-                    source: coord,
-                    dest: route_dest,
-                    hops,
-                    current_hop: 0,
-                    payload: data,
-                    payload_slot,
-                    timestamp,
-                };
-                self.next_message_id += 1;
-
                 // Enqueue at current PE — the event loop will forward or
                 // deliver locally depending on whether hops is empty.
-                self.enqueue_deliver(timestamp, coord, coord, message);
+                self.emit_message(timestamp, coord, route_dest, hops, data, payload_slot);
             }
             TaskKind::CollectOutput { input_slot } => {
                 let pe = self.mesh.pe_mut(coord);
@@ -414,19 +402,7 @@ impl Simulator {
                     }
                 }
 
-                let message = Message {
-                    id: self.next_message_id,
-                    source: coord,
-                    dest: route_dest,
-                    hops,
-                    current_hop: 0,
-                    payload: y,
-                    payload_slot: fragment_slot,
-                    timestamp,
-                };
-                self.next_message_id += 1;
-
-                self.enqueue_deliver(timestamp, coord, coord, message);
+                self.emit_message(timestamp, coord, route_dest, hops, y, fragment_slot);
             }
             TaskKind::ConcatCollect {
                 num_fragments,
@@ -480,46 +456,25 @@ impl Simulator {
                     }
 
                     // Send to next layer's tile PEs with send serialization.
-                    let num_sends = route_dests.len() as u64;
-                    self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
-
+                    let base_time = timestamp + self.config.task_base_latency;
                     if scatter && !route_dests.is_empty() {
                         // Scatter: send row i to destination i
-                        let row_size = result.len() / route_dests.len();
-                        for (i, (dest, hops)) in route_dests.iter().enumerate() {
-                            let send_time = timestamp + self.config.task_base_latency + i as u64;
-                            let row = result[i * row_size..(i + 1) * row_size].to_vec();
-                            let message = Message {
-                                id: self.next_message_id,
-                                source: coord,
-                                dest: *dest,
-                                hops: hops.clone(),
-                                current_hop: 0,
-                                payload: row,
-                                payload_slot: payload_slots.get(i).copied().unwrap_or(0),
-                                timestamp: send_time,
-                            };
-                            self.next_message_id += 1;
-                            self.enqueue_deliver(send_time, coord, coord, message);
-                        }
+                        self.scatter_to_dests(
+                            base_time,
+                            coord,
+                            &route_dests,
+                            &payload_slots,
+                            &result,
+                        );
                     } else {
                         // Broadcast: send full result to all destinations
-                        for (i, (dest, hops)) in route_dests.iter().enumerate() {
-                            let send_time = timestamp + self.config.task_base_latency + i as u64;
-                            let slot = payload_slots.get(i).copied().unwrap_or(0);
-                            let message = Message {
-                                id: self.next_message_id,
-                                source: coord,
-                                dest: *dest,
-                                hops: hops.clone(),
-                                current_hop: 0,
-                                payload: result.clone(),
-                                payload_slot: slot,
-                                timestamp: send_time,
-                            };
-                            self.next_message_id += 1;
-                            self.enqueue_deliver(send_time, coord, coord, message);
-                        }
+                        self.broadcast_to_dests(
+                            base_time,
+                            coord,
+                            &route_dests,
+                            &payload_slots,
+                            result,
+                        );
                     }
                 }
             }
@@ -561,25 +516,8 @@ impl Simulator {
                 // Route to destinations
                 let output_dests = output_dests.clone();
                 let payload_slots = payload_slots.clone();
-                let num_sends = output_dests.len() as u64;
-                self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
-
-                for (i, (dest, hops)) in output_dests.iter().enumerate() {
-                    let send_time = timestamp + self.config.task_base_latency + i as u64;
-                    let slot = payload_slots.get(i).copied().unwrap_or(0);
-                    let message = Message {
-                        id: self.next_message_id,
-                        source: coord,
-                        dest: *dest,
-                        hops: hops.clone(),
-                        current_hop: 0,
-                        payload: result.clone(),
-                        payload_slot: slot,
-                        timestamp: send_time,
-                    };
-                    self.next_message_id += 1;
-                    self.enqueue_deliver(send_time, coord, coord, message);
-                }
+                let base_time = timestamp + self.config.task_base_latency;
+                self.broadcast_to_dests(base_time, coord, &output_dests, &payload_slots, result);
             }
             TaskKind::Softmax {
                 input_slot,
@@ -648,25 +586,8 @@ impl Simulator {
                 let payload_slots = payload_slots.clone();
 
                 // Route to destinations
-                let num_sends = output_dests.len() as u64;
-                self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
-
-                for (i, (dest, hops)) in output_dests.iter().enumerate() {
-                    let send_time = timestamp + self.config.task_base_latency + i as u64;
-                    let slot = payload_slots.get(i).copied().unwrap_or(0);
-                    let message = Message {
-                        id: self.next_message_id,
-                        source: coord,
-                        dest: *dest,
-                        hops: hops.clone(),
-                        current_hop: 0,
-                        payload: result.clone(),
-                        payload_slot: slot,
-                        timestamp: send_time,
-                    };
-                    self.next_message_id += 1;
-                    self.enqueue_deliver(send_time, coord, coord, message);
-                }
+                let base_time = timestamp + self.config.task_base_latency;
+                self.broadcast_to_dests(base_time, coord, &output_dests, &payload_slots, result);
             }
             TaskKind::RmsNormPartialSum {
                 input_slot,
@@ -718,18 +639,14 @@ impl Simulator {
 
                 // Send partial sum(s) to reduce PE
                 let reduce_hops = reduce_hops.clone();
-                let message = Message {
-                    id: self.next_message_id,
-                    source: coord,
-                    dest: reduce_dest,
-                    hops: reduce_hops,
-                    current_hop: 0,
-                    payload,
-                    payload_slot: partial_sum_slot,
+                self.emit_message(
                     timestamp,
-                };
-                self.next_message_id += 1;
-                self.enqueue_deliver(timestamp, coord, coord, message);
+                    coord,
+                    reduce_dest,
+                    reduce_hops,
+                    payload,
+                    partial_sum_slot,
+                );
             }
             TaskKind::RmsNormNormalize {
                 input_slot,
@@ -796,25 +713,8 @@ impl Simulator {
                 // Route to destinations
                 let output_dests = output_dests.clone();
                 let payload_slots = payload_slots.clone();
-                let num_sends = output_dests.len() as u64;
-                self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
-
-                for (i, (dest, hops)) in output_dests.iter().enumerate() {
-                    let send_time = timestamp + self.config.task_base_latency + i as u64;
-                    let slot = payload_slots.get(i).copied().unwrap_or(0);
-                    let message = Message {
-                        id: self.next_message_id,
-                        source: coord,
-                        dest: *dest,
-                        hops: hops.clone(),
-                        current_hop: 0,
-                        payload: result.clone(),
-                        payload_slot: slot,
-                        timestamp: send_time,
-                    };
-                    self.next_message_id += 1;
-                    self.enqueue_deliver(send_time, coord, coord, message);
-                }
+                let base_time = timestamp + self.config.task_base_latency;
+                self.broadcast_to_dests(base_time, coord, &output_dests, &payload_slots, result);
             }
             TaskKind::RmsNormReduce {
                 num_tiles,
@@ -881,25 +781,79 @@ impl Simulator {
 
                 // Broadcast scale factor(s) to all tile PEs
                 let tile_dests = tile_dests.clone();
-                let num_sends = tile_dests.len() as u64;
-                self.mesh.pe_mut(coord).counters.messages_sent += num_sends;
-
-                for (i, (dest, hops)) in tile_dests.iter().enumerate() {
-                    let send_time = timestamp + self.config.task_base_latency + i as u64;
-                    let message = Message {
-                        id: self.next_message_id,
-                        source: coord,
-                        dest: *dest,
-                        hops: hops.clone(),
-                        current_hop: 0,
-                        payload: scales.clone(),
-                        payload_slot: scale_slot,
-                        timestamp: send_time,
-                    };
-                    self.next_message_id += 1;
-                    self.enqueue_deliver(send_time, coord, coord, message);
-                }
+                let uniform_slots = vec![scale_slot; tile_dests.len()];
+                let base_time = timestamp + self.config.task_base_latency;
+                self.broadcast_to_dests(base_time, coord, &tile_dests, &uniform_slots, scales);
             }
+        }
+    }
+
+    /// Create and enqueue a single outbound message from `source` to `dest`.
+    /// Increments `next_message_id` and calls `enqueue_deliver` on the source PE.
+    fn emit_message(
+        &mut self,
+        timestamp: u64,
+        source: Coord,
+        dest: Coord,
+        hops: Vec<Direction>,
+        payload: Vec<f32>,
+        payload_slot: SlotId,
+    ) {
+        let message = Message {
+            id: self.next_message_id,
+            source,
+            dest,
+            hops,
+            current_hop: 0,
+            payload,
+            payload_slot,
+            timestamp,
+        };
+        self.next_message_id += 1;
+        self.enqueue_deliver(timestamp, source, source, message);
+    }
+
+    /// Broadcast `payload` (cloned) to every destination in `dests`, one message
+    /// per destination.  The `messages_sent` counter on `coord` is incremented
+    /// by `dests.len()`.  Send times are serialised: `base_time + i`.
+    fn broadcast_to_dests(
+        &mut self,
+        base_time: u64,
+        coord: Coord,
+        dests: &[(Coord, Vec<Direction>)],
+        payload_slots: &[SlotId],
+        payload: Vec<f32>,
+    ) {
+        self.mesh.pe_mut(coord).counters.messages_sent += dests.len() as u64;
+        for (i, (dest, hops)) in dests.iter().enumerate() {
+            let send_time = base_time + i as u64;
+            let slot = payload_slots.get(i).copied().unwrap_or(0);
+            self.emit_message(send_time, coord, *dest, hops.clone(), payload.clone(), slot);
+        }
+    }
+
+    /// Scatter `result` across `dests`: row `i` (of length `result.len() /
+    /// dests.len()`) goes to `dests[i]`.  The `messages_sent` counter on
+    /// `coord` is incremented by `dests.len()`.  Send times are serialised:
+    /// `base_time + i`.  No-ops when `dests` is empty.
+    fn scatter_to_dests(
+        &mut self,
+        base_time: u64,
+        coord: Coord,
+        dests: &[(Coord, Vec<Direction>)],
+        payload_slots: &[SlotId],
+        result: &[f32],
+    ) {
+        if dests.is_empty() {
+            return;
+        }
+        let row_size = result.len() / dests.len();
+        self.mesh.pe_mut(coord).counters.messages_sent += dests.len() as u64;
+        for (i, (dest, hops)) in dests.iter().enumerate() {
+            let send_time = base_time + i as u64;
+            let row = result[i * row_size..(i + 1) * row_size].to_vec();
+            let slot = payload_slots.get(i).copied().unwrap_or(0);
+            self.emit_message(send_time, coord, *dest, hops.clone(), row, slot);
         }
     }
 
