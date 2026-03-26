@@ -888,3 +888,38 @@ class TestBroadcastDetection:
             assert r.deliver_at == [], (
                 f"non-column routes should have empty deliver_at, got {r.deliver_at}"
             )
+
+    def test_bidirectional_broadcast(self) -> None:
+        """Destinations on both sides of the source produce 2 broadcast routes.
+
+        Source at (0, 2), destinations at (0, 0), (0, 1), (0, 3), (0, 4).
+        Expected: 2 routes — one South (to (0,0) via (0,1)) and one North
+        (to (0,4) via (0,3)).
+        """
+        dests = [
+            BroadcastRoute(dest=(0, 0), hops=[], deliver_at=[], payload_slot=1),
+            BroadcastRoute(dest=(0, 1), hops=[], deliver_at=[], payload_slot=1),
+            BroadcastRoute(dest=(0, 3), hops=[], deliver_at=[], payload_slot=1),
+            BroadcastRoute(dest=(0, 4), hops=[], deliver_at=[], payload_slot=1),
+        ]
+        result = _try_linear_broadcast((0, 2), dests)
+
+        assert len(result) == 2, f"expected 2 broadcast routes, got {len(result)}: {result}"
+
+        # Sort by dest Y to identify South vs North route
+        south = [r for r in result if r.dest[1] < 2]
+        north = [r for r in result if r.dest[1] > 2]
+        assert len(south) == 1, f"expected 1 South route, got {len(south)}"
+        assert len(north) == 1, f"expected 1 North route, got {len(north)}"
+
+        # South route: dest=(0,0), delivers at (0,1) intermediate
+        assert south[0].dest == (0, 0)
+        assert len(south[0].deliver_at) == 1, (
+            f"South route should have 1 intermediate delivery, got {south[0].deliver_at}"
+        )
+
+        # North route: dest=(0,4), delivers at (0,3) intermediate
+        assert north[0].dest == (0, 4)
+        assert len(north[0].deliver_at) == 1, (
+            f"North route should have 1 intermediate delivery, got {north[0].deliver_at}"
+        )
