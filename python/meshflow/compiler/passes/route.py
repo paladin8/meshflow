@@ -1,5 +1,7 @@
 """Routing pass — generates concrete hop lists and flattens to per-PE schedules."""
 
+from collections import defaultdict
+
 import numpy as np
 
 from meshflow.compiler.config import CompilerConfig, RoutingStrategy
@@ -560,40 +562,51 @@ def _try_linear_broadcast(
     source_coord: tuple[int, int],
     dests: list[BroadcastRoute],
 ) -> list[BroadcastRoute]:
-    """Detect column-aligned broadcasts and collapse into 1-2 broadcast routes.
+    """Detect column-aligned broadcasts and collapse into broadcast routes.
 
-    If all destinations share the same X coordinate and the same payload_slot,
-    we can replace N point-to-point routes with 1 or 2 broadcast routes (one
-    per Y-direction from the column entry point).  Each broadcast route carries
-    ``deliver_at`` indices so that intermediate PEs along the path copy the
-    payload into their local SRAM.
+    Groups destinations by ``(dest_x, payload_slot)`` and applies column
+    broadcast within each group.  Each group that has 2+ destinations in the
+    same column with the same payload_slot is replaced by 1-2 broadcast routes
+    (one per Y-direction from the column entry point).  Groups with only 1
+    destination are left as point-to-point.
 
     Returns the (possibly optimised) route list.
     """
-    # 1. Single destination — nothing to optimise
     if len(dests) <= 1:
         return dests
 
-    # 2. All destinations must share the same X coordinate
-    dest_xs = {d.dest[0] for d in dests}
-    if len(dest_xs) != 1:
-        return dests
+    # Group by (dest_x, payload_slot)
+    groups: dict[tuple[int, int], list[BroadcastRoute]] = defaultdict(list)
+    for d in dests:
+        key = (d.dest[0], d.payload_slot)
+        groups[key].append(d)
 
-    # 3. All destinations must share the same payload_slot
-    slots = {d.payload_slot for d in dests}
-    if len(slots) != 1:
-        return dests
+    result: list[BroadcastRoute] = []
+    for (dest_x, payload_slot), group_dests in groups.items():
+        if len(group_dests) == 1:
+            result.extend(group_dests)
+            continue
+        result.extend(_broadcast_single_column(source_coord, dest_x, payload_slot, group_dests))
 
-    dest_x = dest_xs.pop()
-    payload_slot = slots.pop()
+    return result
+
+
+def _broadcast_single_column(
+    source_coord: tuple[int, int],
+    dest_x: int,
+    payload_slot: int,
+    dests: list[BroadcastRoute],
+) -> list[BroadcastRoute]:
+    """Build 1-2 broadcast routes for destinations in a single column.
+
+    All destinations must share the same X coordinate (dest_x) and
+    payload_slot.  Partitions into north/south groups relative to the
+    column entry point and builds a broadcast route per direction.
+    """
     src_x, src_y = source_coord
-
-    # Determine the column entry point.  If source is already in the target
-    # column, the entry point is the source itself; otherwise we route
-    # horizontally first and the entry Y is the source Y in the target column.
     entry_y = src_y  # Y coordinate when we arrive at dest_x column
 
-    # Count horizontal hops needed to reach the target column
+    # Horizontal hops to reach the target column
     x_hops: list[Direction] = []
     cx = src_x
     while cx != dest_x:
@@ -604,11 +617,10 @@ def _try_linear_broadcast(
             x_hops.append(Direction.WEST)
             cx -= 1
 
-    # Partition destinations into north / south groups relative to entry_y.
-    # Destinations at entry_y itself are "same-Y" and get 0 Y-hops.
-    north: list[tuple[int, int]] = []  # (x, y) with y > entry_y
-    south: list[tuple[int, int]] = []  # (x, y) with y < entry_y
-    same: list[tuple[int, int]] = []  # y == entry_y
+    # Partition into north / south / same-Y
+    north: list[tuple[int, int]] = []
+    south: list[tuple[int, int]] = []
+    same: list[tuple[int, int]] = []
 
     for d in dests:
         dy = d.dest[1]
@@ -619,26 +631,31 @@ def _try_linear_broadcast(
         else:
             same.append(d.dest)
 
-    result: list[BroadcastRoute] = []
+    if same and not north and not south:
+        return dests
+
+    # Merge same-Y destinations into whichever group exists, preferring north
+    if same:
+        if north:
+            north = same + north
+        elif south:
+            south = same + south
 
     def _build_broadcast(
         group: list[tuple[int, int]],
         direction: Direction,
     ) -> BroadcastRoute:
         """Build one BroadcastRoute for a uni-directional column group."""
-        # Sort by distance from entry_y (ascending)
         if direction == Direction.NORTH:
-            group.sort(key=lambda c: c[1])  # ascending Y
+            group.sort(key=lambda c: c[1])
         else:
-            group.sort(key=lambda c: -c[1])  # descending Y (closest first)
+            group.sort(key=lambda c: -c[1])
 
         farthest = group[-1]
         y_distance = abs(farthest[1] - entry_y)
         y_hops: list[Direction] = [direction] * y_distance
         hops = list(x_hops) + y_hops
 
-        # deliver_at: hop indices for all destinations *except* the farthest
-        # (farthest is the final dest of the message).
         x_offset = len(x_hops)
         deliver_at: list[int] = []
         for coord in group[:-1]:
@@ -653,21 +670,7 @@ def _try_linear_broadcast(
             payload_slot=payload_slot,
         )
 
-    # Handle same-Y destinations (source column entry = destination)
-    # These are unusual but handle gracefully: wrap into the nearest group
-    # or emit a standalone if no directional groups exist.
-    if same and not north and not south:
-        # All destinations are at the entry_y — each is 0 Y-hops from source.
-        # Just return point-to-point (no broadcast gain).
-        return dests
-
-    # Merge same-Y destinations into whichever group exists, preferring north
-    if same:
-        if north:
-            north = same + north
-        elif south:
-            south = same + south
-
+    result: list[BroadcastRoute] = []
     if north:
         result.append(_build_broadcast(north, Direction.NORTH))
     if south:

@@ -870,10 +870,10 @@ class TestBroadcastDetection:
         )
 
     def test_non_column_fallback(self) -> None:
-        """Destinations in different columns cannot be collapsed into a broadcast.
+        """Single destinations per column are returned as point-to-point.
 
-        _try_linear_broadcast must return N separate routes with empty deliver_at
-        when destinations have different X coordinates.
+        When each column has only one destination, no broadcast is possible
+        within any group — each route is returned with empty deliver_at.
         """
         dests = [
             BroadcastRoute(dest=(1, 0), hops=[], deliver_at=[], payload_slot=0),
@@ -882,11 +882,11 @@ class TestBroadcastDetection:
         ]
         result = _try_linear_broadcast((0, 0), dests)
 
-        # Should be returned unchanged (3 separate routes, no broadcast)
+        # Each column has only 1 dest, so all remain point-to-point
         assert len(result) == 3, f"expected 3 separate routes, got {len(result)}"
         for r in result:
             assert r.deliver_at == [], (
-                f"non-column routes should have empty deliver_at, got {r.deliver_at}"
+                f"single-dest-per-column routes should have empty deliver_at, got {r.deliver_at}"
             )
 
     def test_bidirectional_broadcast(self) -> None:
@@ -923,3 +923,50 @@ class TestBroadcastDetection:
         assert len(north[0].deliver_at) == 1, (
             f"North route should have 1 intermediate delivery, got {north[0].deliver_at}"
         )
+
+    def test_multi_column_broadcast_grouping(self) -> None:
+        """Destinations across multiple columns produce one broadcast per column.
+
+        Source at (0, 3), destinations in columns 1, 2, 3 with 3 tiles each.
+        Expected: 3 broadcast routes (one per column), each delivering to ~3 tiles.
+        """
+        dests = []
+        for col in [1, 2, 3]:
+            for row in [0, 1, 2]:
+                dests.append(
+                    BroadcastRoute(dest=(col, row), hops=[], deliver_at=[], payload_slot=0)
+                )
+        result = _try_linear_broadcast((0, 3), dests)
+
+        # 3 groups (one per column), each collapsed into 1 broadcast route
+        assert len(result) == 3, f"expected 3 broadcast routes, got {len(result)}: {result}"
+        for r in result:
+            assert len(r.deliver_at) > 0, (
+                f"each multi-dest column should broadcast, got deliver_at={r.deliver_at}"
+            )
+        # Each route should target a different column
+        dest_xs = {r.dest[0] for r in result}
+        assert dest_xs == {1, 2, 3}, f"expected routes to columns 1,2,3, got {dest_xs}"
+
+    def test_multi_column_mixed_slots(self) -> None:
+        """Different payload_slots in the same column produce separate groups.
+
+        2 destinations in column 1 with slot=0, 2 destinations in column 1 with slot=1.
+        Expected: 2 broadcast routes (one per payload_slot).
+        """
+        dests = [
+            BroadcastRoute(dest=(1, 0), hops=[], deliver_at=[], payload_slot=0),
+            BroadcastRoute(dest=(1, 1), hops=[], deliver_at=[], payload_slot=0),
+            BroadcastRoute(dest=(1, 2), hops=[], deliver_at=[], payload_slot=1),
+            BroadcastRoute(dest=(1, 3), hops=[], deliver_at=[], payload_slot=1),
+        ]
+        result = _try_linear_broadcast((0, 0), dests)
+
+        # 2 groups: (x=1, slot=0) and (x=1, slot=1)
+        assert len(result) == 2, f"expected 2 broadcast routes, got {len(result)}: {result}"
+        slots = {r.payload_slot for r in result}
+        assert slots == {0, 1}, f"expected routes with slots 0 and 1, got {slots}"
+        for r in result:
+            assert len(r.deliver_at) > 0, (
+                f"each 2-dest group should broadcast, got deliver_at={r.deliver_at}"
+            )
