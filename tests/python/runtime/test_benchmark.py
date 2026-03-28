@@ -68,22 +68,22 @@ class TestSmallConfig:
         cls.program, cls.result = _run_config(4, 8, 16, 6)
 
     def test_mesh_width(self):
-        assert self.program.mesh_config.width <= 13
+        assert self.program.mesh_config.width <= 12  # Phase 2: 13 -> 12
 
     def test_total_messages(self):
         assert self.result.total_messages <= 114
 
     def test_total_hops(self):
-        assert self.result.total_hops <= 331
+        assert self.result.total_hops <= 271  # Phase 1: 331 -> 271
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 737
+        assert self.result.final_timestamp <= 730  # Phase 1: 737 -> 730
 
     def test_max_sends(self):
-        assert _max_sends(self.result) <= 30
+        assert _max_sends(self.result) <= 11  # Phase 1: 30 -> 11
 
     def test_max_queue_depth(self):
-        assert _max_queue_depth(self.result) <= 15
+        assert _max_queue_depth(self.result) <= 5  # Phase 1: 15 -> 5
 
     def test_max_hops_per_route(self):
         _, _, max_hops = _route_stats(self.program)
@@ -98,19 +98,19 @@ class TestMediumConfig:
         cls.program, cls.result = _run_config(8, 16, 32, 8)
 
     def test_mesh_width(self):
-        assert self.program.mesh_config.width <= 13
+        assert self.program.mesh_config.width <= 12  # Phase 2: 13 -> 12
 
     def test_total_messages(self):
         assert self.result.total_messages <= 170
 
     def test_total_hops(self):
-        assert self.result.total_hops <= 602
+        assert self.result.total_hops <= 488  # Phase 1+2: 602 -> 488
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 3095
+        assert self.result.final_timestamp <= 3086  # Phase 1+2: 3095 -> 3086
 
     def test_max_sends(self):
-        assert _max_sends(self.result) <= 42
+        assert _max_sends(self.result) <= 19  # Phase 1: 42 -> 19
 
     def test_max_queue_depth(self):
-        assert _max_queue_depth(self.result) <= 21
+        assert _max_queue_depth(self.result) <= 8  # Phase 1: 21 -> 8

@@ -566,3 +566,86 @@ class TestAddPlacement:
         assert len(add_edges) == 2
         src_nodes = {e.src_node for e in add_edges}
         assert src_nodes == {"a", "b"}
+
+
+class TestCompactPlacement:
+    """Tests for the _compact_columns pass that merges single-PE groups."""
+
+    def test_compact_single_pe_merged(self) -> None:
+        """Single-PE groups (ADD, COLLECT) merge into adjacent columns."""
+        # FORWARD → LINEAR(4→4) → ADD → COLLECT
+        # Groups: FORWARD(col0), LINEAR(col1), ADD(col2), COLLECT(col3)
+        # ADD should merge into LINEAR's column, COLLECT into ADD's (now LINEAR's)
+        graph = GraphIR(
+            nodes=[
+                Node(id="input", op=OpType.FORWARD),
+                Node(id="linear", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 4}),
+                Node(id="add", op=OpType.ADD),
+                Node(id="output", op=OpType.COLLECT),
+            ],
+            edges=[
+                Edge(src_node="input", src_slot=0, dst_node="linear", dst_slot=0),
+                Edge(src_node="input", src_slot=0, dst_node="add", dst_slot=1),
+                Edge(src_node="linear", src_slot=0, dst_node="add", dst_slot=0),
+                Edge(src_node="add", src_slot=0, dst_node="output", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig(mesh_height=6)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+
+        # Without compaction: 4 columns (FORWARD, LINEAR, ADD, COLLECT)
+        # With compaction: ADD and COLLECT should merge, reducing width
+        assert spatial.width < 4, f"expected compact width < 4, got {spatial.width}"
+
+        # Verify no coordinate conflicts
+        coords = [n.coord for n in spatial.nodes]
+        assert len(coords) == len(set(coords)), "coordinate conflict detected"
+
+    def test_compact_preserves_multi_pe_columns(self) -> None:
+        """Tiled groups keep their own columns and are never merge candidates."""
+        graph = GraphIR(
+            nodes=[
+                Node(id="input", op=OpType.FORWARD),
+                Node(id="linear", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 4}),
+                Node(id="output", op=OpType.COLLECT),
+            ],
+            edges=[
+                Edge(src_node="input", src_slot=0, dst_node="linear", dst_slot=0),
+                Edge(src_node="linear", src_slot=0, dst_node="output", dst_slot=0),
+            ],
+        )
+        config = CompilerConfig(mesh_height=6)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+
+        # LINEAR group has multiple PEs (tiles + collect) — must keep its own column
+        linear_nodes = [n for n in spatial.nodes if n.kind == PlacedNodeKind.LINEAR_TILE]
+        linear_cols = {n.coord[0] for n in linear_nodes}
+        assert len(linear_cols) == 1, "linear tiles should all be in one column"
+
+        # That column should contain only LINEAR nodes (tiles + collect)
+        linear_col = linear_cols.pop()
+        col_nodes = [n for n in spatial.nodes if n.coord[0] == linear_col]
+        for n in col_nodes:
+            assert n.kind in (
+                PlacedNodeKind.LINEAR_TILE,
+                PlacedNodeKind.LINEAR_COLLECT,
+                PlacedNodeKind.COLLECT_SIMPLE,  # output may merge into this column
+            ), f"unexpected {n.kind} in linear column"
+
+    def test_compact_no_coordinate_conflicts(self) -> None:
+        """No two PEs end up at the same coordinate after compaction."""
+        from meshflow.models.transformer import transformer_block
+
+        for sl, dm, df, mh in [(4, 8, 16, 6), (8, 16, 32, 8)]:
+            graph = transformer_block(sl, dm, df)
+            config = CompilerConfig(mesh_height=mh)
+            expanded = expand(graph, config)
+            spatial = place(expanded, config)
+
+            coords = [n.coord for n in spatial.nodes]
+            assert len(coords) == len(set(coords)), (
+                f"coordinate conflict in ({sl},{dm},{df},mh={mh}): "
+                f"{len(coords)} nodes but {len(set(coords))} unique coords"
+            )

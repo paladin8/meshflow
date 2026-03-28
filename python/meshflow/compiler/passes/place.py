@@ -116,7 +116,10 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
     # Generate inter-group edges from original GraphIR edges + node expansions
     placed_edges.extend(_generate_inter_group_edges(expanded, node_pe_map))
 
-    width = col if col > 0 else 1
+    # Compact placement: merge single-PE groups into adjacent columns
+    placed_nodes, max_column_height = _compact_columns(placed_nodes, max_column_height)
+
+    width = max((n.coord[0] for n in placed_nodes), default=0) + 1
     height = max_column_height if max_column_height > 0 else 1
     if config.mesh_height is not None and height < config.mesh_height:
         height = config.mesh_height
@@ -128,6 +131,100 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
         edges=placed_edges,
         node_pe_map=node_pe_map,
     )
+
+
+_SINGLE_PE_KINDS = {
+    PlacedNodeKind.FORWARD,
+    PlacedNodeKind.COLLECT_SIMPLE,
+    PlacedNodeKind.ADD,
+    PlacedNodeKind.SOFTMAX,
+}
+
+
+def _compact_columns(nodes: list[PlacedNode], max_height: int) -> tuple[list[PlacedNode], int]:
+    """Merge single-PE columns into their preceding column where space allows.
+
+    A single-PE group at column C can merge into column C-1 if C-1 has a free
+    row.  Column 0 is never a merge candidate (no preceding column).  Multi-PE
+    groups are never candidates.  After merging, gaps in the X coordinate space
+    are closed so the mesh width shrinks.
+
+    Returns the updated node list and the (possibly unchanged) max column height.
+    """
+    # Build column -> set of occupied rows
+    col_rows: dict[int, set[int]] = {}
+    for n in nodes:
+        col_rows.setdefault(n.coord[0], set()).add(n.coord[1])
+
+    # Identify columns that contain exactly one node with a single-PE kind
+    all_cols = sorted(col_rows.keys())
+    single_pe_cols: set[int] = set()
+    for c in all_cols:
+        if len(col_rows[c]) == 1:
+            node = next(n for n in nodes if n.coord[0] == c)
+            if node.kind in _SINGLE_PE_KINDS:
+                single_pe_cols.add(c)
+
+    # Try to merge each single-PE column into its predecessor (right-to-left)
+    # coord_remap: old coord -> new coord for merged nodes
+    coord_remap: dict[tuple[int, int], tuple[int, int]] = {}
+    merged_cols: set[int] = set()
+
+    for c in sorted(single_pe_cols, reverse=True):
+        if c == 0:
+            continue  # cannot merge column 0
+        prev_col = c - 1
+        # If predecessor was already merged away, find the actual target
+        while prev_col in merged_cols and prev_col > 0:
+            prev_col -= 1
+        if prev_col in merged_cols:
+            continue  # no valid target
+
+        # Find the free row in the predecessor column closest to the node's
+        # original Y position.  Only merge if the Y displacement is <= 1, since
+        # merging saves at most 1 X-hop — larger displacements are a net loss.
+        node = next(n for n in nodes if n.coord[0] == c)
+        original_y = node.coord[1]
+        occupied = col_rows.get(prev_col, set())
+        free_row = None
+        best_dist = max_height + 1
+        for r in range(max_height):
+            if r not in occupied and abs(r - original_y) < best_dist:
+                free_row = r
+                best_dist = abs(r - original_y)
+        if free_row is not None and best_dist > 1:
+            free_row = None  # displacement too large, skip merge
+
+        if free_row is None:
+            continue  # no space in predecessor
+
+        # Merge: remap this node's coord to (prev_col, free_row)
+        old_coord = node.coord
+        new_coord = (prev_col, free_row)
+        coord_remap[old_coord] = new_coord
+        merged_cols.add(c)
+        col_rows[prev_col].add(free_row)
+
+    # Apply remaps
+    for n in nodes:
+        if n.coord in coord_remap:
+            n.coord = coord_remap[n.coord]
+
+    # Close gaps in X coordinates
+    if merged_cols:
+        remaining_cols = sorted(set(n.coord[0] for n in nodes))
+        col_map = {old: new for new, old in enumerate(remaining_cols)}
+        for n in nodes:
+            old_x = n.coord[0]
+            if old_x in col_map:
+                n.coord = (col_map[old_x], n.coord[1])
+
+    # Recompute max height
+    new_max = max((n.coord[1] for n in nodes), default=0) + 1
+    if new_max > max_height:
+        max_height = new_max
+
+    return nodes, max_height
 
 
 def _place_tiled_compute_group(
