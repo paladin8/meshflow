@@ -81,19 +81,31 @@ class TestLinearCompileOrchestrator:
         assert program.mesh_config.height == 4
         assert len(program.pe_programs) == 4
 
-        # Tile PEs have LinearTask (vertical layout)
-        for i in range(3):
-            pe = next(p for p in program.pe_programs if p.coord == (0, i))
+        # Tile PEs have LinearTask (vertical layout) — find by task type
+        tile_pes = [
+            pe for pe in program.pe_programs if any(isinstance(t, LinearTask) for t in pe.tasks)
+        ]
+        assert len(tile_pes) == 3
+        for pe in tile_pes:
             assert len(pe.tasks) == 1
             assert isinstance(pe.tasks[0], LinearTask)
             assert pe.tasks[0].tile_rows == 2
             assert pe.tasks[0].tile_cols == 4
-            assert pe.tasks[0].fragment_slot == i
-            assert pe.tasks[0].fragment_offset == i * 2
             assert len(pe.initial_sram) == 2  # weight + bias
 
-        # Collect PE has ConcatCollectTask entries
-        collect_pe = next(p for p in program.pe_programs if p.coord == (0, 3))
+        # Verify fragment indexing
+        fragment_slots = sorted(pe.tasks[0].fragment_slot for pe in tile_pes)
+        assert fragment_slots == [0, 1, 2]
+        for pe in tile_pes:
+            task = pe.tasks[0]
+            assert task.fragment_offset == task.fragment_slot * 2
+
+        # Collect PE has ConcatCollectTask entries — find dynamically
+        collect_pe = next(
+            pe
+            for pe in program.pe_programs
+            if any(isinstance(t, ConcatCollectTask) for t in pe.tasks)
+        )
         assert len(collect_pe.tasks) == 3
         for task in collect_pe.tasks:
             assert isinstance(task, ConcatCollectTask)

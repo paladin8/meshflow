@@ -180,9 +180,10 @@ class TestLinearEndToEnd:
         artifact_bytes = serialize(program)
         result = run_program(artifact_bytes, inputs={"linear1": x.tolist()})
 
-        # Compare against torch reference — collect at (0, 3) in vertical layout
+        # Compare against torch reference — find the single output coord dynamically
         expected = reference_linear(x, W, b)
-        actual = torch.tensor(result.outputs[(0, 3)])
+        assert len(result.outputs) == 1
+        actual = torch.tensor(next(iter(result.outputs.values())))
         assert torch.allclose(actual, expected, atol=1e-6)
 
     def test_linear_single_tile(self) -> None:
@@ -210,7 +211,8 @@ class TestLinearEndToEnd:
         result = run_program(artifact_bytes, inputs={"lin": x.tolist()})
 
         expected = reference_linear(x, W, b)
-        actual = torch.tensor(result.outputs[(0, 1)])
+        assert len(result.outputs) == 1
+        actual = torch.tensor(next(iter(result.outputs.values())))
         assert torch.allclose(actual, expected, atol=1e-6)
 
     def test_linear_profiling(self) -> None:
@@ -243,8 +245,9 @@ class TestLinearEndToEnd:
         assert result.total_messages == 6
         # 3 linear completions + 1 concat_collect completion
         assert result.total_tasks_executed == 4
-        # Fragment hops: tile 0 -> collect = 3 north, tile 1 -> 2 north, tile 2 -> 1 north = 6
-        assert result.total_hops == 6
+        # Fragment hops: with middle-collect placement, collect is closer to tiles
+        # so total hops are reduced (collect at middle row, not top row).
+        assert result.total_hops == 4
 
 
 def _make_mlp_weights(
@@ -287,12 +290,12 @@ class TestMLPEndToEnd:
         result = run_program(artifact_bytes, inputs={"l1": x.tolist()})
 
         expected = reference_mlp(x, ref_layers)
-        # l2 collect at (1, 3) — column 1, top of column
-        actual = torch.tensor(result.outputs[(1, 3)])
+        assert len(result.outputs) == 1
+        actual = torch.tensor(next(iter(result.outputs.values())))
         assert torch.allclose(actual, expected, atol=1e-6)
 
     def test_three_layer_mlp(self) -> None:
-        """Linear(4,8) → ReLU → Linear(8,6) → ReLU → Linear(6,3)."""
+        """Linear(4,8) -> ReLU -> Linear(8,6) -> ReLU -> Linear(6,3)."""
         torch.manual_seed(42)
         x = torch.randn(4)
         weights, ref_layers = _make_mlp_weights([(4, 8), (8, 6), (6, 3)])
@@ -318,15 +321,15 @@ class TestMLPEndToEnd:
         result = run_program(artifact_bytes, inputs={"l1": x.tolist()})
 
         expected = reference_mlp(x, ref_layers)
-        # l3 collect at (2, 3) — column 2, top of column
-        actual = torch.tensor(result.outputs[(2, 3)])
+        assert len(result.outputs) == 1
+        actual = torch.tensor(next(iter(result.outputs.values())))
         assert torch.allclose(actual, expected, atol=1e-6)
 
     def test_uneven_tiling_mlp(self) -> None:
         """MLP with out_features not divisible by num_tiles."""
         torch.manual_seed(42)
         x = torch.randn(4)
-        # 7 out_features with mesh_height=4 → 3 tiles → [3, 2, 2] rows
+        # 7 out_features with mesh_height=4 -> 3 tiles -> [3, 2, 2] rows
         weights, ref_layers = _make_mlp_weights([(4, 7), (7, 3)])
 
         graph = GraphIR(
@@ -346,7 +349,8 @@ class TestMLPEndToEnd:
         result = run_program(artifact_bytes, inputs={"l1": x.tolist()})
 
         expected = reference_mlp(x, ref_layers)
-        actual = torch.tensor(result.outputs[(1, 3)])
+        assert len(result.outputs) == 1
+        actual = torch.tensor(next(iter(result.outputs.values())))
         assert torch.allclose(actual, expected, atol=1e-6)
 
     def test_single_tile_mlp(self) -> None:
@@ -372,8 +376,8 @@ class TestMLPEndToEnd:
         result = run_program(artifact_bytes, inputs={"l1": x.tolist()})
 
         expected = reference_mlp(x, ref_layers)
-        # 1 tile + 1 collect per column, collect at y=1
-        actual = torch.tensor(result.outputs[(1, 1)])
+        assert len(result.outputs) == 1
+        actual = torch.tensor(next(iter(result.outputs.values())))
         assert torch.allclose(actual, expected, atol=1e-6)
 
     def test_mlp_profiling(self) -> None:

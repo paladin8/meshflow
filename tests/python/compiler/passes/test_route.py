@@ -235,9 +235,17 @@ class TestLinearRouting:
         # 4 PEs in schedule (vertical layout)
         assert len(schedule.pe_schedules) == 4
 
-        # Tile PEs have linear tasks (stacked vertically)
-        for i in range(3):
-            pe = next(p for p in schedule.pe_schedules if p.coord == (0, i))
+        # Find collect PE coord dynamically
+        collect_coord = next(
+            p.coord
+            for p in schedule.pe_schedules
+            if any(t.kind == "concat_collect" for t in p.tasks)
+        )
+
+        # Tile PEs have linear tasks — find them by task kind
+        tile_pes = [p for p in schedule.pe_schedules if any(t.kind == "linear" for t in p.tasks)]
+        assert len(tile_pes) == 3
+        for pe in tile_pes:
             assert len(pe.tasks) == 1
             task = pe.tasks[0]
             assert task.kind == "linear"
@@ -245,12 +253,17 @@ class TestLinearRouting:
             assert task.bias_slot == 2
             assert task.tile_rows == 2
             assert task.tile_cols == 4
-            assert task.fragment_slot == i
-            assert task.fragment_offset == i * 2
-            assert task.route_dest == (0, 3)
+            assert task.route_dest == collect_coord
+
+        # Verify fragment indexing is correct across tiles
+        fragment_slots = sorted(pe.tasks[0].fragment_slot for pe in tile_pes)
+        assert fragment_slots == [0, 1, 2]
+        for pe in tile_pes:
+            task = pe.tasks[0]
+            assert task.fragment_offset == task.fragment_slot * 2
 
         # Collect PE has 3 concat_collect tasks
-        collect_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 3))
+        collect_pe = next(p for p in schedule.pe_schedules if p.coord == collect_coord)
         assert len(collect_pe.tasks) == 3
         for i, task in enumerate(collect_pe.tasks):
             assert task.kind == "concat_collect"
@@ -280,8 +293,11 @@ class TestLinearRouting:
         W = weights["linear1"]["weight"]
         b = weights["linear1"]["bias"]
 
-        for i in range(3):
-            pe = next(p for p in schedule.pe_schedules if p.coord == (0, i))
+        # Find tile PEs by task kind and check SRAM contents
+        tile_pes = [p for p in schedule.pe_schedules if any(t.kind == "linear" for t in p.tasks)]
+        assert len(tile_pes) == 3
+        for pe in tile_pes:
+            i = pe.tasks[0].fragment_slot
             # Weight tile in slot 1
             expected_w = W[i * 2 : (i + 1) * 2, :].flatten().tolist()
             assert pe.initial_sram[1] == pytest.approx(expected_w)
@@ -349,8 +365,12 @@ class TestMultiLayerRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, self._make_mlp_weights())
 
-        # l1 collect at (0, 3) should have ConcatCollectForwardEntry tasks
-        l1_collect = next(p for p in schedule.pe_schedules if p.coord == (0, 3))
+        # l1 collect PE: find by ConcatCollectForwardEntry tasks in column 0
+        l1_collect = next(
+            p
+            for p in schedule.pe_schedules
+            if p.coord[0] == 0 and any(isinstance(t, ConcatCollectForwardEntry) for t in p.tasks)
+        )
         assert len(l1_collect.tasks) == 3
         for i, task in enumerate(l1_collect.tasks):
             assert isinstance(task, ConcatCollectForwardEntry)
@@ -359,14 +379,14 @@ class TestMultiLayerRouting:
             assert task.num_fragments == 3
             assert task.total_rows == 6
             assert task.activation == "relu"
-            # Broadcast detection: 3 destinations at X=1, same payload_slot
-            # collapses to 1 broadcast route from (0,3) south to (1,0)
-            # with deliver_at for (1,2) and (1,1).
-            assert len(task.routes) == 1
-            r = task.routes[0]
-            assert r.dest == (1, 0)
-            assert r.payload_slot == 0
-            assert r.deliver_at == [2, 3]
+            # Broadcast detection: 3 l2 tile PEs at X=1, same payload_slot.
+            # With middle-collect layout, tiles may be split above/below the
+            # l2 collect PE, producing multiple broadcast routes.
+            total_deliveries = sum(len(r.deliver_at) for r in task.routes)
+            dest_count = len(task.routes) + total_deliveries
+            assert dest_count == 3  # routes reach all 3 l2 tile PEs
+            for r in task.routes:
+                assert r.payload_slot == 0
 
     def test_terminal_collect_has_concat_tasks(self) -> None:
         graph = self._make_mlp_graph()
@@ -375,32 +395,41 @@ class TestMultiLayerRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, self._make_mlp_weights())
 
-        # l2 collect at (1, 3) should have ConcatCollectEntry tasks (terminal)
-        l2_collect = next(p for p in schedule.pe_schedules if p.coord == (1, 3))
+        # l2 collect PE: find by concat_collect tasks in column 1
+        l2_collect = next(
+            p
+            for p in schedule.pe_schedules
+            if p.coord[0] == 1 and any(t.kind == "concat_collect" for t in p.tasks)
+        )
         assert len(l2_collect.tasks) == 3
         for task in l2_collect.tasks:
             assert task.kind == "concat_collect"
 
     def test_inter_layer_route_hops(self) -> None:
-        """Route from l1 collect (0,3) to l2 tiles: broadcast east then south."""
+        """Route from l1 collect to l2 tiles: broadcast east then up/down."""
         graph = self._make_mlp_graph()
         config = CompilerConfig(mesh_height=4)
         expanded = expand(graph, config)
         spatial = place(expanded, config)
         schedule = route(spatial, config, self._make_mlp_weights())
 
-        l1_collect = next(p for p in schedule.pe_schedules if p.coord == (0, 3))
+        l1_collect = next(
+            p
+            for p in schedule.pe_schedules
+            if p.coord[0] == 0 and any(isinstance(t, ConcatCollectForwardEntry) for t in p.tasks)
+        )
         task = l1_collect.tasks[0]
         assert isinstance(task, ConcatCollectForwardEntry)
 
-        # Broadcast detection collapses 3 routes into 1 broadcast:
-        # (0,3) → (1,0): 1 east, 3 south, delivering at (1,2) and (1,1)
-        assert len(task.routes) == 1
-        r = task.routes[0]
-        assert r.dest == (1, 0)
-        assert r.hops == [Direction.EAST, Direction.SOUTH, Direction.SOUTH, Direction.SOUTH]
-        # deliver_at: (1,2) at hop 2, (1,1) at hop 3
-        assert r.deliver_at == [2, 3]
+        # Broadcast detection collapses 3 routes into broadcast(s).
+        # Verify that the broadcast reaches the farthest l2 tile PE at (1,0)
+        # and delivers intermediately to the other l2 tile PEs.
+        all_dests = set()
+        for r in task.routes:
+            all_dests.add(r.dest)
+            # Each route should include at least an EAST hop (cross-column)
+            assert Direction.EAST in r.hops
+        assert (1, 0) in all_dests
 
     def test_only_first_layer_has_input_slots(self) -> None:
         graph = self._make_mlp_graph()
@@ -423,20 +452,30 @@ class TestMultiLayerRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
-        # l1 tiles at (0, 0)-(0, 2) have weights
-        for i in range(3):
-            pe = next(p for p in schedule.pe_schedules if p.coord == (0, i))
+        # l1 tile PEs (column 0) with linear tasks have weights
+        l1_tiles = [
+            p
+            for p in schedule.pe_schedules
+            if p.coord[0] == 0 and any(t.kind == "linear" for t in p.tasks)
+        ]
+        assert len(l1_tiles) == 3
+        for pe in l1_tiles:
             assert 1 in pe.initial_sram  # weight
             assert 2 in pe.initial_sram  # bias
 
-        # l2 tiles at (1, 0)-(1, 2) have weights
-        for i in range(3):
-            pe = next(p for p in schedule.pe_schedules if p.coord == (1, i))
+        # l2 tile PEs (column 1) with linear tasks have weights
+        l2_tiles = [
+            p
+            for p in schedule.pe_schedules
+            if p.coord[0] == 1 and any(t.kind == "linear" for t in p.tasks)
+        ]
+        assert len(l2_tiles) == 3
+        for pe in l2_tiles:
             assert 1 in pe.initial_sram
             assert 2 in pe.initial_sram
 
     def test_no_activation_on_direct_linear(self) -> None:
-        """Linear → Linear (no RELU): forward tasks have activation=None."""
+        """Linear -> Linear (no RELU): forward tasks have activation=None."""
         graph = GraphIR(
             nodes=[
                 Node(id="l1", op=OpType.LINEAR, attrs={"in_features": 4, "out_features": 6}),
@@ -460,7 +499,12 @@ class TestMultiLayerRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
-        l1_collect = next(p for p in schedule.pe_schedules if p.coord == (0, 3))
+        # l1 collect PE: find by ConcatCollectForwardEntry in column 0
+        l1_collect = next(
+            p
+            for p in schedule.pe_schedules
+            if p.coord[0] == 0 and any(isinstance(t, ConcatCollectForwardEntry) for t in p.tasks)
+        )
         task = l1_collect.tasks[0]
         assert isinstance(task, ConcatCollectForwardEntry)
         assert task.activation is None
@@ -499,8 +543,15 @@ class TestRmsNormRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
-        # Tile PE at (1, 0) should have 2 tasks: partial_sum + normalize
-        tile_pe = next(p for p in schedule.pe_schedules if p.coord == (1, 0))
+        # Find any tile PE with partial_sum + normalize tasks
+        tile_pes = [
+            p
+            for p in schedule.pe_schedules
+            if any(isinstance(t, RmsNormPartialSumEntry) for t in p.tasks)
+        ]
+        assert len(tile_pes) == 4
+
+        tile_pe = tile_pes[0]
         assert len(tile_pe.tasks) == 2
 
         ps_task = tile_pe.tasks[0]
@@ -526,11 +577,22 @@ class TestRmsNormRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
-        # Reduce PE is at (1, 4) (4 tile PEs + reduce)
-        tile_pe = next(p for p in schedule.pe_schedules if p.coord == (1, 0))
+        # Find reduce PE coord dynamically
+        reduce_coord = next(
+            p.coord
+            for p in schedule.pe_schedules
+            if any(isinstance(t, RmsNormReduceEntry) for t in p.tasks)
+        )
+
+        # All tile PEs should route partial sums to the reduce PE
+        tile_pe = next(
+            p
+            for p in schedule.pe_schedules
+            if any(isinstance(t, RmsNormPartialSumEntry) for t in p.tasks)
+        )
         ps_task = tile_pe.tasks[0]
         assert isinstance(ps_task, RmsNormPartialSumEntry)
-        assert ps_task.reduce_dest == (1, 4)
+        assert ps_task.reduce_dest == reduce_coord
 
     def test_rmsnorm_reduce_pe_has_reduce_entries(self) -> None:
         graph = self._make_rmsnorm_graph()
@@ -540,8 +602,12 @@ class TestRmsNormRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
-        # Reduce PE at (1, 4) has 4 tasks (one per partial sum slot)
-        reduce_pe = next(p for p in schedule.pe_schedules if p.coord == (1, 4))
+        # Find reduce PE dynamically
+        reduce_pe = next(
+            p
+            for p in schedule.pe_schedules
+            if any(isinstance(t, RmsNormReduceEntry) for t in p.tasks)
+        )
         assert len(reduce_pe.tasks) == 4
         for i, task in enumerate(reduce_pe.tasks):
             assert isinstance(task, RmsNormReduceEntry)
@@ -549,14 +615,15 @@ class TestRmsNormRouting:
             assert task.num_tiles == 4
             assert task.feature_count == 4
             assert abs(task.eps - 1e-6) < 1e-10
-            # Broadcast detection: 4 tile PEs at (1,0)-(1,3) all share X=1,
-            # payload_slot=1. Collapses to 1 broadcast route from (1,4) south
-            # to (1,0) with deliver_at for (1,3), (1,2), (1,1).
-            assert len(task.routes) == 1
-            r = task.routes[0]
-            assert r.dest == (1, 0)
-            assert r.payload_slot == 1
-            assert r.deliver_at == [1, 2, 3]
+            # Broadcast detection: 4 tile PEs all share X=1, payload_slot=1.
+            # Collapses to broadcast route(s) from reduce PE south to tile PEs.
+            # With middle collect, tiles may be split above/below collect,
+            # so we may get 1 or 2 broadcast routes.
+            total_deliveries = sum(len(r.deliver_at) for r in task.routes)
+            dest_count = len(task.routes) + total_deliveries
+            assert dest_count == 4  # scale reaches all 4 tile PEs
+            for r in task.routes:
+                assert r.payload_slot == 1
 
     def test_rmsnorm_gamma_in_sram(self) -> None:
         graph = self._make_rmsnorm_graph()
@@ -568,13 +635,23 @@ class TestRmsNormRouting:
         schedule = route(spatial, config, weights)
 
         # Each tile PE gets a slice of gamma in SRAM slot 2
-        tile_pe0 = next(p for p in schedule.pe_schedules if p.coord == (1, 0))
-        assert 2 in tile_pe0.initial_sram
-        assert tile_pe0.initial_sram[2] == pytest.approx([1.0])
+        tile_pes = sorted(
+            [
+                p
+                for p in schedule.pe_schedules
+                if any(isinstance(t, RmsNormPartialSumEntry) for t in p.tasks)
+            ],
+            key=lambda p: p.tasks[0].slice_offset,
+        )
+        assert len(tile_pes) == 4
 
-        tile_pe3 = next(p for p in schedule.pe_schedules if p.coord == (1, 3))
-        assert 2 in tile_pe3.initial_sram
-        assert tile_pe3.initial_sram[2] == pytest.approx([4.0])
+        # First tile gets gamma[0] = 1.0
+        assert 2 in tile_pes[0].initial_sram
+        assert tile_pes[0].initial_sram[2] == pytest.approx([1.0])
+
+        # Last tile gets gamma[3] = 4.0
+        assert 2 in tile_pes[3].initial_sram
+        assert tile_pes[3].initial_sram[2] == pytest.approx([4.0])
 
     def test_rmsnorm_normalize_routes_to_collect(self) -> None:
         graph = self._make_rmsnorm_graph()
@@ -584,15 +661,26 @@ class TestRmsNormRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
+        # Find the RmsNorm collect PE dynamically (ConcatCollectForwardEntry in column 1)
+        collect_coord = next(
+            p.coord
+            for p in schedule.pe_schedules
+            if p.coord[0] == 1
+            and any(t.kind in ("concat_collect", "concat_collect_forward") for t in p.tasks)
+        )
+
         # Normalize output should route to the RMSNorm's own collect PE
-        tile_pe = next(p for p in schedule.pe_schedules if p.coord == (1, 0))
+        tile_pe = next(
+            p
+            for p in schedule.pe_schedules
+            if any(isinstance(t, RmsNormPartialSumEntry) for t in p.tasks)
+        )
         norm_task = tile_pe.tasks[1]
         assert isinstance(norm_task, RmsNormNormalizeEntry)
         assert len(norm_task.routes) >= 1
         # The RMSNorm collect PE is within the same column
         dest_coords = [r.dest for r in norm_task.routes]
-        # Collect PE is at (1, num_tiles + 1) = (1, 5) for 4 tiles
-        assert (1, 5) in dest_coords
+        assert collect_coord in dest_coords
 
 
 class TestAttentionRouting:

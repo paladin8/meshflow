@@ -74,16 +74,16 @@ class TestSmallConfig:
         assert self.result.total_messages <= 114
 
     def test_total_hops(self):
-        assert self.result.total_hops <= 271  # Phase 1: 331 -> 271
+        assert self.result.total_hops <= 221  # Phase 3: 271 -> 221 (middle collect)
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 730  # Phase 1: 737 -> 730
+        assert self.result.final_timestamp <= 700  # Phase 3: 730 -> 700 (middle collect)
 
     def test_max_sends(self):
-        assert _max_sends(self.result) <= 11  # Phase 1: 30 -> 11
+        assert _max_sends(self.result) <= 17  # Phase 3: 11 -> 17 (middle collect splits broadcasts)
 
     def test_max_queue_depth(self):
-        assert _max_queue_depth(self.result) <= 5  # Phase 1: 15 -> 5
+        assert _max_queue_depth(self.result) <= 6  # Phase 3: 5 -> 6 (middle collect)
 
     def test_max_hops_per_route(self):
         _, _, max_hops = _route_stats(self.program)
@@ -104,13 +104,13 @@ class TestMediumConfig:
         assert self.result.total_messages <= 170
 
     def test_total_hops(self):
-        assert self.result.total_hops <= 488  # Phase 1+2: 602 -> 488
+        assert self.result.total_hops <= 379  # Phase 3: 488 -> 379 (middle collect)
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 3086  # Phase 1+2: 3095 -> 3086
+        assert self.result.final_timestamp <= 3046  # Phase 3: 3086 -> 3046 (middle collect)
 
     def test_max_sends(self):
-        assert _max_sends(self.result) <= 19  # Phase 1: 42 -> 19
+        assert _max_sends(self.result) <= 22  # Phase 3: 19 -> 22 (middle collect splits broadcasts)
 
     def test_max_queue_depth(self):
         assert _max_queue_depth(self.result) <= 8  # Phase 1: 21 -> 8

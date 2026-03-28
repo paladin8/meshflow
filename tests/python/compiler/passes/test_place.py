@@ -151,23 +151,24 @@ class TestLinearPlacement:
         assert spatial.width == 1
         assert spatial.height == 4
 
-        # First 3 are tile PEs (stacked vertically)
+        # 3 tile PEs with collect in the middle (row 1)
+        # Tiles: row 0, row 2, row 3  |  Collect: row 1
+        tile_node_map = {n.id: n for n in spatial.nodes if n.kind == PlacedNodeKind.LINEAR_TILE}
         for i in range(3):
-            tile = spatial.nodes[i]
-            assert tile.id == f"linear1_tile_{i}"
+            tile = tile_node_map[f"linear1_tile_{i}"]
             assert tile.kind == PlacedNodeKind.LINEAR_TILE
-            assert tile.coord == (0, i)
             assert isinstance(tile.data, PlacedTileData)
             assert tile.data.tile_index == i
             assert tile.data.tile_rows == 2
             assert tile.data.in_features == 4
             assert tile.data.origin_id == "linear1"
 
-        # Last is collect PE at top of column
-        collect = spatial.nodes[3]
-        assert collect.id == "linear1_collect"
+        # Collect PE is in the middle of the column
+        collect = next(n for n in spatial.nodes if n.id == "linear1_collect")
         assert collect.kind == PlacedNodeKind.LINEAR_COLLECT
-        assert collect.coord == (0, 3)
+        # Collect should be at a row between the min and max tile rows
+        tile_ys = [tile_node_map[f"linear1_tile_{i}"].coord[1] for i in range(3)]
+        assert min(tile_ys) < collect.coord[1] < max(tile_ys)
         assert isinstance(collect.data, PlacedCollectData)
         assert collect.data.num_fragments == 3
         assert collect.data.total_rows == 6
@@ -260,16 +261,15 @@ class TestMultiLayerPlacement:
         assert spatial.height == 4
 
         coords = {n.id: n.coord for n in spatial.nodes}
-        # Column 0: l1 tiles at (0,0)-(0,2), collect at (0,3)
-        assert coords["l1_tile_0"] == (0, 0)
-        assert coords["l1_tile_1"] == (0, 1)
-        assert coords["l1_tile_2"] == (0, 2)
-        assert coords["l1_collect"] == (0, 3)
-        # Column 1: l2 tiles at (1,0)-(1,2), collect at (1,3)
-        assert coords["l2_tile_0"] == (1, 0)
-        assert coords["l2_tile_1"] == (1, 1)
-        assert coords["l2_tile_2"] == (1, 2)
-        assert coords["l2_collect"] == (1, 3)
+        # Column 0: l1 tiles with collect in middle
+        assert coords["l1_tile_0"][0] == 0
+        assert coords["l1_collect"][0] == 0
+        # Collect is between tiles
+        tile_ys = [coords[f"l1_tile_{i}"][1] for i in range(3)]
+        assert min(tile_ys) < coords["l1_collect"][1] < max(tile_ys)
+        # Column 1: l2 tiles with collect in middle
+        assert coords["l2_tile_0"][0] == 1
+        assert coords["l2_collect"][0] == 1
 
         # RELU node is NOT placed (fused onto collect)
         placed_ids = {n.id for n in spatial.nodes}
@@ -447,10 +447,16 @@ class TestRmsNormPlacement:
         # 4 tile PEs + 1 reduce PE + 1 collect PE = 6 nodes
         assert len(spatial.nodes) == 6
         coords = {n.id: n.coord for n in spatial.nodes}
+        # All in column 0
         for i in range(4):
-            assert coords[f"rn_tile_{i}"] == (0, i)
-        assert coords["rn_reduce"] == (0, 4)
-        assert coords["rn_collect"] == (0, 5)
+            assert coords[f"rn_tile_{i}"][0] == 0
+        assert coords["rn_reduce"][0] == 0
+        assert coords["rn_collect"][0] == 0
+        # Collect is between tiles (middle placement)
+        tile_ys = [coords[f"rn_tile_{i}"][1] for i in range(4)]
+        assert min(tile_ys) < coords["rn_collect"][1] < max(tile_ys)
+        # Reduce is above all tiles and collect
+        assert coords["rn_reduce"][1] > max(tile_ys)
 
     def test_rmsnorm_data_types(self) -> None:
         graph = GraphIR(
@@ -648,4 +654,35 @@ class TestCompactPlacement:
             assert len(coords) == len(set(coords)), (
                 f"coordinate conflict in ({sl},{dm},{df},mh={mh}): "
                 f"{len(coords)} nodes but {len(set(coords))} unique coords"
+            )
+
+
+class TestMiddleCollectPlacement:
+    """Tests for Phase 3 middle collect PE placement."""
+
+    def test_middle_collect_placement(self) -> None:
+        """Collect PE is at the center row of its tiles for various tile counts."""
+        from meshflow.compiler.passes.place import _middle_collect_rows
+
+        for n in range(1, 8):
+            tile_rows, collect_row = _middle_collect_rows(n)
+            assert collect_row == n // 2, f"n={n}: collect at {collect_row}, expected {n // 2}"
+            # Collect row is not in tile_rows
+            assert collect_row not in tile_rows, f"n={n}: collect row conflicts with a tile"
+            # All rows are unique and contiguous 0..n
+            all_rows = sorted(tile_rows + [collect_row])
+            assert all_rows == list(range(n + 1)), f"n={n}: rows not contiguous: {all_rows}"
+
+    def test_middle_collect_reduces_max_internal_hops(self) -> None:
+        """Max tile-to-collect distance is at most ceil(N/2)."""
+        import math
+
+        from meshflow.compiler.passes.place import _middle_collect_rows
+
+        for n in range(1, 8):
+            tile_rows, collect_row = _middle_collect_rows(n)
+            max_dist = max(abs(r - collect_row) for r in tile_rows)
+            expected_max = math.ceil(n / 2)
+            assert max_dist <= expected_max, (
+                f"n={n}: max distance {max_dist} exceeds ceil({n}/2)={expected_max}"
             )

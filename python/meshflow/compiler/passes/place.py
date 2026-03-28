@@ -227,12 +227,31 @@ def _compact_columns(nodes: list[PlacedNode], max_height: int) -> tuple[list[Pla
     return nodes, max_height
 
 
+def _middle_collect_rows(num_tiles: int) -> tuple[list[int], int]:
+    """Compute row assignments for tiles and a center-placed collect PE.
+
+    Returns (tile_rows, collect_row) where tile_rows[i] is the row for tile i.
+    Tiles below the collect get rows 0..collect_row-1, tiles above get
+    rows collect_row+1..num_tiles.  The collect row is floor(num_tiles / 2).
+    """
+    collect_row = num_tiles // 2
+    tile_rows: list[int] = []
+    for i in range(num_tiles):
+        if i < collect_row:
+            tile_rows.append(i)
+        else:
+            tile_rows.append(i + 1)  # shift up by 1 to make room for collect
+    return tile_rows, collect_row
+
+
 def _place_tiled_compute_group(
     group: TiledComputeGroup, col: int
 ) -> tuple[list[PlacedNode], list[PlacedEdge], int]:
-    """Place a LINEAR tiled compute group in a column."""
+    """Place a LINEAR tiled compute group in a column with collect in the middle."""
     nodes: list[PlacedNode] = []
     edges: list[PlacedEdge] = []
+
+    tile_rows, collect_row = _middle_collect_rows(len(group.tiles))
 
     for spec in group.tiles:
         tile_id = f"{group.origin_id}_tile_{spec.tile_index}"
@@ -240,7 +259,7 @@ def _place_tiled_compute_group(
             PlacedNode(
                 id=tile_id,
                 kind=PlacedNodeKind.LINEAR_TILE,
-                coord=(col, spec.tile_index),
+                coord=(col, tile_rows[spec.tile_index]),
                 data=PlacedTileData(
                     tile_index=spec.tile_index,
                     tile_rows=spec.tile_rows,
@@ -251,7 +270,6 @@ def _place_tiled_compute_group(
             )
         )
 
-    collect_row = len(group.tiles)
     collect_id = f"{group.origin_id}_collect"
     nodes.append(
         PlacedNode(
@@ -278,15 +296,23 @@ def _place_tiled_compute_group(
             )
         )
 
-    return nodes, edges, collect_row + 1
+    return nodes, edges, len(group.tiles) + 1
 
 
 def _place_rmsnorm_group(
     group: RmsNormGroup, col: int
 ) -> tuple[list[PlacedNode], list[PlacedEdge], int]:
-    """Place an RMSNORM group: tile PEs + reduce PE in a column."""
+    """Place an RMSNORM group: tile PEs + reduce PE + collect PE in a column.
+
+    Collect PE is centered among the tiles.  Reduce PE is placed above all
+    tiles and collect.
+    """
     nodes: list[PlacedNode] = []
     edges: list[PlacedEdge] = []
+
+    tile_rows, collect_row = _middle_collect_rows(group.num_tiles)
+    # Reduce PE goes above all tiles and collect
+    reduce_row = group.num_tiles + 1  # tiles occupy N rows + 1 for collect
 
     base = group.feature_count // group.num_tiles
     remainder = group.feature_count % group.num_tiles
@@ -299,7 +325,7 @@ def _place_rmsnorm_group(
             PlacedNode(
                 id=tile_id,
                 kind=PlacedNodeKind.RMSNORM_TILE,
-                coord=(col, i),
+                coord=(col, tile_rows[i]),
                 data=PlacedRmsNormTileData(
                     tile_index=i,
                     feature_slice_size=slice_size,
@@ -310,7 +336,6 @@ def _place_rmsnorm_group(
         )
         offset += slice_size
 
-    reduce_row = group.num_tiles
     reduce_id = f"{group.origin_id}_reduce"
     nodes.append(
         PlacedNode(
@@ -349,7 +374,6 @@ def _place_rmsnorm_group(
         )
 
     # Collect PE gathers normalized fragments from all tiles
-    collect_row = reduce_row + 1
     collect_id = f"{group.origin_id}_collect"
     nodes.append(
         PlacedNode(
@@ -376,15 +400,22 @@ def _place_rmsnorm_group(
             )
         )
 
-    return nodes, edges, collect_row + 1
+    return nodes, edges, reduce_row + 1
 
 
 def _place_attention_group(
     group: AttentionGroup, col: int
 ) -> tuple[list[PlacedNode], list[PlacedEdge], int]:
-    """Place attention PEs + collect PE in a column."""
+    """Place attention PEs + collect PE in a column with collect in the middle."""
     nodes: list[PlacedNode] = []
     edges: list[PlacedEdge] = []
+
+    has_collect = group.av_matmul_id is not None and group.seq_len > 1
+
+    if has_collect:
+        pe_rows, collect_row = _middle_collect_rows(group.seq_len)
+    else:
+        pe_rows = list(range(group.seq_len))
 
     for i in range(group.seq_len):
         pe_id = f"{group.origin_id}_attn_{i}"
@@ -392,7 +423,7 @@ def _place_attention_group(
             PlacedNode(
                 id=pe_id,
                 kind=PlacedNodeKind.ATTENTION_PE,
-                coord=(col, i),
+                coord=(col, pe_rows[i]),
                 data=PlacedAttentionPeData(
                     pe_index=i,
                     seq_len=group.seq_len,
@@ -404,9 +435,7 @@ def _place_attention_group(
             )
         )
 
-    # Collect PE gathers attention outputs (only needed for attention chains)
-    if group.av_matmul_id is not None and group.seq_len > 1:
-        collect_row = group.seq_len
+    if has_collect:
         collect_id = f"{group.origin_id}_collect"
         nodes.append(
             PlacedNode(
@@ -432,7 +461,7 @@ def _place_attention_group(
                 )
             )
 
-        return nodes, edges, collect_row + 1
+        return nodes, edges, group.seq_len + 1
 
     return nodes, edges, group.seq_len
 
