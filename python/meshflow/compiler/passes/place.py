@@ -56,8 +56,17 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
     placed_edges: list[PlacedEdge] = []
     node_pe_map: dict[str, list[str]] = {}
 
+    # Detect ADD nodes that can co-locate with their upstream collect PE.
+    # An ADD co-locates when it receives from a LINEAR_COLLECT output PE.
+    add_colocation = _detect_add_colocation(expanded)
+
     col = 0
     max_column_height = 0
+    # Track collect PE coordinates and num_fragments so co-located ADDs can find them
+    collect_coords: dict[str, tuple[int, int]] = {}
+    collect_num_fragments: dict[str, int] = {}
+    # Track slot offsets for co-located ADDs (ADD_node_id → slot_offset)
+    add_slot_offsets: dict[str, int] = {}
 
     for group in expanded.groups:
         if isinstance(group, TiledComputeGroup):
@@ -67,6 +76,9 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
             tile_ids = [f"{group.origin_id}_tile_{t.tile_index}" for t in group.tiles]
             collect_id = f"{group.origin_id}_collect"
             node_pe_map[group.origin_id] = tile_ids + [collect_id]
+            collect_node = next(n for n in nodes if n.id == collect_id)
+            collect_coords[collect_id] = collect_node.coord
+            collect_num_fragments[collect_id] = group.collect.num_fragments
 
         elif isinstance(group, RmsNormGroup):
             nodes, edges, height = _place_rmsnorm_group(group, col)
@@ -76,6 +88,8 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
             reduce_id = f"{group.origin_id}_reduce"
             collect_id = f"{group.origin_id}_collect"
             node_pe_map[group.origin_id] = tile_ids + [reduce_id, collect_id]
+            collect_node = next(n for n in nodes if n.id == collect_id)
+            collect_coords[collect_id] = collect_node.coord
 
         elif isinstance(group, AttentionGroup):
             nodes, edges_attn, height = _place_attention_group(group, col)
@@ -86,6 +100,8 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
             if has_collect:
                 collect_id = f"{group.origin_id}_collect"
                 node_pe_map[group.origin_id] = pe_ids + [collect_id]
+                collect_node = next(n for n in nodes if n.id == collect_id)
+                collect_coords[collect_id] = collect_node.coord
             else:
                 node_pe_map[group.origin_id] = pe_ids
             if group.softmax_id:
@@ -97,6 +113,22 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
                     node_pe_map[group.av_matmul_id] = pe_ids
 
         elif isinstance(group, PassthroughGroup):
+            # Check if this ADD should co-locate with an upstream collect PE
+            if group.op == OpType.ADD and group.origin_id in add_colocation:
+                collect_pe_id = add_colocation[group.origin_id]
+                if collect_pe_id in collect_coords:
+                    colocated_coord = collect_coords[collect_pe_id]
+                    node = PlacedNode(
+                        id=group.origin_id,
+                        kind=_passthrough_kind(group.op),
+                        coord=colocated_coord,
+                    )
+                    placed_nodes.append(node)
+                    node_pe_map[group.origin_id] = [group.origin_id]
+                    # Record slot offset: ADD's slots start after collect's fragments
+                    add_slot_offsets[group.origin_id] = collect_num_fragments[collect_pe_id]
+                    continue
+
             node = PlacedNode(
                 id=group.origin_id,
                 kind=_passthrough_kind(group.op),
@@ -116,6 +148,14 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
     # Generate inter-group edges from original GraphIR edges + node expansions
     placed_edges.extend(_generate_inter_group_edges(expanded, node_pe_map))
 
+    # Remap dst_slots on edges targeting co-located ADD nodes to avoid
+    # conflicts with the collect PE's fragment slots (0..N-1).
+    if add_slot_offsets:
+        colocated_add_ids = set(add_slot_offsets.keys())
+        for edge in placed_edges:
+            if edge.dst_node in colocated_add_ids:
+                edge.dst_slot += add_slot_offsets[edge.dst_node]
+
     # Compact placement: merge single-PE groups into adjacent columns
     placed_nodes, max_column_height = _compact_columns(placed_nodes, max_column_height)
 
@@ -131,6 +171,37 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
         edges=placed_edges,
         node_pe_map=node_pe_map,
     )
+
+
+def _detect_add_colocation(expanded: ExpandedIR) -> dict[str, str]:
+    """Detect ADD nodes that can co-locate with their upstream collect PE.
+
+    Returns a map: ADD_origin_id → collect_PE_id (e.g., "add1" → "out_proj_collect").
+    An ADD co-locates when one of its inputs comes from a node whose output PE
+    is a collect PE (pattern: LINEAR→collect→ADD or attention→collect→ADD).
+    """
+    result: dict[str, str] = {}
+    for edge in expanded.original_edges:
+        dst_expansion = expanded.node_expansions.get(edge.dst_node)
+        src_expansion = expanded.node_expansions.get(edge.src_node)
+        if dst_expansion is None or src_expansion is None:
+            continue
+        # Check if destination is an ADD (single PE, passthrough)
+        dst_group = None
+        for g in expanded.groups:
+            if g.origin_id == edge.dst_node:
+                dst_group = g
+                break
+        if dst_group is None:
+            continue
+        if not (isinstance(dst_group, PassthroughGroup) and dst_group.op == OpType.ADD):
+            continue
+        # Check if source output goes through a collect PE
+        for out_pe in src_expansion.output_pe_ids:
+            if out_pe.endswith("_collect"):
+                result[edge.dst_node] = out_pe
+                break  # one collect PE per ADD is enough
+    return result
 
 
 _SINGLE_PE_KINDS = {

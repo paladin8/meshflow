@@ -601,12 +601,14 @@ class TestCompactPlacement:
         spatial = place(expanded, config)
 
         # Without compaction: 4 columns (FORWARD, LINEAR, ADD, COLLECT)
-        # With compaction: ADD and COLLECT should merge, reducing width
+        # With co-location + compaction: ADD co-locates with LINEAR collect,
+        # COLLECT merges into the same column. Width should be reduced.
         assert spatial.width < 4, f"expected compact width < 4, got {spatial.width}"
 
-        # Verify no coordinate conflicts
-        coords = [n.coord for n in spatial.nodes]
-        assert len(coords) == len(set(coords)), "coordinate conflict detected"
+        # ADD node shares coordinate with the LINEAR collect PE (co-location)
+        add_node = next(n for n in spatial.nodes if n.id == "add")
+        collect_node = next(n for n in spatial.nodes if n.id == "linear_collect")
+        assert add_node.coord == collect_node.coord, "ADD should co-locate with collect PE"
 
     def test_compact_preserves_multi_pe_columns(self) -> None:
         """Tiled groups keep their own columns and are never merge candidates."""
@@ -640,8 +642,12 @@ class TestCompactPlacement:
                 PlacedNodeKind.COLLECT_SIMPLE,  # output may merge into this column
             ), f"unexpected {n.kind} in linear column"
 
-    def test_compact_no_coordinate_conflicts(self) -> None:
-        """No two PEs end up at the same coordinate after compaction."""
+    def test_compact_no_unexpected_coordinate_conflicts(self) -> None:
+        """No unexpected coordinate conflicts after compaction.
+
+        Co-located ADD+collect pairs intentionally share coordinates.
+        All other nodes must have unique coordinates.
+        """
         from meshflow.models.transformer import transformer_block
 
         for sl, dm, df, mh in [(4, 8, 16, 6), (8, 16, 32, 8)]:
@@ -650,11 +656,82 @@ class TestCompactPlacement:
             expanded = expand(graph, config)
             spatial = place(expanded, config)
 
-            coords = [n.coord for n in spatial.nodes]
-            assert len(coords) == len(set(coords)), (
-                f"coordinate conflict in ({sl},{dm},{df},mh={mh}): "
-                f"{len(coords)} nodes but {len(set(coords))} unique coords"
+            # ADD nodes co-located with collect PEs are expected duplicates
+            add_ids = {n.id for n in spatial.nodes if n.kind == PlacedNodeKind.ADD}
+            non_add_coords = [n.coord for n in spatial.nodes if n.id not in add_ids]
+            assert len(non_add_coords) == len(set(non_add_coords)), (
+                f"unexpected coordinate conflict in ({sl},{dm},{df},mh={mh})"
             )
+
+
+class TestCollectAddColocation:
+    """Tests for Phase 4 LinearCollect+Add co-location."""
+
+    def test_collect_add_colocation(self) -> None:
+        """Co-located PE has both ConcatCollectForward and Add tasks."""
+        from meshflow.models.transformer import transformer_block
+
+        graph = transformer_block(4, 8, 16)
+        config = CompilerConfig(mesh_height=6)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+
+        # add1 and add2 should co-locate with their upstream collect PEs
+        for add_id in ["add1", "add2"]:
+            add_node = next(n for n in spatial.nodes if n.id == add_id)
+            # Find the collect PE at the same coordinate
+            collect_at_same = [
+                n
+                for n in spatial.nodes
+                if n.coord == add_node.coord and n.kind == PlacedNodeKind.LINEAR_COLLECT
+            ]
+            assert len(collect_at_same) == 1, (
+                f"{add_id} should share coordinate with exactly 1 collect PE"
+            )
+
+    def test_add_pe_eliminated(self) -> None:
+        """No separate column for ADD PEs when co-located."""
+        from meshflow.models.transformer import transformer_block
+
+        graph = transformer_block(4, 8, 16)
+        config = CompilerConfig(mesh_height=6)
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+
+        # ADD nodes should share a column with a collect PE, not have their own
+        for add_id in ["add1", "add2"]:
+            add_node = next(n for n in spatial.nodes if n.id == add_id)
+            col_nodes = [n for n in spatial.nodes if n.coord[0] == add_node.coord[0]]
+            # The column should have more than just the ADD (it should have tiles + collect)
+            assert len(col_nodes) > 1, f"{add_id} should share column with collect PE"
+
+    def test_colocation_numerical_correctness(self) -> None:
+        """Transformer block outputs match reference with co-location enabled."""
+        import torch
+
+        from meshflow._mesh_runtime import run_program
+        from meshflow.compiler import compile
+        from meshflow.compiler.artifact import serialize
+        from meshflow.models.reference import reference_transformer_block
+        from meshflow.models.transformer import transformer_block, transformer_weights
+
+        seq_len, d_model, d_ff = 4, 8, 16
+        graph = transformer_block(seq_len, d_model, d_ff)
+        weights = transformer_weights(d_model, d_ff, seed=42)
+        config = CompilerConfig(mesh_height=6)
+        program = compile(graph, config, weights=weights)
+        artifact_bytes = serialize(program)
+
+        torch.manual_seed(99)
+        x = torch.randn(seq_len, d_model)
+        result = run_program(artifact_bytes, inputs={"input": x.flatten().tolist()})
+
+        expected = reference_transformer_block(x, weights)
+        assert len(result.outputs) == 1
+        actual = torch.tensor(next(iter(result.outputs.values())))
+        assert torch.allclose(actual.view(seq_len, d_model), expected, atol=1e-4), (
+            f"max diff: {(actual.view(seq_len, d_model) - expected).abs().max()}"
+        )
 
 
 class TestMiddleCollectPlacement:

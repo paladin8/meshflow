@@ -184,11 +184,11 @@ Reduced internal hop counts and more even link utilization across rows.
 
 ---
 
-## Phase 4: RmsNorm+Linear Co-location
+## Phase 4: LinearCollect+Add Co-location
 
 ### Problem
 
-After RmsNorm normalize completes, each tile PE sends its normalized fragment as a message to a collect PE, which concatenates and forwards to downstream Linear tiles. This adds a full message round (send + hops + deliver) between normalize and the first linear operation.
+In the transformer block, each residual add receives two inputs: the residual path (from FORWARD or a previous ADD) and the output of a Linear collect PE (from `out_proj` or `ffn2`). Currently these are separate PEs — the collect PE concatenates tile fragments, then sends a message to the ADD PE. This message adds one hop + delivery latency per residual connection.
 
 ### Pattern
 
@@ -196,71 +196,35 @@ Softmax and MatMul are already co-located on attention PEs. Softmax writes to a 
 
 ### Change
 
-Place the RmsNorm normalize task and the downstream Linear tile task on the same PE. The normalize output writes to a local SRAM slot that triggers the Linear task. The Linear result is then sent to the Linear collect PE as today.
-
-Each co-located PE runs three phases:
-
-1. **RmsNormPartialSum** — triggered by input arrival (slot 0), sends partial sum to reduce PE.
-2. **RmsNormNormalize** — triggered by scale factor from reduce (slot 1), normalizes its slice, writes result to local slot 3.
-3. **Linear** — triggered by slot 3 write via `task_write_slot`, computes `W @ normalized_fragment`, sends result to Linear collect PE.
-
-### SRAM slot layout
-
-| Slot | Contents |
-|------|----------|
-| 0 | Input activations (triggers RmsNormPartialSum) |
-| 1 | Scale factor from reduce (triggers RmsNormNormalize) |
-| 2 | Gamma weights |
-| 3 | Normalize output (triggers Linear) |
-| 4 | Linear weights |
-| 5 | Linear bias |
-
-The co-located `LinearEntry` uses `trigger_slot=3`, `input_slot=3`, `weight_slot=4`, `bias_slot=5` (instead of the default 0, 0, 1, 2). `_load_linear_weights` must be called with `weight_slot=4, bias_slot=5` for co-located PEs. The existing `LinearEntry` fields already support configurable slot values — no new entry types are needed, and `lower.py` requires no changes.
-
-### RmsNorm collect PE eliminated
-
-The RmsNorm collect PE is eliminated entirely. It existed solely to gather normalized fragments and forward them downstream. With co-location, each tile's normalized fragment is consumed locally by its co-located Linear task — there is nothing to collect.
-
-This also eliminates all ConcatCollectForward tasks associated with RmsNorm collects (8 tasks in the current benchmark) and the messages between them.
+Place the Linear collect PE and its downstream ADD PE on the same coordinate. The ConcatCollectForward task's route to the ADD becomes a 0-hop self-delivery — the message is created but delivered instantly on the same PE with no hop latency. The residual input still arrives via message as today. This requires no runtime changes — the existing message delivery mechanism handles 0-hop routes naturally.
 
 ### Applicability
 
-Only applies when RmsNorm feeds directly into Linear, which covers both cases in the transformer block:
-- RmsNorm → Q/K/V projections (attention sublayer)
-- RmsNorm → FFN up-projection
+Two instances in the transformer block:
+- `out_proj` collect + `add1` (attention residual)
+- `ffn2` collect + `add2` (FFN residual)
+
+The optimization applies when a ConcatCollectForward PE has exactly one downstream ADD PE as its sole non-broadcast destination. The collect's broadcast routes to other downstream operators (if any) are unchanged.
+
+### SRAM slot conflict resolution
+
+The collect PE uses slots 0..N-1 for fragment gathering. The ADD normally uses slots 0 and 1 for its two inputs. To avoid conflicts, edges targeting co-located ADD nodes have their `dst_slot` offset by N (the collect's `num_fragments`). The ADD sees its inputs at slots N and N+1, with output at slot N+2. The route pass's `_route_add` reads these remapped slots naturally.
 
 ### Placement
 
-The co-located column replaces both the RmsNorm column and the downstream Linear column:
+The ADD PE is eliminated as a separate node. Instead, the collect PE absorbs the add functionality. In `_place_columns`, when we encounter a PassthroughGroup(ADD) whose sole input is a preceding collect PE, we skip placing it and mark the collect PE as hosting the add.
 
-```
-Current (2 columns):              Co-located (1 column):
-RmsNorm col    Linear col         Combined col
-row 5: rn_collect  lin_collect    row 5: lin_collect
-row 4: rn_reduce   lin_tile_3    row 4: rn_tile_3 + lin_tile_3
-row 3: rn_tile_3   lin_tile_2    row 3: rn_tile_2 + lin_tile_2
-row 2: rn_tile_2   lin_tile_1    row 2: rn_tile_1 + lin_tile_1
-row 1: rn_tile_1   lin_tile_0    row 1: rn_tile_0 + lin_tile_0
-row 0: rn_tile_0                 row 0: rn_reduce
-```
-
-The RmsNorm reduce PE is placed at row 0 (below all co-located tiles). Co-located tiles start at row 1. The Linear collect PE is placed at the top (above all tiles). Phase 3 middle-collect logic applies to the Linear collect PE within this column — it may be placed at the center of the tile range rather than the top, depending on column height.
-
-### Constraints
-
-- RmsNorm and downstream Linear must have the same number of tiles. This is already the case — both are tiled by mesh_height.
-- Co-located PEs need more SRAM slots (6 vs 3 for a standalone tile). Not a concern for the simulator.
-- When RmsNorm fans out to multiple downstream Linear groups (e.g., Q, K, V), the first downstream Linear in topological order is co-located. The others receive via messages as today. Co-locating all three would require each PE to host Q, K, and V Linear tasks simultaneously — deferred to future work (see Out of Scope).
+This interacts with Phase 2 compact placement: the ADD was previously a single-PE group that sometimes merged into a neighbor. Now it doesn't exist as a separate node — it lives on the collect PE.
 
 ### Files changed
 
-- `expand.py` — detect RmsNorm→Linear pairs and mark them for co-location.
-- `place.py` — place co-located pairs in a single column, eliminate RmsNorm collect PE.
-- `route.py` — generate local SRAM triggers instead of messages for co-located pairs, remove RmsNorm collect routing.
+- `place.py` — detect collect→add pairs, skip placing separate ADD PE, co-locate on collect PE coordinate.
+- `route.py` — generate Add tasks on the collect PE, triggered by a local SRAM slot write instead of a message. Route residual input to the collect PE's add slot.
+- `expand.py` — update node expansions so ADD node maps to the collect PE coordinate.
 
 ### Expected impact
 
-Eliminates one message round per position per RmsNorm→Linear pair. Reduces column count by 1 per co-located pair (up to 2 fewer columns for the transformer block). Removes 8 ConcatCollectForward tasks.
+Eliminates 2 messages (one per residual connection) and 2 columns (ADD PEs merged into collect PEs). Reduces final_timestamp by removing 2 hops from the critical path.
 
 ---
 
@@ -273,9 +237,9 @@ Eliminates one message round per position per RmsNorm→Linear pair. Reduces col
 | `route.py` | 1 | Enhance `_try_linear_broadcast` to group by `(dest_x, payload_slot)` |
 | `place.py` | 2 | Add `_compact_columns` pass |
 | `place.py` | 3 | Middle collect PE placement in `_place_tiled_compute_group`, `_place_rmsnorm_group`, `_place_attention_group` |
-| `expand.py` | 4 | Detect RmsNorm→Linear co-location pairs |
-| `place.py` | 4 | Co-located column placement, eliminate RmsNorm collect PE |
-| `route.py` | 4 | Local SRAM triggers for co-located tasks, remove RmsNorm collect routing |
+| `expand.py` | 4 | Update node expansions for collect+add co-location |
+| `place.py` | 4 | Detect collect→add pairs, skip separate ADD PE |
+| `route.py` | 4 | Generate Add tasks on collect PE with local SRAM triggers |
 
 **No changes**: `runtime.rs`, `message.rs`, `pe.rs`, `program.rs`, `bridge.rs`, `artifact.py`, `lower.py`, `graph_ir.py`, `config.py`.
 
@@ -306,9 +270,9 @@ Eliminates one message round per position per RmsNorm→Linear pair. Reduces col
 
 ### Phase 4 tests
 
-- `test_rmsnorm_linear_colocation`: co-located PE has both RmsNormNormalize and Linear tasks.
-- `test_rmsnorm_collect_eliminated`: no RmsNorm collect PE in the spatial IR when downstream is Linear.
-- `test_colocation_sram_slots`: correct slot layout (0–5).
+- `test_collect_add_colocation`: co-located PE has both ConcatCollectForward and Add tasks.
+- `test_add_pe_eliminated`: no separate ADD PE in the spatial IR when preceded by a collect PE.
+- `test_colocation_numerical_correctness`: transformer block outputs match reference with co-location enabled.
 
 ### Numerical correctness
 
@@ -318,12 +282,12 @@ All existing tests (95 Rust, 278+ Python) must pass unchanged after each phase. 
 
 ## Out of Scope
 
+- **RmsNorm+Linear co-location** — RmsNorm tiles produce feature fragments, but Linear tiles need the full input vector. Co-location requires a streaming dot product (accumulating partial products as fragments arrive), which needs a new Rust task kind. Deferred to a future milestone.
 - **ConcatCollect elimination** — N×M messages (fragment-to-fragment) is worse than N+2 (gather + broadcast). Not worth the complexity.
 - **Parallel sends from a single PE** — runtime change, not a compiler optimization.
 - **Tree-shaped multicast** — only linear-path broadcast. Can be added later.
 - **Congestion-aware routing** — broadcast reduces link pressure but we don't model congestion.
 - **New operators or model capabilities** — this milestone is purely about performance.
-- **Multi-group co-location** — co-locating Q, K, and V Linear tasks on each RmsNorm tile PE. Possible future optimization but adds significant per-PE complexity.
 
 ---
 
@@ -333,7 +297,7 @@ All existing tests (95 Rust, 278+ Python) must pass unchanged after each phase. 
 - Multi-column broadcast grouping reduces sends from high-fanout PEs.
 - Compact placement reduces mesh width from 13 to ~9–10 columns.
 - Middle collect PE placement reduces max internal tile→collect hops by ~50%.
-- RmsNorm+Linear co-location eliminates RmsNorm collect PEs and associated ConcatCollectForward tasks.
+- LinearCollect+Add co-location eliminates separate ADD PEs and their inbound messages.
 - Benchmark metrics improve monotonically across phases for both configs.
 - `final_timestamp` decreases for both configs.
 - All existing tests pass unchanged (numerical correctness preserved).
