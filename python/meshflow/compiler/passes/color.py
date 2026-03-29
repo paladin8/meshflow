@@ -13,7 +13,7 @@ deliver_slot).
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from meshflow.compiler.config import CompilerConfig
 from meshflow.compiler.schedule_ir import (
@@ -298,6 +298,52 @@ def _greedy_color(
     return colors
 
 
+def _diversify_colors(
+    colors: list[int],
+    graph: dict[int, set[int]],
+    route_source_pes: list[tuple[int, int]],
+    color_budget: int,
+) -> None:
+    """Re-color routes to maximize per-PE color diversity.
+
+    For each PE with multiple same-colored routes, try to reassign some
+    to different colors.  A route can be reassigned to color C if:
+    - C < color_budget
+    - No conflicting neighbor already uses C
+
+    This never increases the chromatic number — it only moves routes
+    between valid colors within the existing range.
+    """
+    # Group routes by source PE
+    pe_routes: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for idx, pe in enumerate(route_source_pes):
+        pe_routes[pe].append(idx)
+
+    for pe_coord, route_indices in pe_routes.items():
+        if len(route_indices) <= 1:
+            continue
+
+        # For each route at this PE, try to assign a unique color
+        used_at_pe: set[int] = set()
+        for idx in route_indices:
+            current = colors[idx]
+            if current not in used_at_pe:
+                # Already unique at this PE
+                used_at_pe.add(current)
+                continue
+
+            # Try to find an alternative color not used at this PE
+            forbidden = {colors[n] for n in graph.get(idx, set()) if colors[n] >= 0}
+            for candidate in range(color_budget):
+                if candidate not in forbidden and candidate not in used_at_pe:
+                    colors[idx] = candidate
+                    used_at_pe.add(candidate)
+                    break
+            else:
+                # No alternative found; keep current color
+                used_at_pe.add(current)
+
+
 # ---------------------------------------------------------------------------
 # Write-back & routing table generation
 # ---------------------------------------------------------------------------
@@ -315,7 +361,10 @@ def _write_back_colors(
         task = pe.tasks[task_idx]
 
         if route_idx >= 0:
-            # Multi-route task: set color on the BroadcastRoute
+            # Multi-route task: set color on the BroadcastRoute.
+            # The route pass may reuse BroadcastRoute objects across tasks,
+            # so we replace with a copy when setting a different color to
+            # avoid aliasing issues.
             assert isinstance(
                 task,
                 (
@@ -326,7 +375,9 @@ def _write_back_colors(
                     RmsNormReduceEntry,
                 ),
             )
-            task.routes[route_idx].color = assigned_color
+            br = task.routes[route_idx]
+            if br.color != assigned_color:
+                task.routes[route_idx] = replace(br, color=assigned_color)
         else:
             # Single-route task: set route_color on the entry
             assert isinstance(
@@ -404,8 +455,10 @@ def color(schedule: ScheduleIR, config: CompilerConfig | None = None) -> Schedul
     # Step 3: Build conflict graph
     graph = _build_conflict_graph(routes)
 
-    # Step 4: Greedy coloring
+    # Step 4: Greedy coloring + diversity pass for parallel send throughput
     colors = _greedy_color(len(routes), graph)
+    route_source_pes = [r.source_coord for r in routes]
+    _diversify_colors(colors, graph, route_source_pes, config.color_budget)
 
     # Step 5: Budget check
     chromatic_number = max(colors) + 1 if colors else 0

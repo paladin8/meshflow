@@ -304,6 +304,56 @@ The parallel send model directly reduces the serialized-send bottleneck from M9.
 
 ---
 
+## Phase 2.1: Color Diversity for Parallel Send Throughput
+
+### Problem
+
+The behavior-based conflict model from Phase 1 minimizes the chromatic number (6 colors for the transformer block) but consolidates routes onto the fewest colors possible. When a collect PE broadcasts to tiles at (5,0), (5,1), (5,2), (5,3), all routes go East first — same direction at each intermediate PE — so they don't conflict and all get color 0. Phase 2's parallel send model then serializes them because they share a color.
+
+### Change
+
+Modify `_greedy_color` in `color.py` to prefer color diversity at each source PE. When assigning a color to a route, avoid colors already used by other routes from the same source PE — not just colors used by conflicting neighbors.
+
+The modified algorithm:
+
+```python
+for idx in order:
+    forbidden = {colors[n] for n in graph.get(idx, set()) if colors[n] >= 0}
+    pe_colors = {colors[j] for j in same_pe_routes[source_pe] if colors[j] >= 0}
+    # Prefer a color not forbidden AND not used by same PE
+    c = 0
+    while c in forbidden or c in pe_colors:
+        c += 1
+    # If this exceeds budget, fall back to lowest non-forbidden
+    if c >= budget:
+        c = 0
+        while c in forbidden:
+            c += 1
+    colors[idx] = c
+```
+
+This spreads routes from the same PE across distinct colors (up to K), falling back to shared colors only when the budget would be exceeded.
+
+### Example
+
+RmsNorm collect PE broadcasting 3 routes East to Q/K/V columns:
+- **Before**: all 3 get color 0 (no conflicts) → 3 serial sends (3 ticks)
+- **After**: get colors 0, 1, 2 → 3 parallel sends (1 tick)
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `color.py` | Modify `_greedy_color` to accept source PE mapping and color budget; prefer PE-diverse colors |
+| `test_color.py` | Add test for color diversity at same-PE routes |
+| `test_benchmark.py` | Tighten `final_timestamp` thresholds |
+
+### Expected impact
+
+Significant reduction in `final_timestamp` for both configs — high-fanout PEs now parallelize their sends across K colors instead of serializing on color 0.
+
+---
+
 ## Phase 3: Per-PE Routing Tables
 
 ### Problem

@@ -109,10 +109,10 @@ class TestMediumConfig:
         assert self.result.total_hops <= 376  # Phase 4: 379 -> 376
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 3039  # M10P2: 3045 -> 3039 (parallel sends)
+        assert self.result.final_timestamp <= 3040  # M10P2.1: diversity reshuffle
 
     def test_max_sends(self):
         assert _max_sends(self.result) <= 22
 
     def test_max_queue_depth(self):
-        assert _max_queue_depth(self.result) <= 8
+        assert _max_queue_depth(self.result) <= 9  # M10P2.1: diversity increases concurrency

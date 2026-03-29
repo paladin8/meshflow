@@ -439,6 +439,75 @@ class TestRoutingTableEntriesGenerated:
         assert len(pes_with_tables) > 0, "expected some PEs to have routing tables"
 
 
+class TestColorDiversity:
+    """Diversity pass spreads colors across routes from the same PE."""
+
+    def test_same_pe_routes_get_diverse_colors(self) -> None:
+        """Routes from the same PE that don't conflict should get different colors."""
+        # 4 routes from (0,0), each going to a different destination via 2 hops.
+        # All share intermediate PE (1,0) going East — same behavior, no conflict.
+        # Without diversity: all get color 0. With diversity: colors 0,1,2,3.
+        pe_schedules = [
+            PESchedule(
+                coord=(0, 0),
+                tasks=[
+                    ConcatCollectForwardEntry(
+                        trigger_slot=0,
+                        num_fragments=1,
+                        total_rows=4,
+                        fragment_offset=0,
+                        fragment_rows=4,
+                        routes=[
+                            BroadcastRoute(
+                                dest=(2, i),
+                                hops=[Direction.EAST, Direction.EAST] + [Direction.NORTH] * i,
+                                payload_slot=i,
+                            )
+                            for i in range(4)
+                        ],
+                    ),
+                ],
+            ),
+            PESchedule(coord=(1, 0), tasks=[]),
+            PESchedule(coord=(2, 0), tasks=[]),
+            PESchedule(coord=(2, 1), tasks=[]),
+            PESchedule(coord=(2, 2), tasks=[]),
+            PESchedule(coord=(2, 3), tasks=[]),
+        ]
+        schedule = _make_schedule(pe_schedules)
+        colored = color(schedule)
+
+        route_colors = [r.color for r in colored.pe_schedules[0].tasks[0].routes]
+        distinct = len(set(route_colors))
+        assert distinct == 4, f"expected 4 distinct colors, got {distinct}: {route_colors}"
+
+    def test_transformer_block_diversity(self) -> None:
+        """High-fanout PEs in transformer block should use multiple colors."""
+        graph = transformer_block(seq_len=4, d_model=8, d_ff=16)
+        weights = transformer_weights(d_model=8, d_ff=16)
+        config = CompilerConfig()
+        expanded = expand(graph, config)
+        spatial = place(expanded, config)
+        schedule = route(spatial, config, weights)
+        colored = color(schedule, config)
+
+        # Find the PE with the most routes
+        from collections import defaultdict
+
+        pe_colors: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for pe in colored.pe_schedules:
+            for task in pe.tasks:
+                if hasattr(task, "routes"):
+                    for r in task.routes:
+                        pe_colors[pe.coord].append(r.color)
+
+        # The busiest PE should use more than 2 distinct colors
+        if pe_colors:
+            busiest = max(pe_colors.values(), key=len)
+            distinct = len(set(busiest))
+            assert distinct > 2, f"busiest PE has {len(busiest)} routes but only {distinct} colors"
+
+
 class TestColorPassIntegration:
     """Integration tests: color pass works with the full compiler pipeline."""
 
