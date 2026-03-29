@@ -61,6 +61,9 @@ pub struct ProfileSummary {
     pub trace_events: Vec<TraceEvent>,
     pub operator_timings: Vec<OperatorTiming>,
     pub link_counts: HashMap<(Coord, Coord), u64>,
+    /// Number of times a same-color message was delayed on a link due to contention.
+    /// Should be 0 for correctly-colored programs.
+    pub color_contentions: u64,
 }
 
 impl ProfileSummary {
@@ -75,6 +78,7 @@ impl ProfileSummary {
             trace_events: Vec::new(),
             operator_timings: Vec::new(),
             link_counts: HashMap::new(),
+            color_contentions: 0,
         }
     }
 }
@@ -104,6 +108,7 @@ mod tests {
         let p = ProfileSummary::new();
         assert_eq!(p.total_messages, 0);
         assert_eq!(p.total_hops, 0);
+        assert_eq!(p.color_contentions, 0);
         assert!(p.per_pe.is_empty());
         assert!(p.trace_events.is_empty());
         assert!(p.operator_timings.is_empty());

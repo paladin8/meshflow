@@ -79,6 +79,10 @@ pub struct Simulator {
     pending_counts: HashMap<Coord, u64>,
     /// Peak pending count per PE (written to PeCounters at end).
     max_pending: HashMap<Coord, u64>,
+    /// Per-(directed_link, color) free-at time for contention tracking.
+    /// Key is (from_coord, to_coord, color), value is the earliest time
+    /// this (link, color) pair is available for a new message.
+    link_color_free_at: HashMap<(Coord, Coord, u32), u64>,
 }
 
 impl Simulator {
@@ -91,6 +95,7 @@ impl Simulator {
             next_message_id: 0,
             pending_counts: HashMap::new(),
             max_pending: HashMap::new(),
+            link_color_free_at: HashMap::new(),
             config,
         }
     }
@@ -306,13 +311,26 @@ impl Simulator {
                 .entry((coord, neighbor))
                 .or_insert(0) += 1;
 
+            // Per-(link, color) contention tracking
+            let key = (coord, neighbor, message.color);
+            let free_at = self.link_color_free_at.get(&key).copied().unwrap_or(0);
+            let entry_time = std::cmp::max(timestamp, free_at);
+
+            if entry_time > timestamp {
+                // Same-color contention detected — compiler produced a bad color assignment.
+                self.profile.color_contentions += 1;
+            }
+
+            self.link_color_free_at
+                .insert(key, entry_time + self.config.hop_latency);
+
             // Move message into the next event
             let forwarded = std::mem::take(&mut message.payload);
             let mut new_message = message.clone();
             new_message.payload = forwarded;
 
             self.enqueue_deliver(
-                timestamp + self.config.hop_latency,
+                entry_time + self.config.hop_latency,
                 neighbor,
                 coord,
                 new_message,
@@ -886,7 +904,8 @@ impl Simulator {
 
     /// Broadcast `payload` (cloned) to every route destination, one message
     /// per route.  The `messages_sent` counter on `coord` is incremented
-    /// by `routes.len()`.  Send times are serialised: `base_time + i`.
+    /// by `routes.len()`.  Messages on different colors depart in parallel;
+    /// messages on the same color are serialized within that color.
     fn broadcast_to_dests(
         &mut self,
         base_time: u64,
@@ -895,8 +914,12 @@ impl Simulator {
         payload: Vec<f32>,
     ) {
         self.mesh.pe_mut(coord).counters.messages_sent += routes.len() as u64;
-        for (i, route) in routes.iter().enumerate() {
-            let send_time = base_time + i as u64;
+        // Track how many messages per color have been sent so far
+        let mut color_counts: HashMap<u32, u64> = HashMap::new();
+        for route in routes.iter() {
+            let count = color_counts.entry(route.color).or_insert(0);
+            let send_time = base_time + *count; // serialize within same color only
+            *count += 1;
             if route.deliver_at.is_empty() {
                 self.emit_message(
                     send_time,
@@ -924,8 +947,9 @@ impl Simulator {
 
     /// Scatter `result` across `routes`: row `i` (of length `result.len() /
     /// routes.len()`) goes to `routes[i]`.  The `messages_sent` counter on
-    /// `coord` is incremented by `routes.len()`.  Send times are serialised:
-    /// `base_time + i`.  No-ops when `routes` is empty.
+    /// `coord` is incremented by `routes.len()`.  Messages on different colors
+    /// depart in parallel; messages on the same color are serialized.
+    /// No-ops when `routes` is empty.
     fn scatter_to_dests(
         &mut self,
         base_time: u64,
@@ -938,8 +962,12 @@ impl Simulator {
         }
         let row_size = result.len() / routes.len();
         self.mesh.pe_mut(coord).counters.messages_sent += routes.len() as u64;
+        // Track how many messages per color have been sent so far
+        let mut color_counts: HashMap<u32, u64> = HashMap::new();
         for (i, route) in routes.iter().enumerate() {
-            let send_time = base_time + i as u64;
+            let count = color_counts.entry(route.color).or_insert(0);
+            let send_time = base_time + *count; // serialize within same color only
+            *count += 1;
             let row = result[i * row_size..(i + 1) * row_size].to_vec();
             self.emit_message(
                 send_time,
@@ -2973,5 +3001,353 @@ mod tests {
             Some(&expected),
             "PE (0,3) should receive identical payload"
         );
+    }
+
+    // ---------- Phase 2: Parallel sends & contention tracking ----------
+
+    /// Build a BroadcastRouteRuntime with a specific color.
+    fn route_p2p_colored(
+        dest: Coord,
+        hops: Vec<Direction>,
+        payload_slot: SlotId,
+        color: u32,
+    ) -> BroadcastRouteRuntime {
+        BroadcastRouteRuntime {
+            dest,
+            hops,
+            deliver_at: vec![],
+            payload_slot,
+            color,
+        }
+    }
+
+    #[test]
+    fn parallel_send_different_colors_broadcast() {
+        // 3 routes on 3 different colors should all depart at base_time (no serialization).
+        // PE (0,0) broadcasts to (1,0), (2,0), (3,0) on colors 0, 1, 2.
+        let mut s = sim(4, 1);
+
+        // Add collect tasks at each destination
+        for x in 1..=3 {
+            s.add_task(InjectTask {
+                coord: Coord::new(x, 0),
+                kind: InjectTaskKind::CollectOutput { input_slot: x },
+                trigger_slot: x,
+            });
+        }
+
+        // Set up broadcast routes with different colors
+        let routes = vec![
+            route_p2p_colored(Coord::new(1, 0), vec![Direction::East], 1, 0),
+            route_p2p_colored(
+                Coord::new(2, 0),
+                vec![Direction::East, Direction::East],
+                2,
+                1,
+            ),
+            route_p2p_colored(
+                Coord::new(3, 0),
+                vec![Direction::East, Direction::East, Direction::East],
+                3,
+                2,
+            ),
+        ];
+
+        // Write payload to source PE
+        s.write_sram(Coord::new(0, 0), 0, vec![10.0, 20.0]);
+
+        // Use ConcatCollectForward task to drive the broadcast
+        let task = TaskConfig {
+            kind: TaskKind::ConcatCollectForward {
+                num_fragments: 1,
+                total_rows: 1,
+                fragment_offset: 0,
+                fragment_rows: 1,
+                activation: None,
+                routes: routes,
+                scatter: false,
+                num_positions: 0,
+            },
+            trigger_slot: 0,
+        };
+        s.add_task_direct(Coord::new(0, 0), task);
+
+        // Inject a message to trigger the task
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![10.0, 20.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+
+        // All messages should arrive correctly
+        assert_eq!(
+            result.outputs.get(&Coord::new(1, 0)),
+            Some(&vec![10.0, 20.0])
+        );
+        assert_eq!(
+            result.outputs.get(&Coord::new(2, 0)),
+            Some(&vec![10.0, 20.0])
+        );
+        assert_eq!(
+            result.outputs.get(&Coord::new(3, 0)),
+            Some(&vec![10.0, 20.0])
+        );
+
+        // No color contention since all routes use different colors
+        assert_eq!(result.profile.color_contentions, 0);
+    }
+
+    #[test]
+    fn serial_send_same_color_vs_parallel_different_colors() {
+        // Compare final_timestamp between same-color (serialized) and
+        // different-color (parallel) broadcasts.
+        //
+        // Setup: PE (0,0) broadcasts to (1,0), (2,0), (3,0).
+        // With 3 routes on 1 color: sends at base_time+0, +1, +2 (serialized).
+        // With 3 routes on 3 colors: all send at base_time+0 (parallel).
+        //
+        // The last message to arrive determines final_timestamp.
+        // Farthest dest is (3,0) = 3 hops.
+        // Same color: send_time for (3,0) = base_time + 2, arrive = base_time + 2 + 3 = base + 5
+        // Diff color: send_time for (3,0) = base_time + 0, arrive = base_time + 0 + 3 = base + 3
+
+        // --- Same color run ---
+        let run_same = || {
+            let mut s = sim(4, 1);
+            for x in 1..=3u32 {
+                s.add_task(InjectTask {
+                    coord: Coord::new(x, 0),
+                    kind: InjectTaskKind::CollectOutput { input_slot: x },
+                    trigger_slot: x,
+                });
+            }
+            let routes = vec![
+                route_p2p_colored(Coord::new(1, 0), vec![Direction::East], 1, 0),
+                route_p2p_colored(
+                    Coord::new(2, 0),
+                    vec![Direction::East, Direction::East],
+                    2,
+                    0,
+                ),
+                route_p2p_colored(
+                    Coord::new(3, 0),
+                    vec![Direction::East, Direction::East, Direction::East],
+                    3,
+                    0,
+                ),
+            ];
+            let task = TaskConfig {
+                kind: TaskKind::ConcatCollectForward {
+                    num_fragments: 1,
+                    total_rows: 1,
+                    fragment_offset: 0,
+                    fragment_rows: 1,
+                    activation: None,
+                    routes,
+                    scatter: false,
+                    num_positions: 0,
+                },
+                trigger_slot: 0,
+            };
+            s.add_task_direct(Coord::new(0, 0), task);
+            s.inject_message(InjectMessage {
+                source: Coord::new(0, 0),
+                dest: Coord::new(0, 0),
+                payload: vec![10.0, 20.0],
+                payload_slot: 0,
+            });
+            s.run()
+        };
+
+        // --- Different color run ---
+        let run_diff = || {
+            let mut s = sim(4, 1);
+            for x in 1..=3u32 {
+                s.add_task(InjectTask {
+                    coord: Coord::new(x, 0),
+                    kind: InjectTaskKind::CollectOutput { input_slot: x },
+                    trigger_slot: x,
+                });
+            }
+            let routes = vec![
+                route_p2p_colored(Coord::new(1, 0), vec![Direction::East], 1, 0),
+                route_p2p_colored(
+                    Coord::new(2, 0),
+                    vec![Direction::East, Direction::East],
+                    2,
+                    1,
+                ),
+                route_p2p_colored(
+                    Coord::new(3, 0),
+                    vec![Direction::East, Direction::East, Direction::East],
+                    3,
+                    2,
+                ),
+            ];
+            let task = TaskConfig {
+                kind: TaskKind::ConcatCollectForward {
+                    num_fragments: 1,
+                    total_rows: 1,
+                    fragment_offset: 0,
+                    fragment_rows: 1,
+                    activation: None,
+                    routes,
+                    scatter: false,
+                    num_positions: 0,
+                },
+                trigger_slot: 0,
+            };
+            s.add_task_direct(Coord::new(0, 0), task);
+            s.inject_message(InjectMessage {
+                source: Coord::new(0, 0),
+                dest: Coord::new(0, 0),
+                payload: vec![10.0, 20.0],
+                payload_slot: 0,
+            });
+            s.run()
+        };
+
+        let result_same = run_same();
+        let result_diff = run_diff();
+
+        // Both should produce correct outputs
+        for x in 1..=3u32 {
+            assert_eq!(
+                result_same.outputs.get(&Coord::new(x, 0)),
+                Some(&vec![10.0, 20.0])
+            );
+            assert_eq!(
+                result_diff.outputs.get(&Coord::new(x, 0)),
+                Some(&vec![10.0, 20.0])
+            );
+        }
+
+        // Parallel sends (different colors) should finish earlier or equal
+        assert!(
+            result_diff.profile.final_timestamp <= result_same.profile.final_timestamp,
+            "Different-color parallel sends should finish no later than same-color serial sends: \
+             diff={}, same={}",
+            result_diff.profile.final_timestamp,
+            result_same.profile.final_timestamp
+        );
+    }
+
+    #[test]
+    fn link_color_free_at_contention_detection() {
+        // Two messages on the same color traversing the same link at the same
+        // time should increment color_contentions.
+        //
+        // Setup: inject 2 messages from (0,0) to (1,0), both color 0.
+        // They both traverse link (0,0)->(1,0) at nearly the same time.
+        let mut s = sim(2, 1);
+        s.add_task(InjectTask {
+            coord: Coord::new(1, 0),
+            kind: InjectTaskKind::CollectOutput { input_slot: 0 },
+            trigger_slot: 0,
+        });
+
+        // First message: (0,0) -> (1,0)
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(1, 0),
+            payload: vec![1.0],
+            payload_slot: 0,
+        });
+        // Second message: (0,0) -> (1,0)
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(1, 0),
+            payload: vec![2.0],
+            payload_slot: 0,
+        });
+
+        let result = s.run();
+
+        // Both messages use color 0 and traverse (0,0)->(1,0).
+        // The first message gets through at t=0; the second arrives at t=0 too,
+        // but the link is busy until t=1 (hop_latency=1), so it's delayed.
+        assert!(
+            result.profile.color_contentions > 0,
+            "Two same-color messages on same link should cause contention"
+        );
+    }
+
+    #[test]
+    fn link_color_free_at_no_contention_different_colors() {
+        // Two messages on different colors traversing the same link should
+        // NOT cause contention.
+        //
+        // We need to manually construct this since inject_message always uses color 0.
+        // Instead, use two ForwardActivation tasks with different colors.
+        let mut s = sim(3, 1);
+
+        // Task 1: forward from (0,0) to (2,0) with color 0
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::ForwardActivation {
+                    input_slot: 0,
+                    route_dest: Coord::new(2, 0),
+                    hops: vec![Direction::East, Direction::East],
+                    payload_slot: 0,
+                    color: 0,
+                },
+                trigger_slot: 0,
+            },
+        );
+
+        // Task 2: forward from (0,0) to (2,0) with color 1
+        s.add_task_direct(
+            Coord::new(0, 0),
+            TaskConfig {
+                kind: TaskKind::ForwardActivation {
+                    input_slot: 1,
+                    route_dest: Coord::new(2, 0),
+                    hops: vec![Direction::East, Direction::East],
+                    payload_slot: 1,
+                    color: 1,
+                },
+                trigger_slot: 1,
+            },
+        );
+
+        // Collect both at destination
+        s.add_task(InjectTask {
+            coord: Coord::new(2, 0),
+            kind: InjectTaskKind::CollectOutput { input_slot: 0 },
+            trigger_slot: 0,
+        });
+
+        // Trigger both tasks at the same time by delivering to their slots
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![1.0],
+            payload_slot: 0,
+        });
+        s.inject_message(InjectMessage {
+            source: Coord::new(0, 0),
+            dest: Coord::new(0, 0),
+            payload: vec![2.0],
+            payload_slot: 1,
+        });
+
+        let result = s.run();
+
+        // Different colors on the same link should not cause contention
+        assert_eq!(
+            result.profile.color_contentions, 0,
+            "Different-color messages on the same link should not contend"
+        );
+    }
+
+    #[test]
+    fn color_contentions_zero_for_empty_sim() {
+        let s = sim(2, 2);
+        let result = s.run();
+        assert_eq!(result.profile.color_contentions, 0);
     }
 }

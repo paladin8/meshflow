@@ -1,6 +1,6 @@
 """Benchmark regression tests — asserts key metrics don't exceed baseline.
 
-Thresholds are tightened after each M9 phase to lock in improvements.
+Thresholds are tightened after each milestone phase to lock in improvements.
 """
 
 import torch
@@ -77,13 +77,15 @@ class TestSmallConfig:
         assert self.result.total_hops <= 218  # Phase 4: 221 -> 218
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 699  # Phase 4: 700 -> 699
+        assert self.result.final_timestamp <= 692  # M10P2: 699 -> 692 (parallel sends)
 
     def test_max_sends(self):
         assert _max_sends(self.result) <= 17
 
     def test_max_queue_depth(self):
-        assert _max_queue_depth(self.result) <= 6
+        assert (
+            _max_queue_depth(self.result) <= 8
+        )  # M10P2: 6 -> 8 (parallel sends increase concurrency)
 
     def test_max_hops_per_route(self):
         _, _, max_hops = _route_stats(self.program)
@@ -107,7 +109,7 @@ class TestMediumConfig:
         assert self.result.total_hops <= 376  # Phase 4: 379 -> 376
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 3045  # Phase 4: 3046 -> 3045
+        assert self.result.final_timestamp <= 3039  # M10P2: 3045 -> 3039 (parallel sends)
 
     def test_max_sends(self):
         assert _max_sends(self.result) <= 22

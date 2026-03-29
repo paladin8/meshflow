@@ -196,6 +196,8 @@ pub struct SimResult {
     pub operator_timings: PyObject,
     #[pyo3(get)]
     pub link_counts: PyObject,
+    #[pyo3(get)]
+    pub color_contentions: u64,
 }
 
 /// Run a simulation with the given configuration and inputs.
@@ -316,6 +318,7 @@ fn sim_result_to_py(py: Python<'_>, result: crate::runtime::SimResult) -> PyResu
         trace_events: trace_list.into(),
         operator_timings: timings_list.into(),
         link_counts: link_counts_dict.into(),
+        color_contentions: result.profile.color_contentions,
     })
 }
 
