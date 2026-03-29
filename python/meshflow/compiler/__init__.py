@@ -5,7 +5,7 @@ import numpy as np
 from meshflow.compiler.artifact import RuntimeProgram
 from meshflow.compiler.config import CompilerConfig, PlacementStrategy, RoutingStrategy
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
-from meshflow.compiler.passes import expand, lower, place, route
+from meshflow.compiler.passes import color, expand, lower, place, route
 
 __all__ = [
     "CompilerConfig",
@@ -40,6 +40,7 @@ def compile(
     expanded = expand(graph, config)
     spatial = place(expanded, config)
     schedule = route(spatial, config, weights)
+    schedule = color(schedule, config)
     return lower(schedule, config)
 
 

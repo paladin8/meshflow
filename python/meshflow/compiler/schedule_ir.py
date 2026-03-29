@@ -12,6 +12,19 @@ class Direction(Enum):
 
 
 @dataclass
+class RouteTableEntry:
+    """Per-PE routing table entry: forward a message in a direction.
+
+    direction: which way to forward the message.
+    deliver_slot: if set, deliver payload to this SRAM slot before forwarding
+                  (DeliverAndForward semantics). None means forward-only.
+    """
+
+    direction: Direction
+    deliver_slot: int | None = None
+
+
+@dataclass
 class BroadcastRoute:
     """A single route in a broadcast fan-out.
 
@@ -179,6 +192,7 @@ class PESchedule:
     coord: tuple[int, int]
     tasks: list[TaskEntry]
     initial_sram: dict[int, list[float]] = field(default_factory=dict)
+    routing_table: dict[int, RouteTableEntry] = field(default_factory=dict)
 
 
 @dataclass
