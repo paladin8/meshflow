@@ -54,6 +54,8 @@ pub struct BroadcastRouteRuntime {
     pub hops: Vec<Direction>,
     pub deliver_at: Vec<usize>,
     pub payload_slot: SlotId,
+    /// Route color ID for link multiplexing (0 = uncolored).
+    pub color: u32,
 }
 
 /// A task configuration assigned to a PE.
@@ -77,6 +79,8 @@ pub enum TaskKind {
         hops: Vec<Direction>,
         /// SRAM slot to deliver into on the destination PE (default 0).
         payload_slot: SlotId,
+        /// Route color ID for link multiplexing (0 = uncolored).
+        color: u32,
     },
     /// Consume payload from input_slot and mark it as simulation output.
     CollectOutput { input_slot: SlotId },
@@ -92,6 +96,8 @@ pub enum TaskKind {
         hops: Vec<Direction>,
         fragment_slot: SlotId,
         fragment_offset: u32,
+        /// Route color ID for link multiplexing (0 = uncolored).
+        color: u32,
     },
     /// Accumulate output fragments into a pre-allocated buffer.
     /// Each trigger writes fragment data at fragment_offset.
@@ -155,6 +161,8 @@ pub enum TaskKind {
         /// When > 0 and data.len() > feature_count, the input is position-major
         /// and per-position partial sums are computed.
         feature_count: u32,
+        /// Route color ID for link multiplexing (0 = uncolored).
+        color: u32,
     },
     /// RMSNorm phase 2: apply x * scale * gamma using scale from reduce PE.
     RmsNormNormalize {
@@ -367,6 +375,7 @@ mod tests {
             payload_slot: 0,
             timestamp: 0,
             deliver_at: vec![],
+            color: 0,
         };
         let msg2 = crate::message::Message {
             id: 2,
@@ -389,6 +398,7 @@ mod tests {
                 route_dest: Coord::new(1, 0),
                 hops: vec![Direction::East],
                 payload_slot: 0,
+                color: 0,
             },
             trigger_slot: 0,
         });

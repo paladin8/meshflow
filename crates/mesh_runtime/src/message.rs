@@ -26,6 +26,8 @@ pub struct Message {
     /// When non-empty, payload is delivered to intermediate PEs at these hop indices
     /// in addition to the final destination.
     pub deliver_at: Vec<usize>,
+    /// Route color ID for link multiplexing (0 = uncolored).
+    pub color: u32,
 }
 
 impl Message {
@@ -60,6 +62,7 @@ mod tests {
             payload_slot: 0,
             timestamp: 0,
             deliver_at: vec![],
+            color: 0,
         }
     }
 

@@ -45,6 +45,7 @@ def _lower_route(route: BroadcastRoute) -> BroadcastRouteTask:
         hops=[d.value for d in route.hops],
         deliver_at=list(route.deliver_at),
         payload_slot=route.payload_slot,
+        color=route.color,
     )
 
 
@@ -57,6 +58,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             route_dest=task.route_dest,
             route_hops=[d.value for d in task.route_hops],
             payload_slot=task.payload_slot,
+            route_color=task.route_color,
         )
     if isinstance(task, CollectOutputEntry):
         return CollectOutputTask(
@@ -75,6 +77,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             route_hops=[d.value for d in task.route_hops],
             fragment_slot=task.fragment_slot,
             fragment_offset=task.fragment_offset,
+            route_color=task.route_color,
         )
     if isinstance(task, ConcatCollectEntry):
         return ConcatCollectTask(
@@ -132,6 +135,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             slice_offset=task.slice_offset,
             slice_size=task.slice_size,
             feature_count=task.feature_count,
+            route_color=task.route_color,
         )
     if isinstance(task, RmsNormNormalizeEntry):
         return RmsNormNormalizeTask(

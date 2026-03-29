@@ -56,6 +56,8 @@ enum TaskProgram {
         route_hops: Vec<String>,
         #[serde(default)]
         payload_slot: u32,
+        #[serde(default)]
+        route_color: u32,
     },
     #[serde(rename = "collect_output")]
     CollectOutput { trigger_slot: u32, input_slot: u32 },
@@ -71,6 +73,8 @@ enum TaskProgram {
         route_hops: Vec<String>,
         fragment_slot: u32,
         fragment_offset: u32,
+        #[serde(default)]
+        route_color: u32,
     },
     #[serde(rename = "concat_collect")]
     ConcatCollect {
@@ -140,6 +144,8 @@ enum TaskProgram {
         slice_size: u32,
         #[serde(default)]
         feature_count: u32,
+        #[serde(default)]
+        route_color: u32,
     },
     #[serde(rename = "rms_norm_normalize")]
     RmsNormNormalize {
@@ -179,6 +185,8 @@ struct BroadcastRouteProgram {
     #[serde(default)]
     deliver_at: Vec<usize>,
     payload_slot: u32,
+    #[serde(default)]
+    color: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +413,7 @@ fn convert_routes(
                 hops,
                 deliver_at: r.deliver_at.clone(),
                 payload_slot: r.payload_slot,
+                color: r.color,
             })
         })
         .collect()
@@ -418,6 +427,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             route_dest,
             route_hops,
             payload_slot,
+            route_color,
         } => {
             let dest = Coord::new(route_dest.0, route_dest.1);
             validate_coord(dest, width, height)?;
@@ -431,6 +441,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     route_dest: dest,
                     hops,
                     payload_slot: *payload_slot,
+                    color: *route_color,
                 },
                 trigger_slot: *trigger_slot,
             })
@@ -455,6 +466,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             route_hops,
             fragment_slot,
             fragment_offset,
+            route_color,
         } => {
             let dest = Coord::new(route_dest.0, route_dest.1);
             validate_coord(dest, width, height)?;
@@ -473,6 +485,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     hops,
                     fragment_slot: *fragment_slot,
                     fragment_offset: *fragment_offset,
+                    color: *route_color,
                 },
                 trigger_slot: *trigger_slot,
             })
@@ -583,6 +596,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             slice_offset,
             slice_size,
             feature_count,
+            route_color,
         } => {
             let dest = Coord::new(reduce_dest.0, reduce_dest.1);
             validate_coord(dest, width, height)?;
@@ -599,6 +613,7 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     slice_offset: *slice_offset,
                     slice_size: *slice_size,
                     feature_count: *feature_count,
+                    color: *route_color,
                 },
                 trigger_slot: *trigger_slot,
             })

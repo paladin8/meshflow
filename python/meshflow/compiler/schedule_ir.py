@@ -25,6 +25,7 @@ class BroadcastRoute:
     hops: list[Direction] = field(default_factory=list)
     deliver_at: list[int] = field(default_factory=list)
     payload_slot: int = 0
+    color: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ class ForwardActivationEntry:
     route_dest: tuple[int, int] = (0, 0)
     route_hops: list[Direction] = field(default_factory=list)
     payload_slot: int = 0
+    route_color: int = 0
 
 
 @dataclass
@@ -62,6 +64,7 @@ class LinearEntry:
     route_hops: list[Direction] = field(default_factory=list)
     fragment_slot: int = 0
     fragment_offset: int = 0
+    route_color: int = 0
 
 
 @dataclass
@@ -131,6 +134,7 @@ class RmsNormPartialSumEntry:
     slice_offset: int = 0
     slice_size: int = 0
     feature_count: int = 0
+    route_color: int = 0
 
 
 @dataclass

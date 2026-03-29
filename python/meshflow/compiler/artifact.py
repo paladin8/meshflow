@@ -30,6 +30,7 @@ class BroadcastRouteTask:
     hops: list[str] = field(default_factory=list)
     deliver_at: list[int] = field(default_factory=list)
     payload_slot: int = 0
+    color: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +47,7 @@ class ForwardActivationTask:
     route_dest: tuple[int, int] = (0, 0)
     route_hops: list[str] = field(default_factory=list)
     payload_slot: int = 0
+    route_color: int = 0
 
 
 @dataclass
@@ -68,6 +70,7 @@ class LinearTask:
     route_hops: list[str] = field(default_factory=list)
     fragment_slot: int = 0
     fragment_offset: int = 0
+    route_color: int = 0
 
 
 @dataclass
@@ -137,6 +140,7 @@ class RmsNormPartialSumTask:
     slice_offset: int = 0
     slice_size: int = 0
     feature_count: int = 0
+    route_color: int = 0
 
 
 @dataclass
@@ -288,6 +292,7 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
                     hops=r["hops"],
                     deliver_at=r.get("deliver_at", []),
                     payload_slot=r["payload_slot"],
+                    color=r.get("color", 0),
                 )
                 for r in fields["routes"]
             ]
@@ -300,6 +305,7 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
                     hops=r["hops"],
                     deliver_at=r.get("deliver_at", []),
                     payload_slot=r["payload_slot"],
+                    color=r.get("color", 0),
                 )
                 for r in fields["routes"]
             ]
@@ -314,6 +320,7 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
                     hops=r["hops"],
                     deliver_at=r.get("deliver_at", []),
                     payload_slot=r["payload_slot"],
+                    color=r.get("color", 0),
                 )
                 for r in fields["routes"]
             ]
@@ -330,6 +337,7 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
                     hops=r["hops"],
                     deliver_at=r.get("deliver_at", []),
                     payload_slot=r["payload_slot"],
+                    color=r.get("color", 0),
                 )
                 for r in fields["routes"]
             ]
@@ -342,6 +350,7 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
                     hops=r["hops"],
                     deliver_at=r.get("deliver_at", []),
                     payload_slot=r["payload_slot"],
+                    color=r.get("color", 0),
                 )
                 for r in fields["routes"]
             ]

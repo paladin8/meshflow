@@ -129,6 +129,7 @@ mod tests {
             payload_slot: 0,
             timestamp,
             deliver_at: vec![],
+            color: 0,
         };
         queue.push(
             timestamp,

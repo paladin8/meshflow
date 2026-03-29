@@ -114,6 +114,7 @@ impl Simulator {
                     route_dest,
                     hops,
                     payload_slot: 0,
+                    color: 0,
                 }
             }
             InjectTaskKind::CollectOutput { input_slot } => TaskKind::CollectOutput { input_slot },
@@ -159,6 +160,7 @@ impl Simulator {
             payload_slot: msg.payload_slot,
             timestamp: 0,
             deliver_at: vec![],
+            color: 0,
         };
 
         // Enqueue at the source PE at timestamp 0.
@@ -370,6 +372,7 @@ impl Simulator {
                 route_dest,
                 hops,
                 payload_slot,
+                color,
             } => {
                 let pe = self.mesh.pe_mut(coord);
                 let data = pe.read_slot(input_slot).clone();
@@ -380,7 +383,15 @@ impl Simulator {
                 // Enqueue at current PE — the event loop will forward or
                 // deliver locally depending on whether hops is empty.
                 let send_time = timestamp + self.task_cost(0);
-                self.emit_message(send_time, coord, route_dest, hops, data, payload_slot);
+                self.emit_message(
+                    send_time,
+                    coord,
+                    route_dest,
+                    hops,
+                    data,
+                    payload_slot,
+                    color,
+                );
             }
             TaskKind::CollectOutput { input_slot } => {
                 let pe = self.mesh.pe_mut(coord);
@@ -400,6 +411,7 @@ impl Simulator {
                 hops,
                 fragment_slot,
                 fragment_offset: _,
+                color,
             } => {
                 let pe = self.mesh.pe_mut(coord);
                 let x = pe.read_slot(input_slot).clone();
@@ -431,7 +443,7 @@ impl Simulator {
 
                 let elements = (tile_rows as u64) * (tile_cols as u64) * (num_positions as u64);
                 let send_time = timestamp + self.task_cost(elements);
-                self.emit_message(send_time, coord, route_dest, hops, y, fragment_slot);
+                self.emit_message(send_time, coord, route_dest, hops, y, fragment_slot, color);
             }
             TaskKind::ConcatCollect {
                 num_fragments,
@@ -614,6 +626,7 @@ impl Simulator {
                 slice_offset,
                 slice_size,
                 feature_count,
+                color,
             } => {
                 let pe = self.mesh.pe_mut(coord);
                 let data = pe.read_slot(input_slot).clone();
@@ -670,6 +683,7 @@ impl Simulator {
                     reduce_hops,
                     payload,
                     partial_sum_slot,
+                    color,
                 );
             }
             TaskKind::RmsNormNormalize {
@@ -814,6 +828,7 @@ impl Simulator {
 
     /// Create and enqueue a single outbound message from `source` to `dest`.
     /// Increments `next_message_id` and calls `enqueue_deliver` on the source PE.
+    #[allow(clippy::too_many_arguments)]
     fn emit_message(
         &mut self,
         timestamp: u64,
@@ -822,6 +837,7 @@ impl Simulator {
         hops: Vec<Direction>,
         payload: Vec<f32>,
         payload_slot: SlotId,
+        color: u32,
     ) {
         let message = Message {
             id: self.next_message_id,
@@ -833,6 +849,7 @@ impl Simulator {
             payload_slot,
             timestamp,
             deliver_at: vec![],
+            color,
         };
         self.next_message_id += 1;
         self.enqueue_deliver(timestamp, source, source, message);
@@ -849,6 +866,7 @@ impl Simulator {
         deliver_at: Vec<usize>,
         payload: Vec<f32>,
         payload_slot: SlotId,
+        color: u32,
     ) {
         let message = Message {
             id: self.next_message_id,
@@ -860,6 +878,7 @@ impl Simulator {
             payload_slot,
             timestamp,
             deliver_at,
+            color,
         };
         self.next_message_id += 1;
         self.enqueue_deliver(timestamp, source, source, message);
@@ -886,6 +905,7 @@ impl Simulator {
                     route.hops.clone(),
                     payload.clone(),
                     route.payload_slot,
+                    route.color,
                 );
             } else {
                 self.emit_broadcast_message(
@@ -896,6 +916,7 @@ impl Simulator {
                     route.deliver_at.clone(),
                     payload.clone(),
                     route.payload_slot,
+                    route.color,
                 );
             }
         }
@@ -927,6 +948,7 @@ impl Simulator {
                 route.hops.clone(),
                 row,
                 route.payload_slot,
+                route.color,
             );
         }
     }
@@ -1073,6 +1095,7 @@ mod tests {
             hops,
             deliver_at: vec![],
             payload_slot,
+            color: 0,
         }
     }
 
@@ -1895,6 +1918,7 @@ mod tests {
                     slice_offset: 0,
                     slice_size: 0,
                     feature_count: 0,
+                    color: 0,
                 },
                 trigger_slot: 0,
             },
@@ -1929,6 +1953,7 @@ mod tests {
                     slice_offset: 0,
                     slice_size: 0,
                     feature_count: 0,
+                    color: 0,
                 },
                 trigger_slot: 0,
             },
@@ -2035,6 +2060,7 @@ mod tests {
                     slice_offset: 0,
                     slice_size: 0,
                     feature_count: 0,
+                    color: 0,
                 },
                 trigger_slot: 0,
             },
@@ -2121,6 +2147,7 @@ mod tests {
                         slice_offset: 0,
                         slice_size: 0,
                         feature_count: 0,
+                        color: 0,
                     },
                     trigger_slot: 0,
                 },
@@ -2222,6 +2249,7 @@ mod tests {
                     hops,
                     fragment_slot: 0,
                     fragment_offset: 0,
+                    color: 0,
                 },
                 trigger_slot: 0,
             },
@@ -2275,6 +2303,7 @@ mod tests {
                     hops,
                     fragment_slot: 0,
                     fragment_offset: 0,
+                    color: 0,
                 },
                 trigger_slot: 0,
             },
@@ -2481,6 +2510,7 @@ mod tests {
                     slice_offset: 0,
                     slice_size: 2,
                     feature_count: 2,
+                    color: 0,
                 },
                 trigger_slot: 0,
             },
@@ -2597,6 +2627,7 @@ mod tests {
                     slice_offset: 0,
                     slice_size: 2,
                     feature_count: 4,
+                    color: 0,
                 },
                 trigger_slot: 0,
             },
@@ -2631,6 +2662,7 @@ mod tests {
                     slice_offset: 2,
                     slice_size: 2,
                     feature_count: 4,
+                    color: 0,
                 },
                 trigger_slot: 0,
             },
@@ -2793,7 +2825,7 @@ mod tests {
         let deliver_at = vec![1, 2]; // deliver at (0,1) and (0,2); (0,3) is final
         let payload = vec![10.0, 20.0, 30.0];
 
-        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0);
+        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0, 0);
 
         let result = s.run();
 
@@ -2836,7 +2868,7 @@ mod tests {
         let deliver_at = vec![]; // point-to-point
         let payload = vec![10.0, 20.0, 30.0];
 
-        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0);
+        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0, 0);
 
         let result = s.run();
 
@@ -2877,7 +2909,7 @@ mod tests {
         let deliver_at = vec![1, 2];
         let payload = vec![1.0, 2.0, 3.0];
 
-        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0);
+        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0, 0);
 
         let result = s.run();
 
@@ -2921,7 +2953,7 @@ mod tests {
         let deliver_at = vec![1, 2];
         let payload = vec![1.0, 2.0, 3.0];
 
-        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0);
+        s.emit_broadcast_message(0, source, dest, hops, deliver_at, payload, 0, 0);
 
         let result = s.run();
 
