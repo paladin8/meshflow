@@ -107,7 +107,8 @@ def run_benchmark(config_name: str) -> dict:
         "hottest_link_count": hottest_link[1] if hottest_link else 0,
         "total_colors_used": result.total_colors_used,
         "max_colors_per_link": result.max_colors_per_link,
-        "color_contentions": result.color_contentions,
+        "link_contentions": result.link_contentions,
+        "total_link_wait_cycles": result.total_link_wait_cycles,
     }
 
 
@@ -129,7 +130,8 @@ def print_table(results: list[dict]) -> None:
         ("Hottest link", lambda r: f"{r['hottest_link']}: {r['hottest_link_count']} msgs"),
         ("Total colors used", lambda r: str(r["total_colors_used"])),
         ("Max colors/link", lambda r: str(r["max_colors_per_link"])),
-        ("Color contentions", lambda r: str(r["color_contentions"])),
+        ("Link contentions", lambda r: str(r["link_contentions"])),
+        ("Link wait cycles", lambda r: str(r["total_link_wait_cycles"])),
     ]
 
     # Column widths

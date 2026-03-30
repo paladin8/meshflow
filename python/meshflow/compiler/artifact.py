@@ -10,7 +10,6 @@ import msgpack
 class MeshProgramConfig:
     width: int
     height: int
-    hop_latency: int = 1
     task_base_latency: int = 1
     cost_per_element: int = 1
     max_events: int = 100_000
@@ -330,7 +329,10 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
 
 def _dict_to_program(raw: dict[str, Any]) -> RuntimeProgram:
     """Convert a deserialized dict back into a RuntimeProgram."""
-    mesh_config = MeshProgramConfig(**raw["mesh_config"])
+    # Filter out removed fields for backward compatibility with pre-M11 artifacts
+    known_fields = {f.name for f in MeshProgramConfig.__dataclass_fields__.values()}
+    raw_config = {k: v for k, v in raw["mesh_config"].items() if k in known_fields}
+    mesh_config = MeshProgramConfig(**raw_config)
 
     pe_programs = [
         PEProgram(

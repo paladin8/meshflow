@@ -88,7 +88,6 @@ class TestLowering:
         )
         program = compile(graph)
 
-        assert program.mesh_config.hop_latency == 1
         assert program.mesh_config.task_base_latency == 1
         assert program.mesh_config.max_events == 100_000
 

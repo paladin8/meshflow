@@ -13,7 +13,6 @@ use crate::route::generate_route_xy;
 pub struct SimConfig {
     pub width: u32,
     pub height: u32,
-    pub hop_latency: u64,
     pub task_base_latency: u64,
     pub cost_per_element: u64,
     pub max_events: u64,
@@ -24,7 +23,6 @@ impl Default for SimConfig {
         Self {
             width: 4,
             height: 4,
-            hop_latency: 1,
             task_base_latency: 1,
             cost_per_element: 1,
             max_events: 100_000,
@@ -79,10 +77,11 @@ pub struct Simulator {
     pending_counts: HashMap<Coord, u64>,
     /// Peak pending count per PE (written to PeCounters at end).
     max_pending: HashMap<Coord, u64>,
-    /// Per-(directed_link, color) free-at time for contention tracking.
-    /// Key is (from_coord, to_coord, color), value is the earliest time
-    /// this (link, color) pair is available for a new message.
-    link_color_free_at: HashMap<(Coord, Coord, u32), u64>,
+    /// Per-directed-link free-at time for contention tracking.
+    /// Key is (from_coord, to_coord), value is the earliest time
+    /// this physical link is available for a new message.
+    /// Colors share the same physical link bandwidth.
+    link_free_at: HashMap<(Coord, Coord), u64>,
 }
 
 impl Simulator {
@@ -95,7 +94,7 @@ impl Simulator {
             next_message_id: 0,
             pending_counts: HashMap::new(),
             max_pending: HashMap::new(),
-            link_color_free_at: HashMap::new(),
+            link_free_at: HashMap::new(),
             config,
         }
     }
@@ -353,15 +352,16 @@ impl Simulator {
     }
 
     fn process_deliver(&mut self, timestamp: u64, coord: Coord, message: &mut Message) {
-        let pe = self.mesh.pe_mut(coord);
-        pe.counters.messages_received += 1;
-
-        // Check routing table, but only if we're not at the final destination.
-        // Self-delivery messages (dest == coord) always deliver locally.
-        let route_action = if message.dest != coord {
-            pe.routing_table.get(&message.color).cloned()
-        } else {
-            None
+        // Scoped borrow: read counters and routing table, then drop pe borrow
+        // so forward_message can borrow self mutably.
+        let route_action = {
+            let pe = self.mesh.pe_mut(coord);
+            pe.counters.messages_received += 1;
+            if message.dest != coord {
+                pe.routing_table.get(&message.color).cloned()
+            } else {
+                None
+            }
         };
 
         if let Some(action) = route_action {
@@ -374,22 +374,34 @@ impl Simulator {
                     direction,
                     deliver_slot,
                 } => {
-                    // Deliver a copy locally, then forward
-                    pe.write_slot(deliver_slot, message.payload.clone());
+                    // Clone payload before forwarding (forward_message takes ownership)
+                    let local_payload = message.payload.clone();
+
+                    // Tail-flit delay: SRAM delivery waits for full payload
+                    let tail_flit_delay = if local_payload.len() > 1 {
+                        (local_payload.len() as u64) - 1
+                    } else {
+                        0
+                    };
+                    let ready_time = timestamp + tail_flit_delay;
+
+                    // Forward head flit immediately (wormhole — no buffering delay)
+                    self.forward_message(timestamp, coord, message, direction);
+
+                    let pe = self.mesh.pe_mut(coord);
+                    pe.write_slot(deliver_slot, local_payload);
                     pe.counters.slots_written += 1;
                     self.profile.total_messages += 1;
 
-                    // Trigger tasks waiting on this slot
-                    let triggered = pe.triggered_tasks(deliver_slot);
+                    // Trigger tasks after tail flit arrives
+                    let triggered = self.mesh.pe(coord).triggered_tasks(deliver_slot);
                     for task_index in triggered {
                         self.queue.push(
-                            timestamp + self.config.task_base_latency,
+                            ready_time + self.config.task_base_latency,
                             coord,
                             EventKind::ExecuteTask { task_index },
                         );
                     }
-
-                    self.forward_message(timestamp, coord, message, direction);
                 }
             }
         } else {
@@ -398,16 +410,25 @@ impl Simulator {
             let payload_slot = message.payload_slot;
             let hop_count = message.hop_count as u64;
 
+            // Tail-flit delay: full payload available after payload.len()-1 cycles
+            let tail_flit_delay = if payload.len() > 1 {
+                (payload.len() as u64) - 1
+            } else {
+                0
+            };
+            let ready_time = timestamp + tail_flit_delay;
+
+            let pe = self.mesh.pe_mut(coord);
             pe.write_slot(payload_slot, payload);
             pe.counters.slots_written += 1;
             self.profile.total_messages += 1;
             self.profile.total_hops += hop_count;
 
-            // Check triggered tasks
-            let triggered = pe.triggered_tasks(payload_slot);
+            // Trigger tasks after tail flit arrives
+            let triggered = self.mesh.pe(coord).triggered_tasks(payload_slot);
             for task_index in triggered {
                 self.queue.push(
-                    timestamp + self.config.task_base_latency,
+                    ready_time + self.config.task_base_latency,
                     coord,
                     EventKind::ExecuteTask { task_index },
                 );
@@ -448,18 +469,23 @@ impl Simulator {
             .or_default()
             .insert(message.color);
 
-        // Per-(link, color) contention tracking
-        let key = (coord, neighbor, message.color);
-        let free_at = self.link_color_free_at.get(&key).copied().unwrap_or(0);
+        // Per-link contention tracking (colors share physical link bandwidth)
+        let key = (coord, neighbor);
+        let free_at = self.link_free_at.get(&key).copied().unwrap_or(0);
         let entry_time = std::cmp::max(timestamp, free_at);
 
         if entry_time > timestamp {
-            // Same-color contention detected
-            self.profile.color_contentions += 1;
+            self.profile.link_contentions += 1;
+            self.profile.total_link_wait_cycles += entry_time - timestamp;
         }
 
-        self.link_color_free_at
-            .insert(key, entry_time + self.config.hop_latency);
+        // Link occupied for payload.len() cycles (1 element = 1 cycle)
+        let payload_len = message.payload.len() as u64;
+        let occupancy = std::cmp::max(payload_len, 1); // minimum 1 cycle
+        self.link_free_at.insert(key, entry_time + occupancy);
+
+        // Head flit arrives at neighbor after 1 cycle (wormhole pipelining)
+        let head_flit_arrival = entry_time + 1;
 
         // Build forwarded message
         let forwarded = std::mem::take(&mut message.payload);
@@ -467,12 +493,7 @@ impl Simulator {
         new_message.payload = forwarded;
         new_message.hop_count += 1;
 
-        self.enqueue_deliver(
-            entry_time + self.config.hop_latency,
-            neighbor,
-            coord,
-            new_message,
-        );
+        self.enqueue_deliver(head_flit_arrival, neighbor, coord, new_message);
     }
 
     // Reserved SRAM slot IDs for internal task state.
@@ -888,8 +909,8 @@ impl Simulator {
     }
 
     /// Broadcast `payload` (cloned) to every route destination, one message
-    /// per route. Messages on different colors depart in parallel;
-    /// messages on the same color are serialized within that color.
+    /// per route. All sends emitted at `base_time`; per-link contention
+    /// naturally serializes messages sharing the same outgoing link.
     fn broadcast_to_dests(
         &mut self,
         base_time: u64,
@@ -898,13 +919,9 @@ impl Simulator {
         payload: Vec<f32>,
     ) {
         self.mesh.pe_mut(coord).counters.messages_sent += routes.len() as u64;
-        let mut color_counts: HashMap<u32, u64> = HashMap::new();
         for route in routes.iter() {
-            let count = color_counts.entry(route.color).or_insert(0);
-            let send_time = base_time + *count;
-            *count += 1;
             self.emit_message(
-                send_time,
+                base_time,
                 coord,
                 route.dest,
                 payload.clone(),
@@ -915,8 +932,9 @@ impl Simulator {
     }
 
     /// Scatter `result` across `routes`: row `i` (of length `result.len() /
-    /// routes.len()`) goes to `routes[i]`. Messages on different colors
-    /// depart in parallel; messages on the same color are serialized.
+    /// routes.len()`) goes to `routes[i]`. All sends emitted at `base_time`;
+    /// per-link contention naturally serializes messages sharing the same
+    /// outgoing link.
     fn scatter_to_dests(
         &mut self,
         base_time: u64,
@@ -929,14 +947,10 @@ impl Simulator {
         }
         let row_size = result.len() / routes.len();
         self.mesh.pe_mut(coord).counters.messages_sent += routes.len() as u64;
-        let mut color_counts: HashMap<u32, u64> = HashMap::new();
         for (i, route) in routes.iter().enumerate() {
-            let count = color_counts.entry(route.color).or_insert(0);
-            let send_time = base_time + *count;
-            *count += 1;
             let row = result[i * row_size..(i + 1) * row_size].to_vec();
             self.emit_message(
-                send_time,
+                base_time,
                 coord,
                 route.dest,
                 row,
@@ -1576,6 +1590,9 @@ mod tests {
             Some(&vec![10.0, 20.0])
         );
 
-        assert_eq!(result.profile.color_contentions, 0);
+        // With shared-link bandwidth (M11), different colors share the same
+        // physical link. All 3 messages use link (0,0)->(1,0), so 2 of the 3
+        // experience contention (the first message enters freely, the other 2 wait).
+        assert_eq!(result.profile.link_contentions, 2);
     }
 }

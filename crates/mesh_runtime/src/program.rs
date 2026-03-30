@@ -25,6 +25,9 @@ struct RuntimeProgram {
 struct MeshProgramConfig {
     width: u32,
     height: u32,
+    /// Kept for backward compatibility with pre-M11 artifacts; ignored at runtime.
+    #[serde(default)]
+    #[allow(dead_code)]
     hop_latency: u64,
     task_base_latency: u64,
     #[serde(default = "default_cost_per_element")]
@@ -248,7 +251,6 @@ pub fn load_program(bytes: &[u8]) -> Result<LoadedProgram, ProgramError> {
     let config = SimConfig {
         width,
         height,
-        hop_latency: program.mesh_config.hop_latency,
         task_base_latency: program.mesh_config.task_base_latency,
         cost_per_element: program.mesh_config.cost_per_element,
         max_events: program.mesh_config.max_events,
@@ -685,7 +687,7 @@ mod tests {
     fn reject_unsupported_version() {
         let program = rmp_serde::to_vec_named(&serde_json::json!({
             "version": 99,
-            "mesh_config": {"width": 1, "height": 1, "hop_latency": 1, "task_base_latency": 1, "max_events": 100},
+            "mesh_config": {"width": 1, "height": 1, "task_base_latency": 1, "max_events": 100},
             "pe_programs": [],
             "input_slots": []
         }))
@@ -699,7 +701,7 @@ mod tests {
         // With serde tagged enum, unknown kind is a deserialization error
         let program = rmp_serde::to_vec_named(&serde_json::json!({
             "version": 1,
-            "mesh_config": {"width": 2, "height": 1, "hop_latency": 1, "task_base_latency": 1, "max_events": 100},
+            "mesh_config": {"width": 2, "height": 1, "task_base_latency": 1, "max_events": 100},
             "pe_programs": [{
                 "coord": [0, 0],
                 "tasks": [{"kind": "bogus", "trigger_slot": 0, "input_slot": 0}],
@@ -716,7 +718,7 @@ mod tests {
     fn reject_out_of_bounds_coord() {
         let program = rmp_serde::to_vec_named(&serde_json::json!({
             "version": 1,
-            "mesh_config": {"width": 2, "height": 1, "hop_latency": 1, "task_base_latency": 1, "max_events": 100},
+            "mesh_config": {"width": 2, "height": 1, "task_base_latency": 1, "max_events": 100},
             "pe_programs": [{
                 "coord": [5, 0],
                 "tasks": [],
@@ -734,7 +736,7 @@ mod tests {
         // Duplicate names are valid — they represent broadcast targets
         let bytes = rmp_serde::to_vec_named(&serde_json::json!({
             "version": 1,
-            "mesh_config": {"width": 2, "height": 1, "hop_latency": 1, "task_base_latency": 1, "max_events": 100},
+            "mesh_config": {"width": 2, "height": 1, "task_base_latency": 1, "max_events": 100},
             "pe_programs": [],
             "input_slots": [
                 {"name": "a", "coord": [0, 0], "payload_slot": 0},

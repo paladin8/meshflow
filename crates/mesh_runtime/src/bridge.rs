@@ -22,8 +22,6 @@ pub struct MeshConfig {
     #[pyo3(get, set)]
     pub height: u32,
     #[pyo3(get, set)]
-    pub hop_latency: u64,
-    #[pyo3(get, set)]
     pub task_base_latency: u64,
     #[pyo3(get, set)]
     pub cost_per_element: u64,
@@ -34,11 +32,10 @@ pub struct MeshConfig {
 #[pymethods]
 impl MeshConfig {
     #[new]
-    #[pyo3(signature = (width, height, hop_latency=1, task_base_latency=1, cost_per_element=1, max_events=100_000))]
+    #[pyo3(signature = (width, height, task_base_latency=1, cost_per_element=1, max_events=100_000))]
     fn new(
         width: u32,
         height: u32,
-        hop_latency: u64,
         task_base_latency: u64,
         cost_per_element: u64,
         max_events: u64,
@@ -46,7 +43,6 @@ impl MeshConfig {
         Self {
             width,
             height,
-            hop_latency,
             task_base_latency,
             cost_per_element,
             max_events,
@@ -59,7 +55,6 @@ impl From<&MeshConfig> for SimConfig {
         SimConfig {
             width: cfg.width,
             height: cfg.height,
-            hop_latency: cfg.hop_latency,
             task_base_latency: cfg.task_base_latency,
             cost_per_element: cfg.cost_per_element,
             max_events: cfg.max_events,
@@ -197,7 +192,9 @@ pub struct SimResult {
     #[pyo3(get)]
     pub link_counts: PyObject,
     #[pyo3(get)]
-    pub color_contentions: u64,
+    pub link_contentions: u64,
+    #[pyo3(get)]
+    pub total_link_wait_cycles: u64,
     #[pyo3(get)]
     pub max_colors_per_link: u32,
     #[pyo3(get)]
@@ -322,7 +319,8 @@ fn sim_result_to_py(py: Python<'_>, result: crate::runtime::SimResult) -> PyResu
         trace_events: trace_list.into(),
         operator_timings: timings_list.into(),
         link_counts: link_counts_dict.into(),
-        color_contentions: result.profile.color_contentions,
+        link_contentions: result.profile.link_contentions,
+        total_link_wait_cycles: result.profile.total_link_wait_cycles,
         max_colors_per_link: result.profile.max_colors_per_link,
         total_colors_used: result.profile.total_colors_used,
     })

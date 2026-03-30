@@ -77,7 +77,7 @@ class TestSmallConfig:
         assert self.result.total_hops <= 218  # Phase 4: 221 -> 218
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 692  # M10P2: 699 -> 692 (parallel sends)
+        assert self.result.final_timestamp <= 1613  # M11: wormhole routing (payload-proportional)
 
     def test_max_sends(self):
         assert _max_sends(self.result) <= 17
@@ -98,10 +98,10 @@ class TestSmallConfig:
             f"exceeds budget={self.config.color_budget}"
         )
 
-    def test_color_contentions_low(self):
-        """Color contentions should be zero or very small."""
-        assert self.result.color_contentions <= 10, (
-            f"color_contentions={self.result.color_contentions} exceeds threshold"
+    def test_link_contentions(self):
+        """Link contentions with shared-bandwidth fabric."""
+        assert self.result.link_contentions <= 50, (
+            f"link_contentions={self.result.link_contentions} exceeds threshold"
         )
 
 
@@ -123,7 +123,7 @@ class TestMediumConfig:
         assert self.result.total_hops <= 376  # Phase 4: 379 -> 376
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 3040  # M10P2.1: diversity reshuffle
+        assert self.result.final_timestamp <= 6839  # M11: wormhole routing (payload-proportional)
 
     def test_max_sends(self):
         assert _max_sends(self.result) <= 22
@@ -138,8 +138,8 @@ class TestMediumConfig:
             f"exceeds budget={self.config.color_budget}"
         )
 
-    def test_color_contentions_low(self):
-        """Color contentions should be zero or very small."""
-        assert self.result.color_contentions <= 10, (
-            f"color_contentions={self.result.color_contentions} exceeds threshold"
+    def test_link_contentions(self):
+        """Link contentions with shared-bandwidth fabric."""
+        assert self.result.link_contentions <= 110, (
+            f"link_contentions={self.result.link_contentions} exceeds threshold"
         )

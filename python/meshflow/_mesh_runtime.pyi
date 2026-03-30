@@ -9,15 +9,15 @@ class TaskKind(enum.IntEnum):
 class MeshConfig:
     width: int
     height: int
-    hop_latency: int
     task_base_latency: int
+    cost_per_element: int
     max_events: int
     def __init__(
         self,
         width: int,
         height: int,
-        hop_latency: int = 1,
         task_base_latency: int = 1,
+        cost_per_element: int = 1,
         max_events: int = 100_000,
     ) -> None: ...
 
@@ -56,6 +56,10 @@ class SimResult:
     trace_events: list[dict[str, object]]
     operator_timings: list[dict[str, object]]
     link_counts: dict[tuple[tuple[int, int], tuple[int, int]], int]
+    link_contentions: int
+    total_link_wait_cycles: int
+    max_colors_per_link: int
+    total_colors_used: int
 
 def run_simulation(config: MeshConfig, inputs: SimInput) -> SimResult: ...
 def run_program(program_bytes: bytes, inputs: dict[str, list[float]]) -> SimResult: ...

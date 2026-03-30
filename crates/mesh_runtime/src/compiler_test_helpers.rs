@@ -49,7 +49,6 @@ pub fn make_chain_artifact(n: usize) -> Vec<u8> {
         "mesh_config": {
             "width": n,
             "height": 1,
-            "hop_latency": 1,
             "task_base_latency": 1,
             "max_events": 100_000,
         },
@@ -89,7 +88,6 @@ pub fn make_linear_artifact(
     struct MeshConfig {
         width: u32,
         height: u32,
-        hop_latency: u64,
         task_base_latency: u64,
         max_events: u64,
     }
@@ -208,7 +206,6 @@ pub fn make_linear_artifact(
         mesh_config: MeshConfig {
             width: 1,
             height: height as u32,
-            hop_latency: 1,
             task_base_latency: 1,
             max_events: 100_000,
         },

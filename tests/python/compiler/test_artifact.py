@@ -136,7 +136,6 @@ class TestSerializationRoundTrip:
         program = _make_chain_program()
         restored = deserialize(serialize(program))
 
-        assert restored.mesh_config.hop_latency == 1
         assert restored.mesh_config.task_base_latency == 1
         assert restored.mesh_config.max_events == 100_000
 

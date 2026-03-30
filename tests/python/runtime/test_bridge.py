@@ -18,13 +18,11 @@ class TestSmoke:
 
     def test_config_defaults(self) -> None:
         cfg = MeshConfig(width=3, height=3)
-        assert cfg.hop_latency == 1
         assert cfg.task_base_latency == 1
         assert cfg.max_events == 100_000
 
     def test_config_custom(self) -> None:
-        cfg = MeshConfig(width=4, height=4, hop_latency=2, task_base_latency=3, max_events=500)
-        assert cfg.hop_latency == 2
+        cfg = MeshConfig(width=4, height=4, task_base_latency=3, max_events=500)
         assert cfg.task_base_latency == 3
         assert cfg.max_events == 500
 
