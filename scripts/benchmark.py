@@ -54,23 +54,19 @@ def run_benchmark(config_name: str) -> dict:
     mesh_h = program.mesh_config.height
     active_pes = sum(1 for pe in program.pe_programs if pe.tasks)
 
-    # Route analysis
-    broadcast_routes = 0
-    pp_routes = 0
+    # Route analysis (Phase 3: hops no longer stored per-route, use Manhattan distance)
+    total_routes = 0
+    routing_table_entries = 0
     hop_counts: list[int] = []
     for pe in program.pe_programs:
         for task in pe.tasks:
             if hasattr(task, "routes"):
                 for r in task.routes:
-                    hop_counts.append(len(r.hops))
-                    if r.deliver_at:
-                        broadcast_routes += 1
-                    else:
-                        pp_routes += 1
-            if hasattr(task, "route_hops"):
-                hop_counts.append(len(task.route_hops))
-            if hasattr(task, "dest_hops"):
-                hop_counts.append(len(task.dest_hops))
+                    total_routes += 1
+                    dx = abs(pe.coord[0] - r.dest[0])
+                    dy = abs(pe.coord[1] - r.dest[1])
+                    hop_counts.append(dx + dy)
+        routing_table_entries += len(pe.routing_table)
 
     # PE stats
     max_sends = 0
@@ -98,8 +94,8 @@ def run_benchmark(config_name: str) -> dict:
         "total_messages": result.total_messages,
         "total_hops": result.total_hops,
         "avg_hops_per_message": round(result.total_hops / max(result.total_messages, 1), 2),
-        "broadcast_routes": broadcast_routes,
-        "point_to_point_routes": pp_routes,
+        "total_routes": total_routes,
+        "routing_table_entries": routing_table_entries,
         "max_hops": max(hop_counts) if hop_counts else 0,
         "final_timestamp": result.final_timestamp,
         "total_tasks_executed": result.total_tasks_executed,
@@ -109,6 +105,9 @@ def run_benchmark(config_name: str) -> dict:
         "max_queue_depth_pe": list(max_queue_pe),
         "hottest_link": f"{hottest_link[0][0]}->{hottest_link[0][1]}" if hottest_link else "",
         "hottest_link_count": hottest_link[1] if hottest_link else 0,
+        "total_colors_used": result.total_colors_used,
+        "max_colors_per_link": result.max_colors_per_link,
+        "color_contentions": result.color_contentions,
     }
 
 
@@ -120,14 +119,17 @@ def print_table(results: list[dict]) -> None:
         ("Total messages", lambda r: str(r["total_messages"])),
         ("Total hops", lambda r: str(r["total_hops"])),
         ("Avg hops/message", lambda r: str(r["avg_hops_per_message"])),
-        ("Broadcast routes", lambda r: str(r["broadcast_routes"])),
-        ("P2P routes", lambda r: str(r["point_to_point_routes"])),
+        ("Total routes", lambda r: str(r["total_routes"])),
+        ("Routing table entries", lambda r: str(r["routing_table_entries"])),
         ("Max hops", lambda r: str(r["max_hops"])),
         ("Final timestamp", lambda r: str(r["final_timestamp"])),
         ("Tasks executed", lambda r: str(r["total_tasks_executed"])),
         ("Max sends (PE)", lambda r: f"{r['max_sends']} at {tuple(r['max_sends_pe'])}"),
         ("Max queue depth", lambda r: f"{r['max_queue_depth']} at {tuple(r['max_queue_depth_pe'])}"),
         ("Hottest link", lambda r: f"{r['hottest_link']}: {r['hottest_link_count']} msgs"),
+        ("Total colors used", lambda r: str(r["total_colors_used"])),
+        ("Max colors/link", lambda r: str(r["max_colors_per_link"])),
+        ("Color contentions", lambda r: str(r["color_contentions"])),
     ]
 
     # Column widths

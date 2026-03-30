@@ -65,6 +65,7 @@ class TestSmallConfig:
     @classmethod
     def setup_class(cls):
         cls.program, cls.result = _run_config(4, 8, 16, 6)
+        cls.config = CompilerConfig(mesh_height=6)
 
     def test_mesh_width(self):
         assert self.program.mesh_config.width <= 11  # Phase 4: 12 -> 11 (ADD co-located)
@@ -90,6 +91,19 @@ class TestSmallConfig:
         _, _, max_hops = _route_stats(self.program)
         assert max_hops <= 8
 
+    def test_total_colors_within_budget(self):
+        """Total colors used must fit within the color budget."""
+        assert self.result.total_colors_used <= self.config.color_budget, (
+            f"total_colors_used={self.result.total_colors_used} "
+            f"exceeds budget={self.config.color_budget}"
+        )
+
+    def test_color_contentions_low(self):
+        """Color contentions should be zero or very small."""
+        assert self.result.color_contentions <= 10, (
+            f"color_contentions={self.result.color_contentions} exceeds threshold"
+        )
+
 
 class TestMediumConfig:
     """Regression tests for medium config (seq_len=8, d_model=16, d_ff=32, mesh_height=8)."""
@@ -97,6 +111,7 @@ class TestMediumConfig:
     @classmethod
     def setup_class(cls):
         cls.program, cls.result = _run_config(8, 16, 32, 8)
+        cls.config = CompilerConfig(mesh_height=8)
 
     def test_mesh_width(self):
         assert self.program.mesh_config.width <= 11  # Phase 4: 12 -> 11 (ADD co-located)
@@ -115,3 +130,16 @@ class TestMediumConfig:
 
     def test_max_queue_depth(self):
         assert _max_queue_depth(self.result) <= 9  # M10P2.1: diversity increases concurrency
+
+    def test_total_colors_within_budget(self):
+        """Total colors used must fit within the color budget."""
+        assert self.result.total_colors_used <= self.config.color_budget, (
+            f"total_colors_used={self.result.total_colors_used} "
+            f"exceeds budget={self.config.color_budget}"
+        )
+
+    def test_color_contentions_low(self):
+        """Color contentions should be zero or very small."""
+        assert self.result.color_contentions <= 10, (
+            f"color_contentions={self.result.color_contentions} exceeds threshold"
+        )

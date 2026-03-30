@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::coords::Coord;
@@ -64,6 +64,12 @@ pub struct ProfileSummary {
     /// Number of times a same-color message was delayed on a link due to contention.
     /// Should be 0 for correctly-colored programs.
     pub color_contentions: u64,
+    /// Per-link set of distinct colors that traversed it during simulation.
+    pub link_color_sets: HashMap<(Coord, Coord), HashSet<u32>>,
+    /// Maximum number of distinct colors on any single link.
+    pub max_colors_per_link: u32,
+    /// Total distinct colors used across all routes.
+    pub total_colors_used: u32,
 }
 
 impl ProfileSummary {
@@ -79,6 +85,9 @@ impl ProfileSummary {
             operator_timings: Vec::new(),
             link_counts: HashMap::new(),
             color_contentions: 0,
+            link_color_sets: HashMap::new(),
+            max_colors_per_link: 0,
+            total_colors_used: 0,
         }
     }
 }
@@ -113,5 +122,8 @@ mod tests {
         assert!(p.trace_events.is_empty());
         assert!(p.operator_timings.is_empty());
         assert!(p.link_counts.is_empty());
+        assert!(p.link_color_sets.is_empty());
+        assert_eq!(p.max_colors_per_link, 0);
+        assert_eq!(p.total_colors_used, 0);
     }
 }

@@ -1,10 +1,11 @@
-"""Tests for Phase 2: Parallel sends & runtime contention enforcement.
+"""Tests for color-based routing: parallel sends, contention, and profiling.
 
 Verifies that:
 - Routes on different colors depart in parallel (same tick)
 - Routes on the same color are serialized
 - color_contentions counter is exposed and correct
 - Transformer block final_timestamp improves with parallel sends
+- Color profiling fields (max_colors_per_link, total_colors_used) are populated
 """
 
 import torch
@@ -192,3 +193,67 @@ class TestNumericalCorrectness:
             f"got {actual}\nvs expected {expected}\n"
             f"diff={actual - expected}"
         )
+
+
+class TestColorProfilingFields:
+    """Phase 4: Verify color profiling fields are populated after a run."""
+
+    def test_color_profiling_fields_empty_sim(self) -> None:
+        """Empty simulation has zero color profiling fields."""
+        cfg = MeshConfig(width=2, height=2)
+        inp = SimInput()
+        result = run_simulation(config=cfg, inputs=inp)
+        assert hasattr(result, "max_colors_per_link")
+        assert hasattr(result, "total_colors_used")
+        assert result.max_colors_per_link == 0
+        assert result.total_colors_used == 0
+
+    def test_color_profiling_fields_single_message(self) -> None:
+        """A single message populates color profiling fields."""
+        cfg = MeshConfig(width=4, height=4)
+        inp = SimInput()
+        inp.add_message(source=(0, 0), dest=(2, 0), payload=[1.0, 2.0])
+        inp.add_task(coord=(2, 0), kind=TaskKind.CollectOutput, trigger_slot=0)
+        result = run_simulation(config=cfg, inputs=inp)
+        # Single message with color 0 traverses 2 links
+        assert result.total_colors_used >= 1
+        assert result.max_colors_per_link >= 1
+
+    def test_color_profiling_fields_transformer_block(self) -> None:
+        """Transformer block run produces meaningful color profiling stats."""
+        graph = transformer_block(4, 8, 16)
+        weights = transformer_weights(8, 16, seed=WEIGHTS_SEED)
+        config = CompilerConfig(mesh_height=6)
+        program = compile(graph, config, weights=weights)
+        artifact_bytes = serialize(program)
+
+        torch.manual_seed(INPUT_SEED)
+        x = torch.randn(4, 8)
+        result = run_program(artifact_bytes, inputs={"input": x.flatten().tolist()})
+
+        # With color-based routing, multiple colors should be used
+        assert result.total_colors_used > 0
+        assert result.max_colors_per_link > 0
+        # Colors used should not exceed the budget of 8
+        assert result.total_colors_used <= 8
+
+
+class TestBenchmarkColorMetrics:
+    """Phase 4: Verify benchmark script reports color metrics."""
+
+    def test_benchmark_returns_color_metrics(self) -> None:
+        """The run_benchmark function returns color metric fields."""
+        import sys
+
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).parents[3] / "scripts"))
+        from benchmark import run_benchmark
+
+        metrics = run_benchmark("small")
+        assert "total_colors_used" in metrics
+        assert "max_colors_per_link" in metrics
+        assert "color_contentions" in metrics
+        assert isinstance(metrics["total_colors_used"], int)
+        assert isinstance(metrics["max_colors_per_link"], int)
+        assert isinstance(metrics["color_contentions"], int)
+        assert metrics["total_colors_used"] > 0
+        assert metrics["max_colors_per_link"] > 0

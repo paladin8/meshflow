@@ -327,6 +327,25 @@ impl Simulator {
             self.profile.per_pe.insert(pe.coord, pe.counters.clone());
         }
 
+        // Compute color summary stats from link_color_sets
+        if !self.profile.link_color_sets.is_empty() {
+            self.profile.max_colors_per_link = self
+                .profile
+                .link_color_sets
+                .values()
+                .map(|s| s.len() as u32)
+                .max()
+                .unwrap_or(0);
+
+            let all_colors: std::collections::HashSet<u32> = self
+                .profile
+                .link_color_sets
+                .values()
+                .flat_map(|s| s.iter().copied())
+                .collect();
+            self.profile.total_colors_used = all_colors.len() as u32;
+        }
+
         SimResult {
             outputs: self.outputs,
             profile: self.profile,
@@ -421,6 +440,13 @@ impl Simulator {
             .link_counts
             .entry((coord, neighbor))
             .or_insert(0) += 1;
+
+        // Track per-link color sets for profiling
+        self.profile
+            .link_color_sets
+            .entry((coord, neighbor))
+            .or_default()
+            .insert(message.color);
 
         // Per-(link, color) contention tracking
         let key = (coord, neighbor, message.color);
