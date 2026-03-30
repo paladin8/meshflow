@@ -74,10 +74,12 @@ class TestSmallConfig:
         assert self.result.total_messages <= 114
 
     def test_total_hops(self):
-        assert self.result.total_hops <= 218  # Phase 4: 221 -> 218
+        assert self.result.total_hops <= 224  # M12P1: stagger adds a few hops (218 -> 224)
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 1613  # M11: wormhole routing (payload-proportional)
+        assert (
+            self.result.final_timestamp <= 1559
+        )  # M12P1: stagger reduces contention (1613 -> 1559)
 
     def test_max_sends(self):
         assert _max_sends(self.result) <= 17
@@ -100,7 +102,7 @@ class TestSmallConfig:
 
     def test_link_contentions(self):
         """Link contentions with shared-bandwidth fabric."""
-        assert self.result.link_contentions <= 50, (
+        assert self.result.link_contentions <= 45, (
             f"link_contentions={self.result.link_contentions} exceeds threshold"
         )
 
@@ -120,10 +122,12 @@ class TestMediumConfig:
         assert self.result.total_messages <= 170
 
     def test_total_hops(self):
-        assert self.result.total_hops <= 376  # Phase 4: 379 -> 376
+        assert self.result.total_hops <= 380  # M12P1: stagger adds a few hops (376 -> 380)
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 6839  # M11: wormhole routing (payload-proportional)
+        assert (
+            self.result.final_timestamp <= 6901
+        )  # M12P1: slight increase from stagger (6839 -> 6901)
 
     def test_max_sends(self):
         assert _max_sends(self.result) <= 22

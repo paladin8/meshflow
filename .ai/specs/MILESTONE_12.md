@@ -117,9 +117,9 @@ tile_rows, collect_row = _middle_collect_rows(len(group.tiles), stagger_offset=c
 tile_rows, collect_row = _middle_collect_rows(group.num_tiles, stagger_offset=col)
 ```
 
-**`_place_attention_group`** (place.py:477-537): Same change when `has_collect=True`:
+**`_place_attention_group`** (place.py:477-537): **Excluded from stagger.** Attention groups use an N-to-1 gather pattern (seq_len attention PEs → collect), which is sensitive to collect distance. Moving the collect away from center increases the number of PEs on the longer side, adding link serialization delay on the gather path. The attention collect stays at center (`stagger_offset=1` → delta=0):
 ```python
-pe_rows, collect_row = _middle_collect_rows(group.seq_len, stagger_offset=col)
+pe_rows, collect_row = _middle_collect_rows(group.seq_len, stagger_offset=1)
 ```
 
 ### Impact on broadcast optimization

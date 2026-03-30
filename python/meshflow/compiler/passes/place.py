@@ -298,14 +298,23 @@ def _compact_columns(nodes: list[PlacedNode], max_height: int) -> tuple[list[Pla
     return nodes, max_height
 
 
-def _middle_collect_rows(num_tiles: int) -> tuple[list[int], int]:
+def _middle_collect_rows(num_tiles: int, stagger_offset: int = 0) -> tuple[list[int], int]:
     """Compute row assignments for tiles and a center-placed collect PE.
 
     Returns (tile_rows, collect_row) where tile_rows[i] is the row for tile i.
     Tiles below the collect get rows 0..collect_row-1, tiles above get
-    rows collect_row+1..num_tiles.  The collect row is floor(num_tiles / 2).
+    rows collect_row+1..num_tiles.
+
+    The stagger_offset cycles through 3 positions (col % 3) to spread
+    collect PEs across rows, avoiding the hot-corridor problem where all
+    inter-layer broadcasts share one east-west row.
     """
-    collect_row = num_tiles // 2
+    base_collect = num_tiles // 2
+    # 3-way stagger: offset cycles through -1, 0, +1
+    delta = (stagger_offset % 3) - 1
+    collect_row = base_collect + delta
+    # Clamp to valid range [0, num_tiles]
+    collect_row = max(0, min(collect_row, num_tiles))
     tile_rows: list[int] = []
     for i in range(num_tiles):
         if i < collect_row:
@@ -322,7 +331,7 @@ def _place_tiled_compute_group(
     nodes: list[PlacedNode] = []
     edges: list[PlacedEdge] = []
 
-    tile_rows, collect_row = _middle_collect_rows(len(group.tiles))
+    tile_rows, collect_row = _middle_collect_rows(len(group.tiles), stagger_offset=col)
 
     for spec in group.tiles:
         tile_id = f"{group.origin_id}_tile_{spec.tile_index}"
@@ -381,7 +390,7 @@ def _place_rmsnorm_group(
     nodes: list[PlacedNode] = []
     edges: list[PlacedEdge] = []
 
-    tile_rows, collect_row = _middle_collect_rows(group.num_tiles)
+    tile_rows, collect_row = _middle_collect_rows(group.num_tiles, stagger_offset=col)
     # Reduce PE goes above all tiles and collect
     reduce_row = group.num_tiles + 1  # tiles occupy N rows + 1 for collect
 
@@ -484,7 +493,9 @@ def _place_attention_group(
     has_collect = group.av_matmul_id is not None and group.seq_len > 1
 
     if has_collect:
-        pe_rows, collect_row = _middle_collect_rows(group.seq_len)
+        # No stagger for attention groups — N-to-1 gather pattern is
+        # sensitive to collect distance.  stagger_offset=1 → delta=0 → center.
+        pe_rows, collect_row = _middle_collect_rows(group.seq_len, stagger_offset=1)
     else:
         pe_rows = list(range(group.seq_len))
 

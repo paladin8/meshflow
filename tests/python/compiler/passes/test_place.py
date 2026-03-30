@@ -163,12 +163,13 @@ class TestLinearPlacement:
             assert tile.data.in_features == 4
             assert tile.data.origin_id == "linear1"
 
-        # Collect PE is in the middle of the column
+        # Collect PE is near the center of the column (staggered by col % 3)
         collect = next(n for n in spatial.nodes if n.id == "linear1_collect")
         assert collect.kind == PlacedNodeKind.LINEAR_COLLECT
-        # Collect should be at a row between the min and max tile rows
+        # Collect should be within the column and not on the same row as any tile
         tile_ys = [tile_node_map[f"linear1_tile_{i}"].coord[1] for i in range(3)]
-        assert min(tile_ys) < collect.coord[1] < max(tile_ys)
+        assert collect.coord[1] not in tile_ys
+        assert 0 <= collect.coord[1] <= max(tile_ys)
         assert isinstance(collect.data, PlacedCollectData)
         assert collect.data.num_fragments == 3
         assert collect.data.total_rows == 6
@@ -264,9 +265,10 @@ class TestMultiLayerPlacement:
         # Column 0: l1 tiles with collect in middle
         assert coords["l1_tile_0"][0] == 0
         assert coords["l1_collect"][0] == 0
-        # Collect is between tiles
+        # Collect is within the column (staggered by col % 3)
         tile_ys = [coords[f"l1_tile_{i}"][1] for i in range(3)]
-        assert min(tile_ys) < coords["l1_collect"][1] < max(tile_ys)
+        assert coords["l1_collect"][1] not in tile_ys
+        assert 0 <= coords["l1_collect"][1] <= max(tile_ys)
         # Column 1: l2 tiles with collect in middle
         assert coords["l2_tile_0"][0] == 1
         assert coords["l2_collect"][0] == 1
@@ -452,9 +454,10 @@ class TestRmsNormPlacement:
             assert coords[f"rn_tile_{i}"][0] == 0
         assert coords["rn_reduce"][0] == 0
         assert coords["rn_collect"][0] == 0
-        # Collect is between tiles (middle placement)
+        # Collect is within the column (staggered by col % 3)
         tile_ys = [coords[f"rn_tile_{i}"][1] for i in range(4)]
-        assert min(tile_ys) < coords["rn_collect"][1] < max(tile_ys)
+        assert coords["rn_collect"][1] not in tile_ys
+        assert 0 <= coords["rn_collect"][1] <= max(tile_ys)
         # Reduce is above all tiles and collect
         assert coords["rn_reduce"][1] > max(tile_ys)
 
@@ -735,31 +738,63 @@ class TestCollectAddColocation:
 
 
 class TestMiddleCollectPlacement:
-    """Tests for Phase 3 middle collect PE placement."""
+    """Tests for middle collect PE placement with 3-way stagger."""
 
-    def test_middle_collect_placement(self) -> None:
-        """Collect PE is at the center row of its tiles for various tile counts."""
+    def test_middle_collect_default_is_center(self) -> None:
+        """With stagger_offset=1 (col%3==1), collect is at center (baseline)."""
         from meshflow.compiler.passes.place import _middle_collect_rows
 
         for n in range(1, 8):
-            tile_rows, collect_row = _middle_collect_rows(n)
+            tile_rows, collect_row = _middle_collect_rows(n, stagger_offset=1)
             assert collect_row == n // 2, f"n={n}: collect at {collect_row}, expected {n // 2}"
-            # Collect row is not in tile_rows
-            assert collect_row not in tile_rows, f"n={n}: collect row conflicts with a tile"
-            # All rows are unique and contiguous 0..n
+            assert collect_row not in tile_rows
             all_rows = sorted(tile_rows + [collect_row])
             assert all_rows == list(range(n + 1)), f"n={n}: rows not contiguous: {all_rows}"
 
+    def test_middle_collect_stagger_three_way(self) -> None:
+        """3-way stagger cycles through center-1, center, center+1."""
+        from meshflow.compiler.passes.place import _middle_collect_rows
+
+        for n in range(2, 8):
+            center = n // 2
+            rows_by_offset = []
+            for offset in range(3):
+                _, collect_row = _middle_collect_rows(n, stagger_offset=offset)
+                rows_by_offset.append(collect_row)
+            # offset 0 → center-1, offset 1 → center, offset 2 → center+1
+            assert rows_by_offset[1] == center
+            assert rows_by_offset[0] <= center
+            assert rows_by_offset[2] >= center
+            if n >= 3:
+                assert len(set(rows_by_offset)) == 3, f"n={n}: expected 3 distinct positions"
+            else:
+                assert len(set(rows_by_offset)) >= 2, f"n={n}: stagger produced no variation"
+
+    def test_middle_collect_contiguous_rows(self) -> None:
+        """All rows are unique and contiguous 0..n for every stagger offset."""
+        from meshflow.compiler.passes.place import _middle_collect_rows
+
+        for n in range(1, 8):
+            for offset in range(6):  # test several offsets
+                tile_rows, collect_row = _middle_collect_rows(n, stagger_offset=offset)
+                assert collect_row not in tile_rows, f"n={n}, offset={offset}: collect conflicts"
+                all_rows = sorted(tile_rows + [collect_row])
+                assert all_rows == list(range(n + 1)), (
+                    f"n={n}, offset={offset}: rows not contiguous: {all_rows}"
+                )
+
     def test_middle_collect_reduces_max_internal_hops(self) -> None:
-        """Max tile-to-collect distance is at most ceil(N/2)."""
+        """Max tile-to-collect distance is at most ceil(N/2) + 1 with stagger."""
         import math
 
         from meshflow.compiler.passes.place import _middle_collect_rows
 
         for n in range(1, 8):
-            tile_rows, collect_row = _middle_collect_rows(n)
-            max_dist = max(abs(r - collect_row) for r in tile_rows)
-            expected_max = math.ceil(n / 2)
-            assert max_dist <= expected_max, (
-                f"n={n}: max distance {max_dist} exceeds ceil({n}/2)={expected_max}"
-            )
+            for offset in range(3):
+                tile_rows, collect_row = _middle_collect_rows(n, stagger_offset=offset)
+                max_dist = max(abs(r - collect_row) for r in tile_rows)
+                # Stagger adds at most 1 hop vs center placement
+                expected_max = math.ceil(n / 2) + 1
+                assert max_dist <= expected_max, (
+                    f"n={n}, offset={offset}: max distance {max_dist} exceeds {expected_max}"
+                )

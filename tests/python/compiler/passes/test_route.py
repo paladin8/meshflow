@@ -422,14 +422,13 @@ class TestMultiLayerRouting:
         assert isinstance(task, ConcatCollectForwardEntry)
 
         # Broadcast detection collapses 3 routes into broadcast(s).
-        # Verify that the broadcast reaches the farthest l2 tile PE at (1,0)
-        # and delivers intermediately to the other l2 tile PEs.
-        all_dests = set()
+        # Verify broadcasts go east to column 1 and use deliver_at for
+        # intermediate tile PEs.  Exact coordinates depend on stagger offset.
+        assert len(task.routes) >= 1
         for r in task.routes:
-            all_dests.add(r.dest)
-            # Each route should include at least an EAST hop (cross-column)
             assert Direction.EAST in r.hops
-        assert (1, 0) in all_dests
+            # Dest should be in column 1
+            assert r.dest[0] == 1
 
     def test_only_first_layer_has_input_slots(self) -> None:
         graph = self._make_mlp_graph()
@@ -706,7 +705,10 @@ class TestAttentionRouting:
 
         # New slot layout: Q=0, K=1, V=2, QK^T=3, softmax=4, AV=5
         # 2 QK^T entries (trigger on Q=0 and K=1) + 1 Softmax + 2 AV entries (trigger on V=2 and softmax=4)
-        attn_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 0))
+        # Find an attention PE by its task content (not hardcoded coordinate)
+        attn_pe = next(
+            p for p in schedule.pe_schedules if any(isinstance(t, MatMulEntry) for t in p.tasks)
+        )
         matmul_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulEntry)]
         softmax_tasks = [t for t in attn_pe.tasks if isinstance(t, SoftmaxEntry)]
 
@@ -751,7 +753,9 @@ class TestAttentionRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config)
 
-        attn_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 0))
+        attn_pe = next(
+            p for p in schedule.pe_schedules if any(isinstance(t, MatMulEntry) for t in p.tasks)
+        )
         matmul_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulEntry)]
 
         # QK^T: 2 entries (trigger on Q=0 and K=1), output slot 3
@@ -791,7 +795,9 @@ class TestAttentionRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config)
 
-        attn_pe = next(p for p in schedule.pe_schedules if p.coord == (0, 0))
+        attn_pe = next(
+            p for p in schedule.pe_schedules if any(isinstance(t, MatMulEntry) for t in p.tasks)
+        )
         av_tasks = [t for t in attn_pe.tasks if isinstance(t, MatMulEntry) and t.output_slot == 5]
         assert len(av_tasks) > 0
         # All AV entries share the same routes

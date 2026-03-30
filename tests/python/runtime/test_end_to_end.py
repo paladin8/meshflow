@@ -245,9 +245,10 @@ class TestLinearEndToEnd:
         assert result.total_messages == 6
         # 3 linear completions + 1 concat_collect completion
         assert result.total_tasks_executed == 4
-        # Fragment hops: with middle-collect placement, collect is closer to tiles
-        # so total hops are reduced (collect at middle row, not top row).
-        assert result.total_hops == 4
+        # Fragment hops: with staggered collect placement (col=0, stagger_offset=0,
+        # delta=-1), collect is at edge of column.  Single-column layouts don't
+        # benefit from stagger but multi-column layouts get traffic distribution.
+        assert result.total_hops == 6
 
 
 def _make_mlp_weights(
