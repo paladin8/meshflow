@@ -38,8 +38,8 @@ class TestRouting:
         assert len(a_pe.tasks) == 1
         task = a_pe.tasks[0]
         assert task.kind == "forward_activation"
-        assert task.route_dest == (1, 0)
-        assert task.route_hops == [Direction.EAST]
+        assert task.routes[0].dest == (1, 0)
+        assert task.routes[0].hops == [Direction.EAST]
 
     def test_multi_hop_routing(self) -> None:
         graph = GraphIR(
@@ -60,7 +60,7 @@ class TestRouting:
         # b at (1,0) forwards to c at (2,0)
         b_pe = next(pe for pe in schedule.pe_schedules if pe.coord == (1, 0))
         task = b_pe.tasks[0]
-        assert task.route_hops == [Direction.EAST]
+        assert task.routes[0].hops == [Direction.EAST]
 
     def test_vertical_routing(self) -> None:
         graph = GraphIR(
@@ -78,7 +78,7 @@ class TestRouting:
 
         a_pe = next(pe for pe in schedule.pe_schedules if pe.coord == (0, 0))
         task = a_pe.tasks[0]
-        assert task.route_hops == [Direction.NORTH]
+        assert task.routes[0].hops == [Direction.NORTH]
 
     def test_collect_task_no_route(self) -> None:
         graph = GraphIR(
@@ -158,7 +158,7 @@ class TestRouting:
 
         # a at (0,0) -> d at (1,1): [East, North]
         a_pe = next(pe for pe in schedule.pe_schedules if pe.coord == (0, 0))
-        assert a_pe.tasks[0].route_hops == [Direction.EAST, Direction.NORTH]
+        assert a_pe.tasks[0].routes[0].hops == [Direction.EAST, Direction.NORTH]
 
 
 class TestGenerateRouteXY:
@@ -253,14 +253,14 @@ class TestLinearRouting:
             assert task.bias_slot == 2
             assert task.tile_rows == 2
             assert task.tile_cols == 4
-            assert task.route_dest == collect_coord
+            assert task.routes[0].dest == collect_coord
 
         # Verify fragment indexing is correct across tiles
-        fragment_slots = sorted(pe.tasks[0].fragment_slot for pe in tile_pes)
+        fragment_slots = sorted(pe.tasks[0].routes[0].payload_slot for pe in tile_pes)
         assert fragment_slots == [0, 1, 2]
         for pe in tile_pes:
             task = pe.tasks[0]
-            assert task.fragment_offset == task.fragment_slot * 2
+            assert task.fragment_offset == task.routes[0].payload_slot * 2
 
         # Collect PE has 3 concat_collect tasks
         collect_pe = next(p for p in schedule.pe_schedules if p.coord == collect_coord)
@@ -297,7 +297,7 @@ class TestLinearRouting:
         tile_pes = [p for p in schedule.pe_schedules if any(t.kind == "linear" for t in p.tasks)]
         assert len(tile_pes) == 3
         for pe in tile_pes:
-            i = pe.tasks[0].fragment_slot
+            i = pe.tasks[0].routes[0].payload_slot
             # Weight tile in slot 1
             expected_w = W[i * 2 : (i + 1) * 2, :].flatten().tolist()
             assert pe.initial_sram[1] == pytest.approx(expected_w)
@@ -559,7 +559,7 @@ class TestRmsNormRouting:
         assert ps_task.kind == "rms_norm_partial_sum"
         assert ps_task.trigger_slot == 0
         assert ps_task.input_slot == 0
-        assert ps_task.partial_sum_slot == 0
+        assert ps_task.routes[0].payload_slot == 0
 
         norm_task = tile_pe.tasks[1]
         assert isinstance(norm_task, RmsNormNormalizeEntry)
@@ -592,7 +592,7 @@ class TestRmsNormRouting:
         )
         ps_task = tile_pe.tasks[0]
         assert isinstance(ps_task, RmsNormPartialSumEntry)
-        assert ps_task.reduce_dest == reduce_coord
+        assert ps_task.routes[0].dest == reduce_coord
 
     def test_rmsnorm_reduce_pe_has_reduce_entries(self) -> None:
         graph = self._make_rmsnorm_graph()

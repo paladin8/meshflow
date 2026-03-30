@@ -11,16 +11,12 @@ pub fn make_chain_artifact(n: usize) -> Vec<u8> {
     let mut pe_programs = Vec::new();
     for i in 0..n {
         let tasks = if i < n - 1 {
-            // ForwardActivation: route to next PE
-            let mut hops = Vec::new();
-            // From (i, 0) to (i+1, 0): one hop east
-            hops.push(serde_json::json!("east"));
+            // ForwardActivation: route to next PE via routes list
             vec![serde_json::json!({
                 "kind": "forward_activation",
                 "trigger_slot": 0,
                 "input_slot": 0,
-                "route_dest": [i + 1, 0],
-                "route_hops": hops,
+                "routes": [{"dest": [i + 1, 0], "payload_slot": 0, "color": 0}],
             })]
         } else {
             // CollectOutput at the end
@@ -31,10 +27,20 @@ pub fn make_chain_artifact(n: usize) -> Vec<u8> {
             })]
         };
 
+        // Build routing table: all PEs except the collect PE forward color 0 east.
+        // Source PE included since emit_message enqueues at source and
+        // process_deliver uses the routing table.
+        let routing_table = if i < n - 1 {
+            serde_json::json!({"0": {"direction": "east"}})
+        } else {
+            serde_json::json!({})
+        };
+
         pe_programs.push(serde_json::json!({
             "coord": [i, 0],
             "tasks": tasks,
             "initial_sram": {},
+            "routing_table": routing_table,
         }));
     }
 
@@ -72,7 +78,6 @@ pub fn make_linear_artifact(
     assert_eq!(weights.len(), out_features * in_features);
     assert_eq!(bias.len(), out_features);
 
-    // Use serde-serializable structs so initial_sram gets integer keys in msgpack.
     #[derive(Serialize)]
     struct Program {
         version: u32,
@@ -91,35 +96,15 @@ pub fn make_linear_artifact(
     #[derive(Serialize)]
     struct PEProg {
         coord: (u32, u32),
-        tasks: Vec<Task>,
+        tasks: Vec<serde_json::Value>,
         initial_sram: std::collections::HashMap<u32, Vec<f32>>,
+        routing_table: std::collections::HashMap<String, RouteEntry>,
     }
     #[derive(Serialize)]
-    struct Task {
-        kind: String,
-        trigger_slot: u32,
+    struct RouteEntry {
+        direction: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        input_slot: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        weight_slot: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        bias_slot: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tile_rows: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tile_cols: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        route_dest: Option<(u32, u32)>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        route_hops: Option<Vec<String>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        fragment_slot: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        fragment_offset: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        num_fragments: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        total_rows: Option<u32>,
+        deliver_slot: Option<u32>,
     }
     #[derive(Serialize)]
     struct InputSlot {
@@ -140,10 +125,6 @@ pub fn make_linear_artifact(
         let tile_rows = if i < remainder { base + 1 } else { base };
         let frag_offset = i * base + std::cmp::min(i, remainder);
 
-        // Hops: north from (0, i) to (0, collect_y)
-        let hops_count = collect_y as usize - i;
-        let hops: Vec<String> = (0..hops_count).map(|_| "north".to_string()).collect();
-
         let weight_tile: Vec<f32> = (frag_offset..frag_offset + tile_rows)
             .flat_map(|r| &weights[r * in_features..(r + 1) * in_features])
             .copied()
@@ -154,24 +135,45 @@ pub fn make_linear_artifact(
         sram.insert(1u32, weight_tile);
         sram.insert(2u32, bias_tile);
 
+        // Routing table: each tile PE needs to forward color 0 north
+        // (message from tile to collect PE goes north).
+        // But the tile PE is the source, so it doesn't need a routing entry for
+        // its own emitted messages. The intermediate PEs between tile and collect
+        // need routing entries.
+        // All tiles use color 0 and route north to the collect PE.
+        // Intermediate PEs (tiles above this one) forward color 0 north.
+
+        let task = serde_json::json!({
+            "kind": "linear",
+            "trigger_slot": 0,
+            "input_slot": 0,
+            "weight_slot": 1,
+            "bias_slot": 2,
+            "tile_rows": tile_rows as u32,
+            "tile_cols": in_features as u32,
+            "routes": [{"dest": [0, collect_y], "payload_slot": i as u32, "color": 0}],
+            "fragment_offset": frag_offset as u32,
+        });
+
+        // Routing table for this PE: forward color 0 north.
+        // All tile PEs need this entry: source tiles for their own messages,
+        // and intermediate tiles for messages from tiles below.
+        let mut rt = std::collections::HashMap::new();
+        if (i as u32) < collect_y {
+            rt.insert(
+                "0".to_string(),
+                RouteEntry {
+                    direction: "north".to_string(),
+                    deliver_slot: None,
+                },
+            );
+        }
+
         pe_programs.push(PEProg {
             coord: (0, i as u32),
-            tasks: vec![Task {
-                kind: "linear".to_string(),
-                trigger_slot: 0,
-                input_slot: Some(0),
-                weight_slot: Some(1),
-                bias_slot: Some(2),
-                tile_rows: Some(tile_rows as u32),
-                tile_cols: Some(in_features as u32),
-                route_dest: Some((0, collect_y)),
-                route_hops: Some(hops),
-                fragment_slot: Some(i as u32),
-                fragment_offset: Some(frag_offset as u32),
-                num_fragments: None,
-                total_rows: None,
-            }],
+            tasks: vec![task],
             initial_sram: sram,
+            routing_table: rt,
         });
 
         input_slots_vec.push(InputSlot {
@@ -181,31 +183,24 @@ pub fn make_linear_artifact(
         });
     }
 
-    // Collect PE with concat_collect tasks
+    // Collect PE with concat_collect tasks — no routing table needed (final dest)
     let mut collect_tasks = Vec::new();
     for i in 0..num_tiles {
         let frag_offset = i * base + std::cmp::min(i, remainder);
-        collect_tasks.push(Task {
-            kind: "concat_collect".to_string(),
-            trigger_slot: i as u32,
-            input_slot: None,
-            weight_slot: None,
-            bias_slot: None,
-            tile_rows: None,
-            tile_cols: None,
-            route_dest: None,
-            route_hops: None,
-            fragment_slot: None,
-            fragment_offset: Some(frag_offset as u32),
-            num_fragments: Some(num_tiles as u32),
-            total_rows: Some(out_features as u32),
-        });
+        collect_tasks.push(serde_json::json!({
+            "kind": "concat_collect",
+            "trigger_slot": i as u32,
+            "num_fragments": num_tiles as u32,
+            "total_rows": out_features as u32,
+            "fragment_offset": frag_offset as u32,
+        }));
     }
 
     pe_programs.push(PEProg {
         coord: (0, collect_y),
         tasks: collect_tasks,
         initial_sram: std::collections::HashMap::new(),
+        routing_table: std::collections::HashMap::new(),
     });
 
     let program = Program {

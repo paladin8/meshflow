@@ -17,15 +17,7 @@ from dataclasses import dataclass, replace
 
 from meshflow.compiler.config import CompilerConfig
 from meshflow.compiler.schedule_ir import (
-    AddEntry,
-    ConcatCollectForwardEntry,
     Direction,
-    ForwardActivationEntry,
-    LinearEntry,
-    MatMulEntry,
-    RmsNormNormalizeEntry,
-    RmsNormPartialSumEntry,
-    RmsNormReduceEntry,
     RouteTableEntry,
     ScheduleIR,
 )
@@ -85,17 +77,36 @@ def _compute_intermediates(
 ) -> tuple[set[tuple[int, int]], list[_IntermediatePE]]:
     """Compute intermediate PEs and their forwarding details.
 
+    Includes the **source PE** as a pseudo-intermediate (with the first-hop
+    direction and no deliver_slot) so the conflict graph detects clashes
+    between routes that originate at a PE and routes that merely pass
+    through it.
+
     Returns:
         A tuple of (pe_coord_set, detail_list) where:
-        - pe_coord_set: the set of intermediate PE coordinates
-        - detail_list: detailed per-PE forwarding info
+        - pe_coord_set: the set of intermediate PE coordinates (incl. source)
+        - detail_list: detailed per-PE forwarding info (incl. source)
     """
-    if len(hops) <= 1:
+    if not hops:
         return set(), []
 
-    deliver_at_set = set(deliver_at)
     pe_set: set[tuple[int, int]] = set()
     details: list[_IntermediatePE] = []
+
+    # Include the source PE — it needs a routing table entry for hops[0].
+    pe_set.add(source)
+    details.append(
+        _IntermediatePE(
+            coord=source,
+            next_direction=hops[0],
+            deliver_slot=None,
+        )
+    )
+
+    if len(hops) <= 1:
+        return pe_set, details
+
+    deliver_at_set = set(deliver_at)
 
     current = source
     for hop_idx, direction in enumerate(hops):
@@ -125,6 +136,9 @@ def _compute_intermediates(
 def _enumerate_routes(schedule: ScheduleIR) -> list[_RouteInfo]:
     """Walk all PESchedule entries and extract every route.
 
+    All routed tasks now use ``routes: list[BroadcastRoute]``, so this
+    function handles them uniformly without isinstance branching.
+
     Returns a flat list of _RouteInfo with write-back references so that
     assigned colors can be written back to the original IR structures.
     """
@@ -132,91 +146,24 @@ def _enumerate_routes(schedule: ScheduleIR) -> list[_RouteInfo]:
 
     for pe_idx, pe in enumerate(schedule.pe_schedules):
         for task_idx, task in enumerate(pe.tasks):
-            # Multi-route tasks: extract each BroadcastRoute
-            if isinstance(
-                task,
-                (
-                    ConcatCollectForwardEntry,
-                    AddEntry,
-                    MatMulEntry,
-                    RmsNormNormalizeEntry,
-                    RmsNormReduceEntry,
-                ),
-            ):
-                for route_idx, br in enumerate(task.routes):
-                    pe_set, details = _compute_intermediates(
-                        pe.coord,
-                        br.hops,
-                        br.deliver_at,
-                        br.payload_slot,
-                    )
-                    routes.append(
-                        _RouteInfo(
-                            source_coord=pe.coord,
-                            hops=list(br.hops),
-                            deliver_at=list(br.deliver_at),
-                            payload_slot=br.payload_slot,
-                            intermediate_pes=pe_set,
-                            intermediate_pe_details=details,
-                            write_back_ref=(pe_idx, task_idx, route_idx),
-                        )
-                    )
-
-            # Single-route tasks
-            elif isinstance(task, ForwardActivationEntry):
+            if not hasattr(task, "routes"):
+                continue
+            for route_idx, br in enumerate(task.routes):
                 pe_set, details = _compute_intermediates(
                     pe.coord,
-                    task.route_hops,
-                    [],
-                    task.payload_slot,
+                    br.hops,
+                    br.deliver_at,
+                    br.payload_slot,
                 )
                 routes.append(
                     _RouteInfo(
                         source_coord=pe.coord,
-                        hops=list(task.route_hops),
-                        deliver_at=[],
-                        payload_slot=task.payload_slot,
+                        hops=list(br.hops),
+                        deliver_at=list(br.deliver_at),
+                        payload_slot=br.payload_slot,
                         intermediate_pes=pe_set,
                         intermediate_pe_details=details,
-                        write_back_ref=(pe_idx, task_idx, -1),
-                    )
-                )
-
-            elif isinstance(task, LinearEntry):
-                pe_set, details = _compute_intermediates(
-                    pe.coord,
-                    task.route_hops,
-                    [],
-                    task.fragment_slot,
-                )
-                routes.append(
-                    _RouteInfo(
-                        source_coord=pe.coord,
-                        hops=list(task.route_hops),
-                        deliver_at=[],
-                        payload_slot=task.fragment_slot,
-                        intermediate_pes=pe_set,
-                        intermediate_pe_details=details,
-                        write_back_ref=(pe_idx, task_idx, -1),
-                    )
-                )
-
-            elif isinstance(task, RmsNormPartialSumEntry):
-                pe_set, details = _compute_intermediates(
-                    pe.coord,
-                    task.reduce_hops,
-                    [],
-                    task.partial_sum_slot,
-                )
-                routes.append(
-                    _RouteInfo(
-                        source_coord=pe.coord,
-                        hops=list(task.reduce_hops),
-                        deliver_at=[],
-                        payload_slot=task.partial_sum_slot,
-                        intermediate_pes=pe_set,
-                        intermediate_pe_details=details,
-                        write_back_ref=(pe_idx, task_idx, -1),
+                        write_back_ref=(pe_idx, task_idx, route_idx),
                     )
                 )
 
@@ -354,37 +301,23 @@ def _write_back_colors(
     routes: list[_RouteInfo],
     colors: list[int],
 ) -> None:
-    """Write assigned colors back onto the schedule IR structures."""
+    """Write assigned colors back onto the schedule IR structures.
+
+    All routed tasks now use ``routes: list[BroadcastRoute]``, so we
+    always set color on the BroadcastRoute object at the given index.
+    """
     for route_info, assigned_color in zip(routes, colors):
         pe_idx, task_idx, route_idx = route_info.write_back_ref
         pe = schedule.pe_schedules[pe_idx]
         task = pe.tasks[task_idx]
 
-        if route_idx >= 0:
-            # Multi-route task: set color on the BroadcastRoute.
-            # The route pass may reuse BroadcastRoute objects across tasks,
-            # so we replace with a copy when setting a different color to
-            # avoid aliasing issues.
-            assert isinstance(
-                task,
-                (
-                    ConcatCollectForwardEntry,
-                    AddEntry,
-                    MatMulEntry,
-                    RmsNormNormalizeEntry,
-                    RmsNormReduceEntry,
-                ),
-            )
-            br = task.routes[route_idx]
-            if br.color != assigned_color:
-                task.routes[route_idx] = replace(br, color=assigned_color)
-        else:
-            # Single-route task: set route_color on the entry
-            assert isinstance(
-                task,
-                (ForwardActivationEntry, LinearEntry, RmsNormPartialSumEntry),
-            )
-            task.route_color = assigned_color
+        # The route pass may reuse BroadcastRoute objects across tasks,
+        # so we replace with a copy when setting a different color to
+        # avoid aliasing issues.
+        assert hasattr(task, "routes"), f"task {type(task)} has no routes"  # type narrowing
+        br = task.routes[route_idx]  # type: ignore[union-attr]
+        if br.color != assigned_color:
+            task.routes[route_idx] = replace(br, color=assigned_color)  # type: ignore[union-attr]
 
 
 def _generate_routing_tables(
@@ -403,6 +336,9 @@ def _generate_routing_tables(
         coord_to_pe[pe.coord] = idx
 
     for route_info, assigned_color in zip(routes, colors):
+        # Source and intermediate PE routing table entries.
+        # The source PE is included in intermediate_pe_details (first entry)
+        # so we handle it uniformly here.
         for detail in route_info.intermediate_pe_details:
             pe_idx = coord_to_pe.get(detail.coord)
             if pe_idx is None:

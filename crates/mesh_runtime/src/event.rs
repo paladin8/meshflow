@@ -123,13 +123,11 @@ mod tests {
             id: 0,
             source: Coord::new(0, 0),
             dest: Coord::new(x, y),
-            hops: vec![],
-            current_hop: 0,
             payload: vec![],
             payload_slot: 0,
             timestamp,
-            deliver_at: vec![],
             color: 0,
+            hop_count: 0,
         };
         queue.push(
             timestamp,

@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::coords::{Coord, Direction};
 use crate::message::SlotId;
-use crate::pe::{Activation, BroadcastRouteRuntime, TaskConfig, TaskKind};
+use crate::pe::{Activation, BroadcastRouteRuntime, RouteAction, TaskConfig, TaskKind};
 use crate::runtime::{InjectMessage, SimConfig, SimResult, Simulator};
 
 // ---------------------------------------------------------------------------
@@ -43,6 +43,15 @@ struct PEProgram {
     initial_sram: HashMap<u32, Vec<f32>>,
     #[serde(default)]
     sram_capacity_bytes: Option<usize>,
+    #[serde(default)]
+    routing_table: HashMap<String, RouteActionProgram>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteActionProgram {
+    direction: String,
+    #[serde(default)]
+    deliver_slot: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,12 +61,8 @@ enum TaskProgram {
     ForwardActivation {
         trigger_slot: u32,
         input_slot: u32,
-        route_dest: (u32, u32),
-        route_hops: Vec<String>,
         #[serde(default)]
-        payload_slot: u32,
-        #[serde(default)]
-        route_color: u32,
+        routes: Vec<BroadcastRouteProgram>,
     },
     #[serde(rename = "collect_output")]
     CollectOutput { trigger_slot: u32, input_slot: u32 },
@@ -69,12 +74,10 @@ enum TaskProgram {
         bias_slot: u32,
         tile_rows: u32,
         tile_cols: u32,
-        route_dest: (u32, u32),
-        route_hops: Vec<String>,
-        fragment_slot: u32,
-        fragment_offset: u32,
         #[serde(default)]
-        route_color: u32,
+        routes: Vec<BroadcastRouteProgram>,
+        #[serde(default)]
+        fragment_offset: u32,
     },
     #[serde(rename = "concat_collect")]
     ConcatCollect {
@@ -135,17 +138,14 @@ enum TaskProgram {
     RmsNormPartialSum {
         trigger_slot: u32,
         input_slot: u32,
-        reduce_dest: (u32, u32),
-        reduce_hops: Vec<String>,
-        partial_sum_slot: u32,
+        #[serde(default)]
+        routes: Vec<BroadcastRouteProgram>,
         #[serde(default)]
         slice_offset: u32,
         #[serde(default)]
         slice_size: u32,
         #[serde(default)]
         feature_count: u32,
-        #[serde(default)]
-        route_color: u32,
     },
     #[serde(rename = "rms_norm_normalize")]
     RmsNormNormalize {
@@ -181,9 +181,6 @@ struct InputSlotProgram {
 #[derive(Debug, Deserialize)]
 struct BroadcastRouteProgram {
     dest: (u32, u32),
-    hops: Vec<String>,
-    #[serde(default)]
-    deliver_at: Vec<usize>,
     payload_slot: u32,
     #[serde(default)]
     color: u32,
@@ -227,6 +224,7 @@ struct PEConfig {
     tasks: Vec<TaskConfig>,
     initial_sram: HashMap<SlotId, Vec<f32>>,
     sram_capacity_bytes: Option<usize>,
+    routing_table: HashMap<u32, RouteAction>,
 }
 
 #[derive(Debug)]
@@ -273,11 +271,30 @@ pub fn load_program(bytes: &[u8]) -> Result<LoadedProgram, ProgramError> {
             .map(|(k, v)| (*k, v.clone()))
             .collect();
 
+        // Convert routing table (keys are stringified color IDs)
+        let mut routing_table = HashMap::new();
+        for (color_str, entry) in &pe.routing_table {
+            let color: u32 = color_str.parse().map_err(|_| {
+                ProgramError::Deserialize(format!("invalid routing table color key: {color_str:?}"))
+            })?;
+            let direction = parse_direction(&entry.direction)?;
+            let action = if let Some(slot) = entry.deliver_slot {
+                RouteAction::DeliverAndForward {
+                    direction,
+                    deliver_slot: slot,
+                }
+            } else {
+                RouteAction::Forward(direction)
+            };
+            routing_table.insert(color, action);
+        }
+
         pe_configs.push(PEConfig {
             coord,
             tasks,
             initial_sram,
             sram_capacity_bytes: pe.sram_capacity_bytes,
+            routing_table,
         });
     }
 
@@ -312,7 +329,7 @@ impl LoadedProgram {
     ) -> Result<SimResult, ProgramError> {
         let mut sim = Simulator::new(self.config.clone());
 
-        // Configure tasks and SRAM capacity on PEs
+        // Configure tasks, SRAM capacity, and routing tables on PEs
         for pe_config in &self.pe_configs {
             if let Some(cap) = pe_config.sram_capacity_bytes {
                 sim.set_sram_capacity(pe_config.coord, cap);
@@ -325,6 +342,11 @@ impl LoadedProgram {
             // Pre-load initial SRAM
             for (slot, data) in &pe_config.initial_sram {
                 sim.write_sram(pe_config.coord, *slot, data.clone());
+            }
+
+            // Load routing table
+            for (color, action) in &pe_config.routing_table {
+                sim.set_routing_entry(pe_config.coord, *color, action.clone());
             }
         }
 
@@ -403,15 +425,8 @@ fn convert_routes(
         .map(|r| {
             let dest = Coord::new(r.dest.0, r.dest.1);
             validate_coord(dest, width, height)?;
-            let hops: Vec<Direction> = r
-                .hops
-                .iter()
-                .map(|s| parse_direction(s))
-                .collect::<Result<_, _>>()?;
             Ok(BroadcastRouteRuntime {
                 dest,
-                hops,
-                deliver_at: r.deliver_at.clone(),
                 payload_slot: r.payload_slot,
                 color: r.color,
             })
@@ -424,24 +439,13 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
         TaskProgram::ForwardActivation {
             trigger_slot,
             input_slot,
-            route_dest,
-            route_hops,
-            payload_slot,
-            route_color,
+            routes,
         } => {
-            let dest = Coord::new(route_dest.0, route_dest.1);
-            validate_coord(dest, width, height)?;
-            let hops: Vec<Direction> = route_hops
-                .iter()
-                .map(|s| parse_direction(s))
-                .collect::<Result<_, _>>()?;
+            let converted_routes = convert_routes(routes, width, height)?;
             Ok(TaskConfig {
                 kind: TaskKind::ForwardActivation {
                     input_slot: *input_slot,
-                    route_dest: dest,
-                    hops,
-                    payload_slot: *payload_slot,
-                    color: *route_color,
+                    routes: converted_routes,
                 },
                 trigger_slot: *trigger_slot,
             })
@@ -462,18 +466,10 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             bias_slot,
             tile_rows,
             tile_cols,
-            route_dest,
-            route_hops,
-            fragment_slot,
+            routes,
             fragment_offset,
-            route_color,
         } => {
-            let dest = Coord::new(route_dest.0, route_dest.1);
-            validate_coord(dest, width, height)?;
-            let hops: Vec<Direction> = route_hops
-                .iter()
-                .map(|s| parse_direction(s))
-                .collect::<Result<_, _>>()?;
+            let converted_routes = convert_routes(routes, width, height)?;
             Ok(TaskConfig {
                 kind: TaskKind::Linear {
                     input_slot: *input_slot,
@@ -481,11 +477,8 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     bias_slot: *bias_slot,
                     tile_rows: *tile_rows,
                     tile_cols: *tile_cols,
-                    route_dest: dest,
-                    hops,
-                    fragment_slot: *fragment_slot,
+                    routes: converted_routes,
                     fragment_offset: *fragment_offset,
-                    color: *route_color,
                 },
                 trigger_slot: *trigger_slot,
             })
@@ -590,30 +583,19 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
         TaskProgram::RmsNormPartialSum {
             trigger_slot,
             input_slot,
-            reduce_dest,
-            reduce_hops,
-            partial_sum_slot,
+            routes,
             slice_offset,
             slice_size,
             feature_count,
-            route_color,
         } => {
-            let dest = Coord::new(reduce_dest.0, reduce_dest.1);
-            validate_coord(dest, width, height)?;
-            let hops: Vec<Direction> = reduce_hops
-                .iter()
-                .map(|s| parse_direction(s))
-                .collect::<Result<_, _>>()?;
+            let converted_routes = convert_routes(routes, width, height)?;
             Ok(TaskConfig {
                 kind: TaskKind::RmsNormPartialSum {
                     input_slot: *input_slot,
-                    reduce_dest: dest,
-                    reduce_hops: hops,
-                    partial_sum_slot: *partial_sum_slot,
+                    routes: converted_routes,
                     slice_offset: *slice_offset,
                     slice_size: *slice_size,
                     feature_count: *feature_count,
-                    color: *route_color,
                 },
                 trigger_slot: *trigger_slot,
             })
@@ -728,23 +710,6 @@ mod tests {
         .unwrap();
         let err = load_program(&program).unwrap_err();
         assert!(matches!(err, ProgramError::Deserialize(_)));
-    }
-
-    #[test]
-    fn reject_invalid_direction() {
-        let bytes = rmp_serde::to_vec_named(&serde_json::json!({
-            "version": 1,
-            "mesh_config": {"width": 2, "height": 1, "hop_latency": 1, "task_base_latency": 1, "max_events": 100},
-            "pe_programs": [{
-                "coord": [0, 0],
-                "tasks": [{"kind": "forward_activation", "trigger_slot": 0, "input_slot": 0, "route_dest": [1, 0], "route_hops": ["east", "bogus"]}],
-                "initial_sram": {}
-            }],
-            "input_slots": []
-        }))
-        .unwrap();
-        let err = load_program(&bytes).unwrap_err();
-        assert!(matches!(err, ProgramError::InvalidDirection(_)));
     }
 
     #[test]

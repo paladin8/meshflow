@@ -19,9 +19,7 @@ from meshflow.compiler.schedule_ir import (
     ConcatCollectForwardEntry,
     Direction,
     ForwardActivationEntry,
-    LinearEntry,
     PESchedule,
-    RmsNormPartialSumEntry,
     ScheduleIR,
 )
 from meshflow.models.transformer import transformer_block, transformer_weights
@@ -47,9 +45,7 @@ def _collect_all_colors(schedule: ScheduleIR) -> list[int]:
     colors: list[int] = []
     for pe in schedule.pe_schedules:
         for task in pe.tasks:
-            if isinstance(task, (ForwardActivationEntry, LinearEntry, RmsNormPartialSumEntry)):
-                colors.append(task.route_color)
-            elif hasattr(task, "routes"):
+            if hasattr(task, "routes"):
                 for r in task.routes:
                     colors.append(r.color)
     return colors
@@ -80,10 +76,13 @@ class TestIntermediatePEs:
         assert pe_set == set()
         assert details == []
 
-    def test_one_hop_empty(self) -> None:
+    def test_one_hop_includes_source(self) -> None:
+        # Source PE is included so the conflict graph detects source-vs-intermediate clashes
         pe_set, details = _compute_intermediates((0, 0), [Direction.EAST], [], 0)
-        assert pe_set == set()
-        assert details == []
+        assert pe_set == {(0, 0)}
+        assert len(details) == 1
+        assert details[0].coord == (0, 0)
+        assert details[0].next_direction == Direction.EAST
 
     def test_two_hop_one_intermediate(self) -> None:
         pe_set, details = _compute_intermediates(
@@ -92,10 +91,13 @@ class TestIntermediatePEs:
             [],
             0,
         )
-        assert pe_set == {(1, 0)}
-        assert len(details) == 1
-        assert details[0].coord == (1, 0)
+        # Source (0,0) + intermediate (1,0); destination (2,0) excluded
+        assert pe_set == {(0, 0), (1, 0)}
+        assert len(details) == 2
+        assert details[0].coord == (0, 0)
         assert details[0].next_direction == Direction.EAST
+        assert details[1].coord == (1, 0)
+        assert details[1].next_direction == Direction.EAST
 
     def test_multi_hop(self) -> None:
         pe_set, details = _compute_intermediates(
@@ -105,9 +107,9 @@ class TestIntermediatePEs:
             0,
         )
         # (0,0) -> (1,0) -> (2,0) -> (2,1)
-        # Intermediates: (1,0) and (2,0), destination (2,1) excluded
-        assert pe_set == {(1, 0), (2, 0)}
-        assert len(details) == 2
+        # Source (0,0), intermediates (1,0) and (2,0), destination (2,1) excluded
+        assert pe_set == {(0, 0), (1, 0), (2, 0)}
+        assert len(details) == 3
 
 
 class TestNoConflictAllColorZero:
@@ -122,9 +124,13 @@ class TestNoConflictAllColorZero:
                     ForwardActivationEntry(
                         trigger_slot=0,
                         input_slot=0,
-                        route_dest=(1, 0),
-                        route_hops=[Direction.EAST],
-                        payload_slot=0,
+                        routes=[
+                            BroadcastRoute(
+                                dest=(1, 0),
+                                hops=[Direction.EAST],
+                                payload_slot=0,
+                            )
+                        ],
                     ),
                 ],
             ),
@@ -135,9 +141,13 @@ class TestNoConflictAllColorZero:
                     ForwardActivationEntry(
                         trigger_slot=0,
                         input_slot=0,
-                        route_dest=(3, 0),
-                        route_hops=[Direction.EAST],
-                        payload_slot=0,
+                        routes=[
+                            BroadcastRoute(
+                                dest=(3, 0),
+                                hops=[Direction.EAST],
+                                payload_slot=0,
+                            )
+                        ],
                     ),
                 ],
             ),
@@ -148,9 +158,13 @@ class TestNoConflictAllColorZero:
                     ForwardActivationEntry(
                         trigger_slot=0,
                         input_slot=0,
-                        route_dest=(5, 0),
-                        route_hops=[Direction.EAST],
-                        payload_slot=0,
+                        routes=[
+                            BroadcastRoute(
+                                dest=(5, 0),
+                                hops=[Direction.EAST],
+                                payload_slot=0,
+                            )
+                        ],
                     ),
                 ],
             ),
@@ -167,13 +181,9 @@ class TestSharedPeDifferentColors:
     """Two routes sharing an intermediate PE with different directions get different colors."""
 
     def test_shared_pe_different_colors(self) -> None:
-        # Route A: (0,0) -> E -> E -> E to (3,0), intermediates at (1,0) and (2,0)
-        # Route B: (0,1) -> S -> E -> E to (2,0), intermediates at (0,0) and (1,0)
-        #   Wait, (0,0) is the source of route A so it won't be intermediate.
-        # Better: Route B goes through (1,0) but in a different direction.
         # Route A: (0,0) -> E -> E -> N to (2,1), intermediates: (1,0) fwd E, (2,0) fwd N
         # Route B: (0,0) -> E -> N -> E to (2,1), intermediates: (1,0) fwd N, (1,1) fwd E
-        # Both share (1,0) but A forwards E, B forwards N → conflict
+        # Both share (1,0) but A forwards E, B forwards N -> conflict
         pe_schedules = [
             PESchedule(
                 coord=(0, 0),
@@ -181,16 +191,24 @@ class TestSharedPeDifferentColors:
                     ForwardActivationEntry(
                         trigger_slot=0,
                         input_slot=0,
-                        route_dest=(2, 1),
-                        route_hops=[Direction.EAST, Direction.EAST, Direction.NORTH],
-                        payload_slot=0,
+                        routes=[
+                            BroadcastRoute(
+                                dest=(2, 1),
+                                hops=[Direction.EAST, Direction.EAST, Direction.NORTH],
+                                payload_slot=0,
+                            )
+                        ],
                     ),
                     ForwardActivationEntry(
                         trigger_slot=0,
                         input_slot=0,
-                        route_dest=(2, 1),
-                        route_hops=[Direction.EAST, Direction.NORTH, Direction.EAST],
-                        payload_slot=1,
+                        routes=[
+                            BroadcastRoute(
+                                dest=(2, 1),
+                                hops=[Direction.EAST, Direction.NORTH, Direction.EAST],
+                                payload_slot=1,
+                            )
+                        ],
                     ),
                 ],
             ),
@@ -202,8 +220,8 @@ class TestSharedPeDifferentColors:
         schedule = _make_schedule(pe_schedules)
         colored = color(schedule)
 
-        c0 = colored.pe_schedules[0].tasks[0].route_color
-        c1 = colored.pe_schedules[0].tasks[1].route_color
+        c0 = colored.pe_schedules[0].tasks[0].routes[0].color
+        c1 = colored.pe_schedules[0].tasks[1].routes[0].color
         assert c0 != c1, f"expected different colors, got {c0} and {c1}"
 
 
@@ -213,7 +231,7 @@ class TestGreedyColoringOrder:
     def test_greedy_coloring_order(self) -> None:
         # Create a star conflict graph: route 0 conflicts with routes 1,2,3
         # Route 0 has degree 3, routes 1-3 have degree 1
-        # Most-constrained (route 0) should be colored first → gets color 0
+        # Most-constrained (route 0) should be colored first -> gets color 0
         # The others each get color 0 if they don't conflict with each other
         graph: dict[int, set[int]] = {
             0: {1, 2, 3},
@@ -222,9 +240,9 @@ class TestGreedyColoringOrder:
             3: {0},
         }
         colors = _greedy_color(4, graph)
-        # Route 0 (most constrained) gets colored first → color 0
+        # Route 0 (most constrained) gets colored first -> color 0
         assert colors[0] == 0
-        # Routes 1,2,3 don't conflict with each other → all get lowest available
+        # Routes 1,2,3 don't conflict with each other -> all get lowest available
         # Since they each only conflict with route 0 (color 0), they get color 1
         assert colors[1] == 1
         assert colors[2] == 1
@@ -235,11 +253,8 @@ class TestBudgetExceededRaises:
     """If chromatic number exceeds color_budget, raise ValueError."""
 
     def test_budget_exceeded_raises(self) -> None:
-        # Create routes that form a clique requiring more colors than budget.
         # 3 routes through the same intermediate PE, each needing a different direction.
-        # But we only have 4 cardinal directions, so let's create the scenario:
-        # 3 routes all sharing PE (1,1), each forwarding in a different direction.
-        # With budget=2, this needs 3 colors → exceeds budget.
+        # With budget=2, this needs 3 colors -> exceeds budget.
         pe_schedules = [
             PESchedule(
                 coord=(0, 1),
@@ -248,25 +263,37 @@ class TestBudgetExceededRaises:
                     ForwardActivationEntry(
                         trigger_slot=0,
                         input_slot=0,
-                        route_dest=(2, 1),
-                        route_hops=[Direction.EAST, Direction.EAST],
-                        payload_slot=0,
+                        routes=[
+                            BroadcastRoute(
+                                dest=(2, 1),
+                                hops=[Direction.EAST, Direction.EAST],
+                                payload_slot=0,
+                            )
+                        ],
                     ),
                     # Route B: (0,1) -> E -> N to (1,2), intermediate (1,1) fwd N
                     ForwardActivationEntry(
                         trigger_slot=0,
                         input_slot=0,
-                        route_dest=(1, 2),
-                        route_hops=[Direction.EAST, Direction.NORTH],
-                        payload_slot=1,
+                        routes=[
+                            BroadcastRoute(
+                                dest=(1, 2),
+                                hops=[Direction.EAST, Direction.NORTH],
+                                payload_slot=1,
+                            )
+                        ],
                     ),
                     # Route C: (0,1) -> E -> S to (1,0), intermediate (1,1) fwd S
                     ForwardActivationEntry(
                         trigger_slot=0,
                         input_slot=0,
-                        route_dest=(1, 0),
-                        route_hops=[Direction.EAST, Direction.SOUTH],
-                        payload_slot=2,
+                        routes=[
+                            BroadcastRoute(
+                                dest=(1, 0),
+                                hops=[Direction.EAST, Direction.SOUTH],
+                                payload_slot=2,
+                            )
+                        ],
                     ),
                 ],
             ),
@@ -347,9 +374,13 @@ class TestRoutingTableEntriesGenerated:
                     ForwardActivationEntry(
                         trigger_slot=0,
                         input_slot=0,
-                        route_dest=(3, 0),
-                        route_hops=[Direction.EAST, Direction.EAST, Direction.EAST],
-                        payload_slot=0,
+                        routes=[
+                            BroadcastRoute(
+                                dest=(3, 0),
+                                hops=[Direction.EAST, Direction.EAST, Direction.EAST],
+                                payload_slot=0,
+                            )
+                        ],
                     ),
                 ],
             ),
@@ -373,17 +404,21 @@ class TestRoutingTableEntriesGenerated:
             assert entry.direction == Direction.EAST
             assert entry.deliver_slot is None
 
-        # Source and destination should have no routing table entries
+        # Source PE should have a routing table entry (first hop direction)
         pe_0_0 = next(p for p in colored.pe_schedules if p.coord == (0, 0))
+        assert len(pe_0_0.routing_table) == 1
+        entry = list(pe_0_0.routing_table.values())[0]
+        assert entry.direction == Direction.EAST
+
+        # Destination should have no routing table entries
         pe_3_0 = next(p for p in colored.pe_schedules if p.coord == (3, 0))
-        assert len(pe_0_0.routing_table) == 0
         assert len(pe_3_0.routing_table) == 0
 
     def test_routing_table_with_deliver_at(self) -> None:
         """Broadcast route with deliver_at generates DeliverAndForward entries."""
         # Route: (0,0) -> E -> E -> E to (3,0) with deliver_at=[1] (deliver at hop 1)
-        # After hop 0: at (1,0), next dir E — no deliver
-        # After hop 1: at (2,0), next dir E — deliver_at includes 1
+        # After hop 0: at (1,0), next dir E -- no deliver
+        # After hop 1: at (2,0), next dir E -- deliver_at includes 1
         pe_schedules = [
             PESchedule(
                 coord=(0, 0),
@@ -420,7 +455,7 @@ class TestRoutingTableEntriesGenerated:
         assert entry_1.direction == Direction.EAST
         assert entry_1.deliver_slot is None
 
-        # PE (2,0) at hop_idx=1: deliver_at includes 1 → deliver_slot = payload_slot = 5
+        # PE (2,0) at hop_idx=1: deliver_at includes 1 -> deliver_slot = payload_slot = 5
         entry_2 = list(pe_2_0.routing_table.values())[0]
         assert entry_2.direction == Direction.EAST
         assert entry_2.deliver_slot == 5
@@ -445,7 +480,7 @@ class TestColorDiversity:
     def test_same_pe_routes_get_diverse_colors(self) -> None:
         """Routes from the same PE that don't conflict should get different colors."""
         # 4 routes from (0,0), each going to a different destination via 2 hops.
-        # All share intermediate PE (1,0) going East — same behavior, no conflict.
+        # All share intermediate PE (1,0) going East -- same behavior, no conflict.
         # Without diversity: all get color 0. With diversity: colors 0,1,2,3.
         pe_schedules = [
             PESchedule(

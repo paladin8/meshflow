@@ -87,9 +87,12 @@ def _route_xy(
 
     pe_tasks: dict[tuple[int, int], list[TaskEntry]] = {}
     pe_sram: dict[tuple[int, int], dict[int, list[float]]] = {}
-    for node in spatial.nodes:
-        pe_tasks.setdefault(node.coord, [])
-        pe_sram.setdefault(node.coord, {})
+    # Initialize ALL mesh PEs so that routing tables can be generated for
+    # intermediate PEs that messages pass through (even if they have no tasks).
+    for x in range(spatial.width):
+        for y in range(spatial.height):
+            pe_tasks.setdefault((x, y), [])
+            pe_sram.setdefault((x, y), {})
 
     for node in spatial.nodes:
         if node.kind == PlacedNodeKind.FORWARD:
@@ -104,9 +107,13 @@ def _route_xy(
                     ForwardActivationEntry(
                         trigger_slot=0,
                         input_slot=0,
-                        route_dest=dst_node.coord,
-                        route_hops=hops,
-                        payload_slot=edge.dst_slot,
+                        routes=[
+                            BroadcastRoute(
+                                dest=dst_node.coord,
+                                hops=hops,
+                                payload_slot=edge.dst_slot,
+                            )
+                        ],
                     )
                 )
 
@@ -127,9 +134,13 @@ def _route_xy(
                     bias_slot=2,
                     tile_rows=tile.tile_rows,
                     tile_cols=tile.in_features,
-                    route_dest=collect_node.coord,
-                    route_hops=hops,
-                    fragment_slot=tile.tile_index,
+                    routes=[
+                        BroadcastRoute(
+                            dest=collect_node.coord,
+                            hops=hops,
+                            payload_slot=tile.tile_index,
+                        )
+                    ],
                     fragment_offset=tile.fragment_offset,
                 )
             )
@@ -326,9 +337,13 @@ def _route_rmsnorm_tile(
         RmsNormPartialSumEntry(
             trigger_slot=0,
             input_slot=0,
-            reduce_dest=reduce_node.coord,
-            reduce_hops=reduce_hops,
-            partial_sum_slot=tile.tile_index,
+            routes=[
+                BroadcastRoute(
+                    dest=reduce_node.coord,
+                    hops=reduce_hops,
+                    payload_slot=tile.tile_index,
+                )
+            ],
             slice_offset=tile.feature_slice_offset,
             slice_size=tile.feature_slice_size,
             feature_count=feature_count,
@@ -660,7 +675,10 @@ def _broadcast_single_column(
         deliver_at: list[int] = []
         for coord in group[:-1]:
             y_dist = abs(coord[1] - entry_y)
-            hop_idx = x_offset + y_dist
+            # After x_offset horizontal hops we enter the column at entry_y.
+            # The first Y hop (index x_offset) arrives at entry_y ± 1.
+            # A PE at distance y_dist is reached at hop x_offset + y_dist - 1.
+            hop_idx = x_offset + y_dist - 1
             deliver_at.append(hop_idx)
 
         return BroadcastRoute(

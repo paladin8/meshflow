@@ -51,10 +51,7 @@ class ForwardActivationEntry:
     kind: str = field(default="forward_activation", init=False)
     trigger_slot: int = 0
     input_slot: int = 0
-    route_dest: tuple[int, int] = (0, 0)
-    route_hops: list[Direction] = field(default_factory=list)
-    payload_slot: int = 0
-    route_color: int = 0
+    routes: list[BroadcastRoute] = field(default_factory=list)
 
 
 @dataclass
@@ -73,11 +70,8 @@ class LinearEntry:
     bias_slot: int = 2
     tile_rows: int = 0
     tile_cols: int = 0
-    route_dest: tuple[int, int] = (0, 0)
-    route_hops: list[Direction] = field(default_factory=list)
-    fragment_slot: int = 0
+    routes: list[BroadcastRoute] = field(default_factory=list)
     fragment_offset: int = 0
-    route_color: int = 0
 
 
 @dataclass
@@ -141,13 +135,10 @@ class RmsNormPartialSumEntry:
     kind: str = field(default="rms_norm_partial_sum", init=False)
     trigger_slot: int = 0
     input_slot: int = 0
-    reduce_dest: tuple[int, int] = (0, 0)
-    reduce_hops: list[Direction] = field(default_factory=list)
-    partial_sum_slot: int = 0
+    routes: list[BroadcastRoute] = field(default_factory=list)
     slice_offset: int = 0
     slice_size: int = 0
     feature_count: int = 0
-    route_color: int = 0
 
 
 @dataclass

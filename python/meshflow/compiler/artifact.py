@@ -21,16 +21,25 @@ class BroadcastRouteTask:
     """A single route in a broadcast fan-out (serialization form).
 
     dest: (x, y) coordinate of the final destination.
-    hops: ordered direction strings from source to destination.
-    deliver_at: hop indices for intermediate delivery (empty = point-to-point).
     payload_slot: SRAM slot to deliver into on the destination PE.
+    color: route color ID for link multiplexing.
     """
 
     dest: tuple[int, int] = (0, 0)
-    hops: list[str] = field(default_factory=list)
-    deliver_at: list[int] = field(default_factory=list)
     payload_slot: int = 0
     color: int = 0
+
+
+@dataclass
+class RouteTableEntry:
+    """Per-PE routing table entry for the artifact.
+
+    direction: "north", "south", "east", "west"
+    deliver_slot: if set, deliver payload to this SRAM slot before forwarding.
+    """
+
+    direction: str
+    deliver_slot: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -44,10 +53,7 @@ class ForwardActivationTask:
     kind: str = field(default="forward_activation", init=False)
     trigger_slot: int = 0
     input_slot: int = 0
-    route_dest: tuple[int, int] = (0, 0)
-    route_hops: list[str] = field(default_factory=list)
-    payload_slot: int = 0
-    route_color: int = 0
+    routes: list[BroadcastRouteTask] = field(default_factory=list)
 
 
 @dataclass
@@ -66,11 +72,8 @@ class LinearTask:
     bias_slot: int = 2
     tile_rows: int = 0
     tile_cols: int = 0
-    route_dest: tuple[int, int] = (0, 0)
-    route_hops: list[str] = field(default_factory=list)
-    fragment_slot: int = 0
+    routes: list[BroadcastRouteTask] = field(default_factory=list)
     fragment_offset: int = 0
-    route_color: int = 0
 
 
 @dataclass
@@ -134,13 +137,10 @@ class RmsNormPartialSumTask:
     kind: str = field(default="rms_norm_partial_sum", init=False)
     trigger_slot: int = 0
     input_slot: int = 0
-    reduce_dest: tuple[int, int] = (0, 0)
-    reduce_hops: list[str] = field(default_factory=list)
-    partial_sum_slot: int = 0
+    routes: list[BroadcastRouteTask] = field(default_factory=list)
     slice_offset: int = 0
     slice_size: int = 0
     feature_count: int = 0
-    route_color: int = 0
 
 
 @dataclass
@@ -187,6 +187,7 @@ class PEProgram:
     tasks: list[TaskProgram]
     initial_sram: dict[int, list[float]] = field(default_factory=dict)
     sram_capacity_bytes: int | None = None
+    routing_table: dict[int, RouteTableEntry] = field(default_factory=dict)
 
 
 @dataclass
@@ -239,6 +240,13 @@ def _program_to_dict(program: RuntimeProgram) -> dict[str, Any]:
                 "tasks": [_task_to_dict(task) for task in pe.tasks],
                 "initial_sram": {k: v for k, v in pe.initial_sram.items()},
                 "sram_capacity_bytes": pe.sram_capacity_bytes,
+                "routing_table": {
+                    str(color): {
+                        "direction": entry.direction,
+                        "deliver_slot": entry.deliver_slot,
+                    }
+                    for color, entry in pe.routing_table.items()
+                },
             }
             for pe in program.pe_programs
         ],
@@ -256,11 +264,6 @@ def _program_to_dict(program: RuntimeProgram) -> dict[str, Any]:
 def _task_to_dict(task: TaskProgram) -> dict[str, Any]:
     """Convert a per-kind task dataclass to a flat dict."""
     d = asdict(task)
-    # Convert tuples to lists for msgpack
-    if "route_dest" in d and d["route_dest"] is not None:
-        d["route_dest"] = list(d["route_dest"])
-    if "reduce_dest" in d and d["reduce_dest"] is not None:
-        d["reduce_dest"] = list(d["reduce_dest"])
     # Convert routes list of BroadcastRouteTask dicts — dest tuple to list
     if "routes" in d:
         for route in d["routes"]:
@@ -268,92 +271,59 @@ def _task_to_dict(task: TaskProgram) -> dict[str, Any]:
     return d
 
 
+def _reconstruct_routes(raw_routes: list[dict[str, Any]]) -> list[BroadcastRouteTask]:
+    """Reconstruct BroadcastRouteTask objects from deserialized dicts."""
+    return [
+        BroadcastRouteTask(
+            dest=tuple(r["dest"]),
+            payload_slot=r["payload_slot"],
+            color=r.get("color", 0),
+        )
+        for r in raw_routes
+    ]
+
+
 def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
     """Dispatch on `kind` and construct the right task dataclass."""
     kind = d["kind"]
     fields = {k: v for k, v in d.items() if k != "kind"}
     if kind == "forward_activation":
-        if fields.get("route_dest") is not None:
-            fields["route_dest"] = tuple(fields["route_dest"])
+        if "routes" in fields:
+            fields["routes"] = _reconstruct_routes(fields["routes"])
         return ForwardActivationTask(**fields)
     if kind == "collect_output":
         return CollectOutputTask(**fields)
     if kind == "linear":
-        if fields.get("route_dest") is not None:
-            fields["route_dest"] = tuple(fields["route_dest"])
+        if "routes" in fields:
+            fields["routes"] = _reconstruct_routes(fields["routes"])
         return LinearTask(**fields)
     if kind == "concat_collect":
         return ConcatCollectTask(**fields)
     if kind == "concat_collect_forward":
         if "routes" in fields:
-            fields["routes"] = [
-                BroadcastRouteTask(
-                    dest=tuple(r["dest"]),
-                    hops=r["hops"],
-                    deliver_at=r.get("deliver_at", []),
-                    payload_slot=r["payload_slot"],
-                    color=r.get("color", 0),
-                )
-                for r in fields["routes"]
-            ]
+            fields["routes"] = _reconstruct_routes(fields["routes"])
         return ConcatCollectForwardTask(**fields)
     if kind == "add":
         if "routes" in fields:
-            fields["routes"] = [
-                BroadcastRouteTask(
-                    dest=tuple(r["dest"]),
-                    hops=r["hops"],
-                    deliver_at=r.get("deliver_at", []),
-                    payload_slot=r["payload_slot"],
-                    color=r.get("color", 0),
-                )
-                for r in fields["routes"]
-            ]
+            fields["routes"] = _reconstruct_routes(fields["routes"])
         return AddTask(**fields)
     if kind == "softmax":
         return SoftmaxTask(**fields)
     if kind == "mat_mul":
         if "routes" in fields:
-            fields["routes"] = [
-                BroadcastRouteTask(
-                    dest=tuple(r["dest"]),
-                    hops=r["hops"],
-                    deliver_at=r.get("deliver_at", []),
-                    payload_slot=r["payload_slot"],
-                    color=r.get("color", 0),
-                )
-                for r in fields["routes"]
-            ]
+            fields["routes"] = _reconstruct_routes(fields["routes"])
         return MatMulTask(**fields)
     if kind == "rms_norm_partial_sum":
-        if fields.get("reduce_dest") is not None:
-            fields["reduce_dest"] = tuple(fields["reduce_dest"])
+        if "routes" in fields:
+            fields["routes"] = _reconstruct_routes(fields["routes"])
         return RmsNormPartialSumTask(**fields)
     if kind == "rms_norm_normalize":
         if "routes" in fields:
-            fields["routes"] = [
-                BroadcastRouteTask(
-                    dest=tuple(r["dest"]),
-                    hops=r["hops"],
-                    deliver_at=r.get("deliver_at", []),
-                    payload_slot=r["payload_slot"],
-                    color=r.get("color", 0),
-                )
-                for r in fields["routes"]
-            ]
+            fields["routes"] = _reconstruct_routes(fields["routes"])
         return RmsNormNormalizeTask(**fields)
     if kind == "rms_norm_reduce":
         if "routes" in fields:
-            fields["routes"] = [
-                BroadcastRouteTask(
-                    dest=tuple(r["dest"]),
-                    hops=r["hops"],
-                    deliver_at=r.get("deliver_at", []),
-                    payload_slot=r["payload_slot"],
-                    color=r.get("color", 0),
-                )
-                for r in fields["routes"]
-            ]
+            fields["routes"] = _reconstruct_routes(fields["routes"])
         return RmsNormReduceTask(**fields)
     raise ValueError(f"unknown task kind: {kind!r}")
 
@@ -368,6 +338,13 @@ def _dict_to_program(raw: dict[str, Any]) -> RuntimeProgram:
             tasks=[_dict_to_task(task) for task in pe["tasks"]],
             initial_sram={int(k): v for k, v in pe["initial_sram"].items()},
             sram_capacity_bytes=pe.get("sram_capacity_bytes"),
+            routing_table={
+                int(color): RouteTableEntry(
+                    direction=entry["direction"],
+                    deliver_slot=entry.get("deliver_slot"),
+                )
+                for color, entry in pe.get("routing_table", {}).items()
+            },
         )
         for pe in raw["pe_programs"]
     ]

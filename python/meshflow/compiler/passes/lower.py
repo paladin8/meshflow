@@ -15,6 +15,7 @@ from meshflow.compiler.artifact import (
     RmsNormNormalizeTask,
     RmsNormPartialSumTask,
     RmsNormReduceTask,
+    RouteTableEntry,
     RuntimeProgram,
     SoftmaxTask,
     TaskProgram,
@@ -39,11 +40,12 @@ from meshflow.compiler.schedule_ir import (
 
 
 def _lower_route(route: BroadcastRoute) -> BroadcastRouteTask:
-    """Convert a schedule-IR BroadcastRoute to artifact BroadcastRouteTask."""
+    """Convert a schedule-IR BroadcastRoute to artifact BroadcastRouteTask.
+
+    Strips hops and deliver_at -- routing is in per-PE routing tables now.
+    """
     return BroadcastRouteTask(
         dest=route.dest,
-        hops=[d.value for d in route.hops],
-        deliver_at=list(route.deliver_at),
         payload_slot=route.payload_slot,
         color=route.color,
     )
@@ -55,10 +57,7 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
         return ForwardActivationTask(
             trigger_slot=task.trigger_slot,
             input_slot=task.input_slot,
-            route_dest=task.route_dest,
-            route_hops=[d.value for d in task.route_hops],
-            payload_slot=task.payload_slot,
-            route_color=task.route_color,
+            routes=[_lower_route(r) for r in task.routes],
         )
     if isinstance(task, CollectOutputEntry):
         return CollectOutputTask(
@@ -73,11 +72,8 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             bias_slot=task.bias_slot,
             tile_rows=task.tile_rows,
             tile_cols=task.tile_cols,
-            route_dest=task.route_dest,
-            route_hops=[d.value for d in task.route_hops],
-            fragment_slot=task.fragment_slot,
+            routes=[_lower_route(r) for r in task.routes],
             fragment_offset=task.fragment_offset,
-            route_color=task.route_color,
         )
     if isinstance(task, ConcatCollectEntry):
         return ConcatCollectTask(
@@ -129,13 +125,10 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
         return RmsNormPartialSumTask(
             trigger_slot=task.trigger_slot,
             input_slot=task.input_slot,
-            reduce_dest=task.reduce_dest,
-            reduce_hops=[d.value for d in task.reduce_hops],
-            partial_sum_slot=task.partial_sum_slot,
+            routes=[_lower_route(r) for r in task.routes],
             slice_offset=task.slice_offset,
             slice_size=task.slice_size,
             feature_count=task.feature_count,
-            route_color=task.route_color,
         )
     if isinstance(task, RmsNormNormalizeEntry):
         return RmsNormNormalizeTask(
@@ -174,6 +167,13 @@ def lower(schedule: ScheduleIR, config: CompilerConfig | None = None) -> Runtime
             tasks=[_lower_task(task) for task in pe.tasks],
             initial_sram=pe.initial_sram,
             sram_capacity_bytes=config.sram_capacity_bytes,
+            routing_table={
+                color: RouteTableEntry(
+                    direction=entry.direction.value,
+                    deliver_slot=entry.deliver_slot,
+                )
+                for color, entry in pe.routing_table.items()
+            },
         )
         for pe in schedule.pe_schedules
     ]

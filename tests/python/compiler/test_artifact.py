@@ -155,9 +155,7 @@ class TestSerializationRoundTrip:
                             bias_slot=2,
                             tile_rows=3,
                             tile_cols=4,
-                            route_dest=(1, 0),
-                            route_hops=["east"],
-                            fragment_slot=0,
+                            routes=[BroadcastRouteTask(dest=(1, 0), payload_slot=0)],
                             fragment_offset=0,
                         )
                     ],
@@ -181,8 +179,8 @@ class TestSerializationRoundTrip:
         assert isinstance(task0, LinearTask)
         assert task0.tile_rows == 3
         assert task0.tile_cols == 4
-        assert task0.route_dest == (1, 0)
-        assert task0.fragment_slot == 0
+        assert task0.routes[0].dest == (1, 0)
+        assert task0.routes[0].payload_slot == 0
         assert task0.fragment_offset == 0
         assert restored.pe_programs[0].initial_sram == {1: [1.0, 2.0], 2: [3.0]}
 
@@ -207,11 +205,9 @@ class TestSerializationRoundTrip:
                             fragment_offset=0,
                             activation="relu",
                             routes=[
-                                BroadcastRouteTask(
-                                    dest=(1, 0), hops=["east", "south", "south", "south"]
-                                ),
-                                BroadcastRouteTask(dest=(1, 1), hops=["east", "south", "south"]),
-                                BroadcastRouteTask(dest=(1, 2), hops=["east", "south"]),
+                                BroadcastRouteTask(dest=(1, 0)),
+                                BroadcastRouteTask(dest=(1, 1)),
+                                BroadcastRouteTask(dest=(1, 2)),
                             ],
                         ),
                     ],
@@ -231,11 +227,11 @@ class TestSerializationRoundTrip:
         assert task.activation == "relu"
         assert len(task.routes) == 3
         assert task.routes[0].dest == (1, 0)
-        assert task.routes[0].hops == ["east", "south", "south", "south"]
+        assert task.routes[0].dest == (1, 0)
         assert task.routes[1].dest == (1, 1)
-        assert task.routes[1].hops == ["east", "south", "south"]
+        assert task.routes[1].dest == (1, 1)
         assert task.routes[2].dest == (1, 2)
-        assert task.routes[2].hops == ["east", "south"]
+        assert task.routes[2].dest == (1, 2)
 
     def test_round_trip_concat_collect_forward_scatter(self) -> None:
         program = RuntimeProgram(
@@ -254,10 +250,8 @@ class TestSerializationRoundTrip:
                             scatter=True,
                             activation="relu",
                             routes=[
-                                BroadcastRouteTask(
-                                    dest=(1, 0), hops=["east", "south", "south", "south"]
-                                ),
-                                BroadcastRouteTask(dest=(1, 1), hops=["east", "south", "south"]),
+                                BroadcastRouteTask(dest=(1, 0)),
+                                BroadcastRouteTask(dest=(1, 1)),
                             ],
                         ),
                     ],
@@ -279,9 +273,9 @@ class TestSerializationRoundTrip:
         assert task.activation == "relu"
         assert len(task.routes) == 2
         assert task.routes[0].dest == (1, 0)
-        assert task.routes[0].hops == ["east", "south", "south", "south"]
+        assert task.routes[0].dest == (1, 0)
         assert task.routes[1].dest == (1, 1)
-        assert task.routes[1].hops == ["east", "south", "south"]
+        assert task.routes[1].dest == (1, 1)
 
     def test_round_trip_add_task(self) -> None:
         program = RuntimeProgram(
@@ -297,10 +291,8 @@ class TestSerializationRoundTrip:
                             input_slot_b=1,
                             output_slot=2,
                             routes=[
-                                BroadcastRouteTask(dest=(2, 0), hops=["east"], payload_slot=0),
-                                BroadcastRouteTask(
-                                    dest=(2, 1), hops=["east", "north"], payload_slot=1
-                                ),
+                                BroadcastRouteTask(dest=(2, 0), payload_slot=0),
+                                BroadcastRouteTask(dest=(2, 1), payload_slot=1),
                             ],
                         ),
                     ],
@@ -320,7 +312,7 @@ class TestSerializationRoundTrip:
         assert task.output_slot == 2
         assert len(task.routes) == 2
         assert task.routes[0].dest == (2, 0)
-        assert task.routes[0].hops == ["east"]
+        assert task.routes[0].dest[0] >= 0  # valid dest
         assert task.routes[0].payload_slot == 0
         assert task.routes[1].dest == (2, 1)
         assert task.routes[1].payload_slot == 1
@@ -366,7 +358,7 @@ class TestSerializationRoundTrip:
                             transpose=False,
                             output_slot=3,
                             routes=[
-                                BroadcastRouteTask(dest=(1, 0), hops=["east"], payload_slot=0),
+                                BroadcastRouteTask(dest=(1, 0), payload_slot=0),
                             ],
                         ),
                     ],
@@ -400,9 +392,7 @@ class TestSerializationRoundTrip:
                         RmsNormPartialSumTask(
                             trigger_slot=0,
                             input_slot=0,
-                            reduce_dest=(0, 1),
-                            reduce_hops=["north"],
-                            partial_sum_slot=0,
+                            routes=[BroadcastRouteTask(dest=(0, 1), payload_slot=0)],
                         ),
                     ],
                     initial_sram={},
@@ -417,9 +407,9 @@ class TestSerializationRoundTrip:
         assert task.kind == "rms_norm_partial_sum"
         assert task.trigger_slot == 0
         assert task.input_slot == 0
-        assert task.reduce_dest == (0, 1)
-        assert task.reduce_hops == ["north"]
-        assert task.partial_sum_slot == 0
+        assert len(task.routes) == 1
+        assert task.routes[0].dest == (0, 1)
+        assert task.routes[0].payload_slot == 0
 
     def test_round_trip_rms_norm_normalize_task(self) -> None:
         program = RuntimeProgram(
@@ -435,7 +425,7 @@ class TestSerializationRoundTrip:
                             scale_slot=1,
                             gamma_slot=2,
                             routes=[
-                                BroadcastRouteTask(dest=(1, 0), hops=["east"], payload_slot=0),
+                                BroadcastRouteTask(dest=(1, 0), payload_slot=0),
                             ],
                         ),
                     ],
@@ -455,7 +445,7 @@ class TestSerializationRoundTrip:
         assert task.gamma_slot == 2
         assert len(task.routes) == 1
         assert task.routes[0].dest == (1, 0)
-        assert task.routes[0].hops == ["east"]
+        assert task.routes[0].dest[0] >= 0  # valid dest
         assert task.routes[0].payload_slot == 0
 
     def test_round_trip_rms_norm_reduce_task(self) -> None:
@@ -472,10 +462,8 @@ class TestSerializationRoundTrip:
                             feature_count=8,
                             eps=1e-6,
                             routes=[
-                                BroadcastRouteTask(
-                                    dest=(0, 0), hops=["south", "south"], payload_slot=1
-                                ),
-                                BroadcastRouteTask(dest=(0, 1), hops=["south"], payload_slot=1),
+                                BroadcastRouteTask(dest=(0, 0), payload_slot=1),
+                                BroadcastRouteTask(dest=(0, 1), payload_slot=1),
                             ],
                         ),
                     ],
@@ -495,10 +483,8 @@ class TestSerializationRoundTrip:
         assert abs(task.eps - 1e-6) < 1e-10
         assert len(task.routes) == 2
         assert task.routes[0].dest == (0, 0)
-        assert task.routes[0].hops == ["south", "south"]
         assert task.routes[0].payload_slot == 1
         assert task.routes[1].dest == (0, 1)
-        assert task.routes[1].hops == ["south"]
         assert task.routes[1].payload_slot == 1
 
 

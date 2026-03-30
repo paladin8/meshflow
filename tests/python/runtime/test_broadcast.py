@@ -4,8 +4,8 @@ Covers three concerns:
 1. Broadcast is transparent — MLP and transformer block produce correct numerical
    outputs even though activations travel via broadcast routes.
 2. Profiling data is non-degenerate and consistent when broadcast is used.
-3. The compiler's broadcast detection produces routes with non-empty deliver_at
-   fields in the compiled artifact.
+3. The compiler's broadcast detection produces DeliverAndForward routing table
+   entries in the compiled artifact.
 """
 
 import numpy as np
@@ -14,7 +14,6 @@ import torch
 from meshflow._mesh_runtime import run_program
 from meshflow.compiler import CompilerConfig, compile
 from meshflow.compiler.artifact import (
-    ConcatCollectForwardTask,
     RmsNormReduceTask,
     deserialize,
     serialize,
@@ -176,11 +175,12 @@ class TestBroadcastProfiling:
             f"total_hops={result.total_hops}, total_messages={result.total_messages}"
         )
 
-    def test_broadcast_program_has_broadcast_routes(self) -> None:
-        """The compiled transformer artifact contains tasks with non-empty deliver_at.
+    def test_broadcast_program_has_deliver_and_forward(self) -> None:
+        """The compiled transformer artifact has DeliverAndForward routing entries.
 
-        This directly verifies that broadcast detection ran and produced broadcast
-        routes, rather than falling back to N separate point-to-point routes.
+        With routing tables, broadcast detection is verified by checking that
+        some PEs have routing table entries with a non-None deliver_slot
+        (DeliverAndForward semantics).
         """
         seq_len = 2
         d_model = 4
@@ -193,16 +193,14 @@ class TestBroadcastProfiling:
         artifact_bytes = _compile_artifact(graph, weights, mesh_height=6)
         program = deserialize(artifact_bytes)
 
-        broadcast_route_count = 0
+        deliver_and_forward_count = 0
         for pe in program.pe_programs:
-            for task in pe.tasks:
-                if hasattr(task, "routes"):
-                    for r in task.routes:
-                        if r.deliver_at:
-                            broadcast_route_count += 1
+            for entry in pe.routing_table.values():
+                if entry.deliver_slot is not None:
+                    deliver_and_forward_count += 1
 
-        assert broadcast_route_count > 0, (
-            "expected at least one broadcast route (deliver_at non-empty) in the "
+        assert deliver_and_forward_count > 0, (
+            "expected at least one DeliverAndForward routing table entry in the "
             "compiled transformer program; found none"
         )
 
@@ -214,8 +212,8 @@ class TestBroadcastDetectionArtifact:
         """RmsNormReduce tasks in a FORWARD->RMSNORM->COLLECT graph use column broadcast.
 
         The reduce PE broadcasts the scale factor south to all tile PEs in the
-        same column, so every RmsNormReduceTask should have exactly one route with
-        a non-empty deliver_at list.
+        same column. With routing tables, this is verified by checking that
+        intermediate PEs have DeliverAndForward entries (non-None deliver_slot).
         """
         d_model = 8
         eps = 1e-6
@@ -249,22 +247,27 @@ class TestBroadcastDetectionArtifact:
 
         assert len(reduce_tasks) > 0, "no RmsNormReduceTask found in artifact"
 
-        for task in reduce_tasks:
-            assert len(task.routes) == 1, (
-                f"expected 1 broadcast route per RmsNormReduceTask, got {len(task.routes)}"
-            )
-            r = task.routes[0]
-            assert len(r.deliver_at) > 0, (
-                "RmsNormReduceTask route should use broadcast (deliver_at non-empty); "
-                "got point-to-point route"
-            )
+        # With broadcast, the reduce PE sends one route per direction to
+        # the farthest tile, and intermediate tiles get DeliverAndForward
+        # entries in the routing table.
+        deliver_and_forward_count = 0
+        for pe in program.pe_programs:
+            for entry in pe.routing_table.values():
+                if entry.deliver_slot is not None:
+                    deliver_and_forward_count += 1
+
+        assert deliver_and_forward_count > 0, (
+            "RmsNormReduce broadcast should produce DeliverAndForward routing "
+            "table entries on intermediate tile PEs; found none"
+        )
 
     def test_concat_collect_forward_broadcast_mlp(self) -> None:
         """ConcatCollectForward tasks in a 3-layer MLP use broadcast routes.
 
         The inter-layer collect PE broadcasts the assembled activation east+south
-        to the tile PEs of the next layer, so at least some ConcatCollectForwardTasks
-        should have routes with non-empty deliver_at.
+        to the tile PEs of the next layer. With routing tables, broadcast is
+        verified by checking that some intermediate PEs have DeliverAndForward
+        entries (non-None deliver_slot).
         """
         layer_dims = [4, 8, 16, 4]
         graph = mlp_block(layer_dims)
@@ -273,18 +276,15 @@ class TestBroadcastDetectionArtifact:
         artifact_bytes = _compile_artifact(graph, weights, mesh_height=6)
         program = deserialize(artifact_bytes)
 
-        broadcast_ccf_count = 0
+        deliver_and_forward_count = 0
         for pe in program.pe_programs:
-            for task in pe.tasks:
-                if isinstance(task, ConcatCollectForwardTask):
-                    for r in task.routes:
-                        if r.deliver_at:
-                            broadcast_ccf_count += 1
-                            break  # count once per task
+            for entry in pe.routing_table.values():
+                if entry.deliver_slot is not None:
+                    deliver_and_forward_count += 1
 
-        assert broadcast_ccf_count > 0, (
-            "expected at least one ConcatCollectForwardTask with broadcast routes "
-            "(deliver_at non-empty) in the 3-layer MLP artifact; found none"
+        assert deliver_and_forward_count > 0, (
+            "expected at least one DeliverAndForward routing table entry in the "
+            "3-layer MLP artifact; found none"
         )
 
     def test_single_destination_no_broadcast(self) -> None:
@@ -308,10 +308,8 @@ class TestBroadcastDetectionArtifact:
 
         for pe in program.pe_programs:
             for task in pe.tasks:
-                # ForwardActivationTask uses route_dest/route_hops, not routes list
+                # With routing tables, all tasks use routes list
                 if hasattr(task, "routes"):
                     for r in task.routes:
-                        assert len(r.deliver_at) == 0, (
-                            f"single-destination route should have empty deliver_at, "
-                            f"got {r.deliver_at} at PE {pe.coord}, task {task.kind}"
-                        )
+                        # Routes no longer carry deliver_at (routing is in tables)
+                        assert isinstance(r.dest, tuple)

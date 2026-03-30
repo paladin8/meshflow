@@ -65,7 +65,8 @@ class TestLowering:
         a_prog = next(pe for pe in program.pe_programs if pe.coord == (0, 0))
         task = a_prog.tasks[0]
         assert isinstance(task, ForwardActivationTask)
-        assert task.route_hops == ["east"]
+        assert len(task.routes) == 1
+        assert task.routes[0].dest == (1, 0)
 
     def test_lower_empty_initial_sram(self) -> None:
         graph = GraphIR(
@@ -138,10 +139,8 @@ class TestLowerNewTasks:
         assert task.input_slot_b == 1
         assert task.output_slot == 2
         assert len(task.routes) == 2
-        assert task.routes[0] == BroadcastRouteTask(dest=(2, 0), hops=["east"], payload_slot=0)
-        assert task.routes[1] == BroadcastRouteTask(
-            dest=(2, 1), hops=["east", "north"], payload_slot=1
-        )
+        assert task.routes[0] == BroadcastRouteTask(dest=(2, 0), payload_slot=0)
+        assert task.routes[1] == BroadcastRouteTask(dest=(2, 1), payload_slot=1)
 
     def test_lower_softmax_entry(self) -> None:
         entry = SoftmaxEntry(trigger_slot=5, input_slot=5, output_slot=6)
@@ -173,24 +172,28 @@ class TestLowerNewTasks:
         assert task.transpose is False
         assert task.output_slot == 3
         assert len(task.routes) == 1
-        assert task.routes[0] == BroadcastRouteTask(dest=(1, 0), hops=["east"], payload_slot=0)
+        assert task.routes[0] == BroadcastRouteTask(dest=(1, 0), payload_slot=0)
 
     def test_lower_rms_norm_partial_sum_entry(self) -> None:
         entry = RmsNormPartialSumEntry(
             trigger_slot=0,
             input_slot=0,
-            reduce_dest=(0, 4),
-            reduce_hops=[Direction.NORTH, Direction.NORTH],
-            partial_sum_slot=2,
+            routes=[
+                BroadcastRoute(
+                    dest=(0, 4),
+                    hops=[Direction.NORTH, Direction.NORTH],
+                    payload_slot=2,
+                ),
+            ],
         )
         task = _lower_task(entry)
         assert isinstance(task, RmsNormPartialSumTask)
         assert task.kind == "rms_norm_partial_sum"
         assert task.trigger_slot == 0
         assert task.input_slot == 0
-        assert task.reduce_dest == (0, 4)
-        assert task.reduce_hops == ["north", "north"]
-        assert task.partial_sum_slot == 2
+        assert len(task.routes) == 1
+        assert task.routes[0].dest == (0, 4)
+        assert task.routes[0].payload_slot == 2
 
     def test_lower_rms_norm_normalize_entry(self) -> None:
         entry = RmsNormNormalizeEntry(
@@ -210,7 +213,7 @@ class TestLowerNewTasks:
         assert task.scale_slot == 1
         assert task.gamma_slot == 2
         assert len(task.routes) == 1
-        assert task.routes[0] == BroadcastRouteTask(dest=(1, 0), hops=["east"], payload_slot=0)
+        assert task.routes[0] == BroadcastRouteTask(dest=(1, 0), payload_slot=0)
 
     def test_lower_rms_norm_reduce_entry(self) -> None:
         entry = RmsNormReduceEntry(
@@ -233,10 +236,8 @@ class TestLowerNewTasks:
         assert task.feature_count == 8
         assert abs(task.eps - 1e-6) < 1e-10
         assert len(task.routes) == 2
-        assert task.routes[0] == BroadcastRouteTask(
-            dest=(0, 0), hops=["south", "south"], payload_slot=1
-        )
-        assert task.routes[1] == BroadcastRouteTask(dest=(0, 1), hops=["south"], payload_slot=1)
+        assert task.routes[0] == BroadcastRouteTask(dest=(0, 0), payload_slot=1)
+        assert task.routes[1] == BroadcastRouteTask(dest=(0, 1), payload_slot=1)
 
     def test_lower_rmsnorm_full_pipeline(self) -> None:
         """End-to-end: FORWARD → RMSNORM → COLLECT through all passes."""
@@ -272,7 +273,7 @@ class TestLowerNewTasks:
         )
         ps_tasks = [t for t in tile_pe.tasks if isinstance(t, RmsNormPartialSumTask)]
         assert len(ps_tasks) == 1
-        assert ps_tasks[0].reduce_hops  # should have at least one hop direction
+        assert len(ps_tasks[0].routes) == 1  # should have one route
 
         norm_tasks = [t for t in tile_pe.tasks if isinstance(t, RmsNormNormalizeTask)]
         assert len(norm_tasks) == 1
@@ -349,8 +350,7 @@ class TestLowerNewTasks:
         softmax_tasks = [t for t in attn_pe.tasks if isinstance(t, SoftmaxTask)]
         assert len(softmax_tasks) == 1
 
-        # Verify direction strings are lowered
+        # Verify routes are present (hops stripped in Phase 3 lowering)
         for t in matmul_tasks:
             for r in t.routes:
-                for h in r.hops:
-                    assert h in ("north", "south", "east", "west")
+                assert isinstance(r, BroadcastRouteTask)

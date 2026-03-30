@@ -32,15 +32,15 @@ class TestCompileOrchestrator:
         # Check tasks are correct
         a_prog = next(pe for pe in program.pe_programs if pe.coord == (0, 0))
         assert a_prog.tasks[0].kind == "forward_activation"
-        assert a_prog.tasks[0].route_hops == ["east"]
+        assert len(a_prog.tasks[0].routes) == 1
 
         b_prog = next(pe for pe in program.pe_programs if pe.coord == (1, 0))
         assert b_prog.tasks[0].kind == "forward_activation"
-        assert b_prog.tasks[0].route_hops == ["east"]
+        assert len(b_prog.tasks[0].routes) == 1
 
         c_prog = next(pe for pe in program.pe_programs if pe.coord == (2, 0))
         assert c_prog.tasks[0].kind == "collect_output"
-        assert not hasattr(c_prog.tasks[0], "route_hops")
+        assert not hasattr(c_prog.tasks[0], "routes")
 
     def test_compile_with_explicit_config(self) -> None:
         graph = GraphIR(
@@ -94,11 +94,11 @@ class TestLinearCompileOrchestrator:
             assert len(pe.initial_sram) == 2  # weight + bias
 
         # Verify fragment indexing
-        fragment_slots = sorted(pe.tasks[0].fragment_slot for pe in tile_pes)
+        fragment_slots = sorted(pe.tasks[0].routes[0].payload_slot for pe in tile_pes)
         assert fragment_slots == [0, 1, 2]
         for pe in tile_pes:
             task = pe.tasks[0]
-            assert task.fragment_offset == task.fragment_slot * 2
+            assert task.fragment_offset == task.routes[0].payload_slot * 2
 
         # Collect PE has ConcatCollectTask entries — find dynamically
         collect_pe = next(

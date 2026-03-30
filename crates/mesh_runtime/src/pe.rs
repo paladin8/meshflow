@@ -23,6 +23,18 @@ impl Activation {
     }
 }
 
+/// Action to take when a message with a given color arrives at this PE.
+#[derive(Debug, Clone)]
+pub enum RouteAction {
+    /// Forward the message in the given direction.
+    Forward(Direction),
+    /// Deliver a copy of the payload to the given slot, then forward.
+    DeliverAndForward {
+        direction: Direction,
+        deliver_slot: SlotId,
+    },
+}
+
 /// A processing element on the 2D mesh.
 ///
 /// Each PE has local SRAM (blob store), an input queue for arriving messages,
@@ -40,19 +52,19 @@ pub struct PE {
     pub sram_capacity_bytes: Option<usize>,
     /// Profiling counters.
     pub counters: PeCounters,
+    /// Per-color routing table: color -> action (forward or deliver+forward).
+    /// Absence of an entry for a color means this PE is the final destination.
+    pub routing_table: HashMap<u32, RouteAction>,
 }
 
 /// A single route in a broadcast fan-out (runtime form).
 ///
 /// `dest` is the final destination coordinate (used for Message.dest / profiling).
-/// `hops` is the ordered direction list from source to destination.
-/// `deliver_at` lists hop indices for intermediate delivery (empty = point-to-point).
 /// `payload_slot` is the SRAM slot to deliver into on the destination PE.
+/// `color` is the route color for link multiplexing.
 #[derive(Debug, Clone)]
 pub struct BroadcastRouteRuntime {
     pub dest: Coord,
-    pub hops: Vec<Direction>,
-    pub deliver_at: Vec<usize>,
     pub payload_slot: SlotId,
     /// Route color ID for link multiplexing (0 = uncolored).
     pub color: u32,
@@ -71,16 +83,10 @@ pub struct TaskConfig {
 /// The kind of task and its parameters.
 #[derive(Debug, Clone)]
 pub enum TaskKind {
-    /// Read payload from input_slot and emit a message to route_dest
-    /// using the pre-computed hop list.
+    /// Read payload from input_slot and emit a message using routes[0].
     ForwardActivation {
         input_slot: SlotId,
-        route_dest: Coord,
-        hops: Vec<Direction>,
-        /// SRAM slot to deliver into on the destination PE (default 0).
-        payload_slot: SlotId,
-        /// Route color ID for link multiplexing (0 = uncolored).
-        color: u32,
+        routes: Vec<BroadcastRouteRuntime>,
     },
     /// Consume payload from input_slot and mark it as simulation output.
     CollectOutput { input_slot: SlotId },
@@ -92,12 +98,8 @@ pub enum TaskKind {
         bias_slot: SlotId,
         tile_rows: u32,
         tile_cols: u32,
-        route_dest: Coord,
-        hops: Vec<Direction>,
-        fragment_slot: SlotId,
+        routes: Vec<BroadcastRouteRuntime>,
         fragment_offset: u32,
-        /// Route color ID for link multiplexing (0 = uncolored).
-        color: u32,
     },
     /// Accumulate output fragments into a pre-allocated buffer.
     /// Each trigger writes fragment data at fragment_offset.
@@ -152,17 +154,13 @@ pub enum TaskKind {
     /// RMSNorm phase 1: compute sum(x^2) for local slice, send to reduce PE.
     RmsNormPartialSum {
         input_slot: SlotId,
-        reduce_dest: Coord,
-        reduce_hops: Vec<Direction>,
-        partial_sum_slot: SlotId,
+        routes: Vec<BroadcastRouteRuntime>,
         slice_offset: u32,
         slice_size: u32,
         /// Total features per position (0 = legacy single-position mode).
         /// When > 0 and data.len() > feature_count, the input is position-major
         /// and per-position partial sums are computed.
         feature_count: u32,
-        /// Route color ID for link multiplexing (0 = uncolored).
-        color: u32,
     },
     /// RMSNorm phase 2: apply x * scale * gamma using scale from reduce PE.
     RmsNormNormalize {
@@ -209,6 +207,7 @@ impl PE {
             tasks: Vec::new(),
             sram_capacity_bytes: None,
             counters: PeCounters::default(),
+            routing_table: HashMap::new(),
         }
     }
 
@@ -270,7 +269,6 @@ impl PE {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coords::Direction;
 
     fn make_pe() -> PE {
         PE::new(Coord::new(0, 0))
@@ -369,13 +367,11 @@ mod tests {
             id: 1,
             source: Coord::new(0, 0),
             dest: Coord::new(1, 0),
-            hops: vec![],
-            current_hop: 0,
             payload: vec![1.0],
             payload_slot: 0,
             timestamp: 0,
-            deliver_at: vec![],
             color: 0,
+            hop_count: 0,
         };
         let msg2 = crate::message::Message {
             id: 2,
@@ -395,10 +391,11 @@ mod tests {
         pe.tasks.push(TaskConfig {
             kind: TaskKind::ForwardActivation {
                 input_slot: 0,
-                route_dest: Coord::new(1, 0),
-                hops: vec![Direction::East],
-                payload_slot: 0,
-                color: 0,
+                routes: vec![BroadcastRouteRuntime {
+                    dest: Coord::new(1, 0),
+                    payload_slot: 0,
+                    color: 0,
+                }],
             },
             trigger_slot: 0,
         });

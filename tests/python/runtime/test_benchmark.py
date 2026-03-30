@@ -29,25 +29,24 @@ def _run_config(seq_len: int, d_model: int, d_ff: int, mesh_height: int) -> tupl
 
 
 def _route_stats(program) -> tuple[int, int, int]:
-    """Return (broadcast_routes, pp_routes, max_hops) from compiled program."""
-    broadcast_routes = 0
-    pp_routes = 0
-    hop_counts: list[int] = []
+    """Return (total_routes, routing_table_entries, max_manhattan_hops).
+
+    With Phase 3 routing tables, hops are no longer stored per-route.
+    Estimate max_hops via Manhattan distance from source PE to route dest.
+    """
+    total_routes = 0
+    routing_table_entries = 0
+    max_hops = 0
     for pe in program.pe_programs:
         for task in pe.tasks:
             if hasattr(task, "routes"):
-                for r in task.routes:
-                    hop_counts.append(len(r.hops))
-                    if r.deliver_at:
-                        broadcast_routes += 1
-                    else:
-                        pp_routes += 1
-            if hasattr(task, "route_hops"):
-                hop_counts.append(len(task.route_hops))
-            if hasattr(task, "dest_hops"):
-                hop_counts.append(len(task.dest_hops))
-    max_hops = max(hop_counts) if hop_counts else 0
-    return broadcast_routes, pp_routes, max_hops
+                for route in task.routes:
+                    total_routes += 1
+                    dx = abs(pe.coord[0] - route.dest[0])
+                    dy = abs(pe.coord[1] - route.dest[1])
+                    max_hops = max(max_hops, dx + dy)
+        routing_table_entries += len(pe.routing_table)
+    return total_routes, routing_table_entries, max_hops
 
 
 def _max_sends(result) -> int:
