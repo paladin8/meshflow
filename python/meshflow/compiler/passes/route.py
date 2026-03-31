@@ -17,9 +17,7 @@ from meshflow.compiler.schedule_ir import (
     LinearEntry,
     MatMulEntry,
     PESchedule,
-    RmsNormNormalizeEntry,
-    RmsNormPartialSumEntry,
-    RmsNormReduceEntry,
+    RmsNormFusedEntry,
     ScheduleIR,
     SoftmaxEntry,
     TaskEntry,
@@ -30,8 +28,7 @@ from meshflow.compiler.spatial_ir import (
     PlacedEdge,
     PlacedNode,
     PlacedNodeKind,
-    PlacedRmsNormReduceData,
-    PlacedRmsNormTileData,
+    PlacedRmsNormFusedData,
     PlacedTileData,
     SpatialIR,
 )
@@ -226,11 +223,8 @@ def _route_xy(
                         )
                     )
 
-        elif node.kind == PlacedNodeKind.RMSNORM_TILE:
-            _route_rmsnorm_tile(node, spatial, node_map, pe_tasks, pe_sram, weights)
-
-        elif node.kind == PlacedNodeKind.RMSNORM_REDUCE:
-            _route_rmsnorm_reduce(node, spatial, node_map, pe_tasks)
+        elif node.kind == PlacedNodeKind.RMSNORM_FUSED:
+            _route_rmsnorm_fused(node, spatial, node_map, pe_tasks, pe_sram, weights)
 
         elif node.kind == PlacedNodeKind.ATTENTION_PE:
             _route_attention_pe(node, spatial, node_map, pe_tasks)
@@ -274,8 +268,7 @@ def _generate_input_slots(spatial: SpatialIR) -> list[InputSlot]:
     # Internal PE kinds that should never be external inputs
     _INTERNAL_KINDS = {
         PlacedNodeKind.LINEAR_COLLECT,
-        PlacedNodeKind.RMSNORM_TILE,
-        PlacedNodeKind.RMSNORM_REDUCE,
+        PlacedNodeKind.RMSNORM_FUSED,
         PlacedNodeKind.ATTENTION_PE,
     }
 
@@ -301,7 +294,7 @@ def _find_first_layer_origin(spatial: SpatialIR) -> str | None:
     return None
 
 
-def _route_rmsnorm_tile(
+def _route_rmsnorm_fused(
     node: PlacedNode,
     spatial: SpatialIR,
     node_map: dict[str, PlacedNode],
@@ -309,129 +302,42 @@ def _route_rmsnorm_tile(
     pe_sram: dict[tuple[int, int], dict[int, list[float]]],
     weights: dict[str, dict[str, np.ndarray]] | None,
 ) -> None:
-    """Route an RmsNorm tile PE: phase 1 (partial sum) and phase 2 (normalize)."""
-    tile = node.data
-    assert isinstance(tile, PlacedRmsNormTileData)
+    """Route a fused single-PE RMSNorm: receive input, normalize, broadcast."""
+    data = node.data
+    assert isinstance(data, PlacedRmsNormFusedData)
 
-    # Find the reduce PE via internal edges (tile → reduce)
-    reduce_edge = None
-    for e in spatial.edges:
-        if e.src_node == node.id:
-            dst = node_map[e.dst_node]
-            if dst.kind == PlacedNodeKind.RMSNORM_REDUCE:
-                reduce_edge = e
-                break
-
-    if reduce_edge is None:
-        raise ValueError(f"RmsNorm tile node {node.id!r} has no edge to reduce PE")
-
-    reduce_node = node_map[reduce_edge.dst_node]
-    reduce_hops = _generate_route_xy(node.coord, reduce_node.coord)
-
-    # Get feature_count from reduce PE data
-    assert isinstance(reduce_node.data, PlacedRmsNormReduceData)
-    feature_count = reduce_node.data.feature_count
-
-    # Phase 1: RmsNormPartialSum
-    pe_tasks[node.coord].append(
-        RmsNormPartialSumEntry(
-            trigger_slot=0,
-            input_slot=0,
-            routes=[
-                BroadcastRoute(
-                    dest=reduce_node.coord,
-                    hops=reduce_hops,
-                    payload_slot=tile.tile_index,
-                )
-            ],
-            slice_offset=tile.feature_slice_offset,
-            slice_size=tile.feature_slice_size,
-            feature_count=feature_count,
-        )
-    )
-
-    # Phase 2: RmsNormNormalize — find outgoing inter-group edges (not internal)
-    # Inter-group edges go to nodes that are NOT the reduce PE
-    normalize_routes: list[BroadcastRoute] = []
-    for e in spatial.edges:
-        if e.src_node == node.id:
-            dst = node_map[e.dst_node]
-            if dst.kind != PlacedNodeKind.RMSNORM_REDUCE:
-                hops = _generate_route_xy(node.coord, dst.coord)
-                normalize_routes.append(
-                    BroadcastRoute(
-                        dest=dst.coord,
-                        hops=hops,
-                        deliver_at=[],
-                        payload_slot=e.dst_slot,
-                    )
-                )
-
-    normalize_routes = _try_linear_broadcast(node.coord, normalize_routes)
-
-    pe_tasks[node.coord].append(
-        RmsNormNormalizeEntry(
-            trigger_slot=1,
-            input_slot=0,
-            scale_slot=1,
-            gamma_slot=2,
-            routes=normalize_routes,
-            slice_offset=tile.feature_slice_offset,
-            slice_size=tile.feature_slice_size,
-        )
-    )
-
-    # Load gamma weights into SRAM slot 2
-    if weights is not None and tile.origin_id in weights:
-        gamma = weights[tile.origin_id]["gamma"]
-        gamma_slice = (
-            gamma[tile.feature_slice_offset : tile.feature_slice_offset + tile.feature_slice_size]
-            .flatten()
-            .tolist()
-        )
-        pe_sram[node.coord][2] = gamma_slice
-
-
-def _route_rmsnorm_reduce(
-    node: PlacedNode,
-    spatial: SpatialIR,
-    node_map: dict[str, PlacedNode],
-    pe_tasks: dict[tuple[int, int], list[TaskEntry]],
-) -> None:
-    """Route an RmsNorm reduce PE."""
-    reduce = node.data
-    assert isinstance(reduce, PlacedRmsNormReduceData)
-
-    # Find tile_dests: outgoing edges from reduce → tile PEs (scale broadcast)
-    # Each route carries payload_slot=1 (the scale slot on tile PEs)
-    reduce_routes: list[BroadcastRoute] = []
-    for e in spatial.edges:
-        if e.src_node == node.id:
-            dst = node_map[e.dst_node]
-            if dst.kind == PlacedNodeKind.RMSNORM_TILE:
-                hops = _generate_route_xy(node.coord, dst.coord)
-                reduce_routes.append(
-                    BroadcastRoute(
-                        dest=dst.coord,
-                        hops=hops,
-                        deliver_at=[],
-                        payload_slot=1,
-                    )
-                )
-
-    reduce_routes = _try_linear_broadcast(node.coord, reduce_routes)
-
-    # Generate one RmsNormReduceEntry per partial sum slot
-    for i in range(reduce.num_tiles):
-        pe_tasks[node.coord].append(
-            RmsNormReduceEntry(
-                trigger_slot=i,
-                num_tiles=reduce.num_tiles,
-                feature_count=reduce.feature_count,
-                eps=reduce.eps,
-                routes=list(reduce_routes),
+    # Build routes to downstream nodes
+    outgoing = _outgoing_edges(spatial, node.id)
+    fused_routes: list[BroadcastRoute] = []
+    for edge in outgoing:
+        dst = node_map[edge.dst_node]
+        hops = _generate_route_xy(node.coord, dst.coord)
+        fused_routes.append(
+            BroadcastRoute(
+                dest=dst.coord,
+                hops=hops,
+                deliver_at=[],
+                payload_slot=edge.dst_slot,
             )
         )
+
+    fused_routes = _try_linear_broadcast(node.coord, fused_routes)
+
+    pe_tasks[node.coord].append(
+        RmsNormFusedEntry(
+            trigger_slot=0,
+            input_slot=0,
+            gamma_slot=1,
+            feature_count=data.feature_count,
+            eps=data.eps,
+            routes=fused_routes,
+        )
+    )
+
+    # Load gamma weights into SRAM slot 1
+    if weights is not None and data.origin_id in weights:
+        gamma = weights[data.origin_id]["gamma"]
+        pe_sram[node.coord][1] = gamma.flatten().tolist()
 
 
 def _route_attention_pe(

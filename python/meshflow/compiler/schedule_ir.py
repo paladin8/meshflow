@@ -131,33 +131,11 @@ class MatMulEntry:
 
 
 @dataclass
-class RmsNormPartialSumEntry:
-    kind: str = field(default="rms_norm_partial_sum", init=False)
+class RmsNormFusedEntry:
+    kind: str = field(default="rms_norm_fused", init=False)
     trigger_slot: int = 0
     input_slot: int = 0
-    routes: list[BroadcastRoute] = field(default_factory=list)
-    slice_offset: int = 0
-    slice_size: int = 0
-    feature_count: int = 0
-
-
-@dataclass
-class RmsNormNormalizeEntry:
-    kind: str = field(default="rms_norm_normalize", init=False)
-    trigger_slot: int = 1
-    input_slot: int = 0
-    scale_slot: int = 1
-    gamma_slot: int = 2
-    routes: list[BroadcastRoute] = field(default_factory=list)
-    slice_offset: int = 0
-    slice_size: int = 0
-
-
-@dataclass
-class RmsNormReduceEntry:
-    kind: str = field(default="rms_norm_reduce", init=False)
-    trigger_slot: int = 0
-    num_tiles: int = 0
+    gamma_slot: int = 1
     feature_count: int = 0
     eps: float = 1e-6
     routes: list[BroadcastRoute] = field(default_factory=list)
@@ -172,9 +150,7 @@ TaskEntry = (
     | AddEntry
     | SoftmaxEntry
     | MatMulEntry
-    | RmsNormPartialSumEntry
-    | RmsNormNormalizeEntry
-    | RmsNormReduceEntry
+    | RmsNormFusedEntry
 )
 
 

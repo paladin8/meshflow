@@ -73,21 +73,17 @@ def expand(graph: GraphIR, config: CompilerConfig) -> ExpandedIR:
             assert node.attrs is not None
             feature_count = node.attrs["feature_count"]
             eps = node.attrs["eps"]
-            num_tiles = _compute_tile_count(
-                feature_count, config, reserved_rows=2
-            )  # reduce + collect
+            # Fused single-PE RMSNorm: no tiles or reduce PE needed.
             groups.append(
                 RmsNormGroup(
                     origin_id=nid,
-                    num_tiles=num_tiles,
+                    num_tiles=0,
                     feature_count=feature_count,
                     eps=eps,
                 )
             )
-            tile_ids = [f"{nid}_tile_{i}" for i in range(num_tiles)]
-            collect_id = f"{nid}_collect"
-            # Data enters through tiles, exits through collect (gathers normalized fragments)
-            node_expansions[nid] = NodeExpansion(input_pe_ids=tile_ids, output_pe_ids=[collect_id])
+            norm_id = f"{nid}_norm"
+            node_expansions[nid] = NodeExpansion(input_pe_ids=[norm_id], output_pe_ids=[norm_id])
 
         elif node.op == OpType.MATMUL:
             if nid in attention_chains:

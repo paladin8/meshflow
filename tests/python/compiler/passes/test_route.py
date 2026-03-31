@@ -13,9 +13,7 @@ from meshflow.compiler.schedule_ir import (
     ConcatCollectForwardEntry,
     Direction,
     MatMulEntry,
-    RmsNormNormalizeEntry,
-    RmsNormPartialSumEntry,
-    RmsNormReduceEntry,
+    RmsNormFusedEntry,
     SoftmaxEntry,
 )
 
@@ -534,7 +532,8 @@ class TestRmsNormRouting:
             }
         }
 
-    def test_rmsnorm_tile_pe_has_partial_sum_and_normalize(self) -> None:
+    def test_rmsnorm_fused_pe_has_fused_entry(self) -> None:
+        """The fused RMSNorm PE has a single RmsNormFusedEntry task."""
         graph = self._make_rmsnorm_graph()
         config = CompilerConfig()
         weights = self._make_rmsnorm_weights()
@@ -542,33 +541,28 @@ class TestRmsNormRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
-        # Find any tile PE with partial_sum + normalize tasks
-        tile_pes = [
+        # Find the fused PE
+        fused_pes = [
             p
             for p in schedule.pe_schedules
-            if any(isinstance(t, RmsNormPartialSumEntry) for t in p.tasks)
+            if any(isinstance(t, RmsNormFusedEntry) for t in p.tasks)
         ]
-        assert len(tile_pes) == 4
+        assert len(fused_pes) == 1
 
-        tile_pe = tile_pes[0]
-        assert len(tile_pe.tasks) == 2
+        fused_pe = fused_pes[0]
+        fused_tasks = [t for t in fused_pe.tasks if isinstance(t, RmsNormFusedEntry)]
+        assert len(fused_tasks) == 1
 
-        ps_task = tile_pe.tasks[0]
-        assert isinstance(ps_task, RmsNormPartialSumEntry)
-        assert ps_task.kind == "rms_norm_partial_sum"
-        assert ps_task.trigger_slot == 0
-        assert ps_task.input_slot == 0
-        assert ps_task.routes[0].payload_slot == 0
+        task = fused_tasks[0]
+        assert task.kind == "rms_norm_fused"
+        assert task.trigger_slot == 0
+        assert task.input_slot == 0
+        assert task.gamma_slot == 1
+        assert task.feature_count == 4
+        assert abs(task.eps - 1e-6) < 1e-10
 
-        norm_task = tile_pe.tasks[1]
-        assert isinstance(norm_task, RmsNormNormalizeEntry)
-        assert norm_task.kind == "rms_norm_normalize"
-        assert norm_task.trigger_slot == 1
-        assert norm_task.input_slot == 0
-        assert norm_task.scale_slot == 1
-        assert norm_task.gamma_slot == 2
-
-    def test_rmsnorm_tile_has_correct_reduce_dest(self) -> None:
+    def test_rmsnorm_fused_routes_to_downstream(self) -> None:
+        """The fused PE routes its output to the downstream COLLECT PE."""
         graph = self._make_rmsnorm_graph()
         config = CompilerConfig()
         weights = self._make_rmsnorm_weights()
@@ -576,55 +570,25 @@ class TestRmsNormRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
-        # Find reduce PE coord dynamically
-        reduce_coord = next(
+        fused_pe = next(
+            p
+            for p in schedule.pe_schedules
+            if any(isinstance(t, RmsNormFusedEntry) for t in p.tasks)
+        )
+        fused_task = next(t for t in fused_pe.tasks if isinstance(t, RmsNormFusedEntry))
+        assert len(fused_task.routes) >= 1
+
+        # The output should reach the collect PE
+        collect_coord = next(
             p.coord
             for p in schedule.pe_schedules
-            if any(isinstance(t, RmsNormReduceEntry) for t in p.tasks)
+            if any(t.kind == "collect_output" for t in p.tasks)
         )
-
-        # All tile PEs should route partial sums to the reduce PE
-        tile_pe = next(
-            p
-            for p in schedule.pe_schedules
-            if any(isinstance(t, RmsNormPartialSumEntry) for t in p.tasks)
-        )
-        ps_task = tile_pe.tasks[0]
-        assert isinstance(ps_task, RmsNormPartialSumEntry)
-        assert ps_task.routes[0].dest == reduce_coord
-
-    def test_rmsnorm_reduce_pe_has_reduce_entries(self) -> None:
-        graph = self._make_rmsnorm_graph()
-        config = CompilerConfig()
-        weights = self._make_rmsnorm_weights()
-        expanded = expand(graph, config)
-        spatial = place(expanded, config)
-        schedule = route(spatial, config, weights)
-
-        # Find reduce PE dynamically
-        reduce_pe = next(
-            p
-            for p in schedule.pe_schedules
-            if any(isinstance(t, RmsNormReduceEntry) for t in p.tasks)
-        )
-        assert len(reduce_pe.tasks) == 4
-        for i, task in enumerate(reduce_pe.tasks):
-            assert isinstance(task, RmsNormReduceEntry)
-            assert task.trigger_slot == i
-            assert task.num_tiles == 4
-            assert task.feature_count == 4
-            assert abs(task.eps - 1e-6) < 1e-10
-            # Broadcast detection: 4 tile PEs all share X=1, payload_slot=1.
-            # Collapses to broadcast route(s) from reduce PE south to tile PEs.
-            # With middle collect, tiles may be split above/below collect,
-            # so we may get 1 or 2 broadcast routes.
-            total_deliveries = sum(len(r.deliver_at) for r in task.routes)
-            dest_count = len(task.routes) + total_deliveries
-            assert dest_count == 4  # scale reaches all 4 tile PEs
-            for r in task.routes:
-                assert r.payload_slot == 1
+        dest_coords = [r.dest for r in fused_task.routes]
+        assert collect_coord in dest_coords
 
     def test_rmsnorm_gamma_in_sram(self) -> None:
+        """Gamma weights loaded on the fused PE at SRAM slot 1."""
         graph = self._make_rmsnorm_graph()
         config = CompilerConfig()
         gamma = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
@@ -633,53 +597,14 @@ class TestRmsNormRouting:
         spatial = place(expanded, config)
         schedule = route(spatial, config, weights)
 
-        # Each tile PE gets a slice of gamma in SRAM slot 2
-        tile_pes = sorted(
-            [
-                p
-                for p in schedule.pe_schedules
-                if any(isinstance(t, RmsNormPartialSumEntry) for t in p.tasks)
-            ],
-            key=lambda p: p.tasks[0].slice_offset,
-        )
-        assert len(tile_pes) == 4
-
-        # First tile gets gamma[0] = 1.0
-        assert 2 in tile_pes[0].initial_sram
-        assert tile_pes[0].initial_sram[2] == pytest.approx([1.0])
-
-        # Last tile gets gamma[3] = 4.0
-        assert 2 in tile_pes[3].initial_sram
-        assert tile_pes[3].initial_sram[2] == pytest.approx([4.0])
-
-    def test_rmsnorm_normalize_routes_to_collect(self) -> None:
-        graph = self._make_rmsnorm_graph()
-        config = CompilerConfig()
-        weights = self._make_rmsnorm_weights()
-        expanded = expand(graph, config)
-        spatial = place(expanded, config)
-        schedule = route(spatial, config, weights)
-
-        # Find the RmsNorm collect PE dynamically (ConcatCollectForwardEntry in column 1)
-        collect_coord = next(
-            p.coord
-            for p in schedule.pe_schedules
-            if p.coord[0] == 1
-            and any(t.kind in ("concat_collect", "concat_collect_forward") for t in p.tasks)
-        )
-
-        # Normalize output should route to the RMSNorm's own collect PE
-        tile_pe = next(
+        fused_pe = next(
             p
             for p in schedule.pe_schedules
-            if any(isinstance(t, RmsNormPartialSumEntry) for t in p.tasks)
+            if any(isinstance(t, RmsNormFusedEntry) for t in p.tasks)
         )
-        norm_task = tile_pe.tasks[1]
-        assert isinstance(norm_task, RmsNormNormalizeEntry)
-        assert len(norm_task.routes) >= 1
-        # The RMSNorm collect PE is within the same column
-        dest_coords = [r.dest for r in norm_task.routes]
-        assert collect_coord in dest_coords
+        # Full gamma loaded into SRAM slot 1 (gamma_slot)
+        assert 1 in fused_pe.initial_sram
+        assert fused_pe.initial_sram[1] == pytest.approx([1.0, 2.0, 3.0, 4.0])
 
 
 class TestAttentionRouting:

@@ -17,9 +17,6 @@ from meshflow.compiler.artifact import (
     MatMulTask,
     MeshProgramConfig,
     PEProgram,
-    RmsNormNormalizeTask,
-    RmsNormPartialSumTask,
-    RmsNormReduceTask,
     RuntimeProgram,
     SoftmaxTask,
     deserialize,
@@ -379,112 +376,6 @@ class TestSerializationRoundTrip:
         assert task.output_slot == 3
         assert len(task.routes) == 1
         assert task.routes[0].dest == (1, 0)
-
-    def test_round_trip_rms_norm_partial_sum_task(self) -> None:
-        program = RuntimeProgram(
-            version=1,
-            mesh_config=MeshProgramConfig(width=1, height=2),
-            pe_programs=[
-                PEProgram(
-                    coord=(0, 0),
-                    tasks=[
-                        RmsNormPartialSumTask(
-                            trigger_slot=0,
-                            input_slot=0,
-                            routes=[BroadcastRouteTask(dest=(0, 1), payload_slot=0)],
-                        ),
-                    ],
-                    initial_sram={},
-                ),
-            ],
-            input_slots=[],
-        )
-        restored = deserialize(serialize(program))
-
-        task = restored.pe_programs[0].tasks[0]
-        assert isinstance(task, RmsNormPartialSumTask)
-        assert task.kind == "rms_norm_partial_sum"
-        assert task.trigger_slot == 0
-        assert task.input_slot == 0
-        assert len(task.routes) == 1
-        assert task.routes[0].dest == (0, 1)
-        assert task.routes[0].payload_slot == 0
-
-    def test_round_trip_rms_norm_normalize_task(self) -> None:
-        program = RuntimeProgram(
-            version=1,
-            mesh_config=MeshProgramConfig(width=2, height=1),
-            pe_programs=[
-                PEProgram(
-                    coord=(0, 0),
-                    tasks=[
-                        RmsNormNormalizeTask(
-                            trigger_slot=1,
-                            input_slot=0,
-                            scale_slot=1,
-                            gamma_slot=2,
-                            routes=[
-                                BroadcastRouteTask(dest=(1, 0), payload_slot=0),
-                            ],
-                        ),
-                    ],
-                    initial_sram={2: [1.0, 1.0, 1.0]},
-                ),
-            ],
-            input_slots=[],
-        )
-        restored = deserialize(serialize(program))
-
-        task = restored.pe_programs[0].tasks[0]
-        assert isinstance(task, RmsNormNormalizeTask)
-        assert task.kind == "rms_norm_normalize"
-        assert task.trigger_slot == 1
-        assert task.input_slot == 0
-        assert task.scale_slot == 1
-        assert task.gamma_slot == 2
-        assert len(task.routes) == 1
-        assert task.routes[0].dest == (1, 0)
-        assert task.routes[0].dest[0] >= 0  # valid dest
-        assert task.routes[0].payload_slot == 0
-
-    def test_round_trip_rms_norm_reduce_task(self) -> None:
-        program = RuntimeProgram(
-            version=1,
-            mesh_config=MeshProgramConfig(width=1, height=3),
-            pe_programs=[
-                PEProgram(
-                    coord=(0, 2),
-                    tasks=[
-                        RmsNormReduceTask(
-                            trigger_slot=0,
-                            num_tiles=2,
-                            feature_count=8,
-                            eps=1e-6,
-                            routes=[
-                                BroadcastRouteTask(dest=(0, 0), payload_slot=1),
-                                BroadcastRouteTask(dest=(0, 1), payload_slot=1),
-                            ],
-                        ),
-                    ],
-                    initial_sram={},
-                ),
-            ],
-            input_slots=[],
-        )
-        restored = deserialize(serialize(program))
-
-        task = restored.pe_programs[0].tasks[0]
-        assert isinstance(task, RmsNormReduceTask)
-        assert task.kind == "rms_norm_reduce"
-        assert task.trigger_slot == 0
-        assert task.num_tiles == 2
-        assert task.feature_count == 8
-        assert abs(task.eps - 1e-6) < 1e-10
-        assert len(task.routes) == 2
-        assert task.routes[0].dest == (0, 0)
-        assert task.routes[0].payload_slot == 1
-        assert task.routes[1].dest == (0, 1)
-        assert task.routes[1].payload_slot == 1
 
 
 class TestDeserializeErrors:

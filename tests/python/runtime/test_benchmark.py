@@ -68,26 +68,22 @@ class TestSmallConfig:
         cls.config = CompilerConfig(mesh_height=6)
 
     def test_mesh_width(self):
-        assert self.program.mesh_config.width <= 11  # Phase 4: 12 -> 11 (ADD co-located)
+        assert self.program.mesh_config.width <= 11
 
     def test_total_messages(self):
-        assert self.result.total_messages <= 114
+        assert self.result.total_messages <= 84  # M12P2: fused RMSNorm (114 -> 84)
 
     def test_total_hops(self):
-        assert self.result.total_hops <= 224  # M12P1: stagger adds a few hops (218 -> 224)
+        assert self.result.total_hops <= 154  # M12P2: fused RMSNorm (222 -> 154)
 
     def test_final_timestamp(self):
-        assert (
-            self.result.final_timestamp <= 1559
-        )  # M12P1: stagger reduces contention (1613 -> 1559)
+        assert self.result.final_timestamp <= 1297  # M12P2: fused RMSNorm (1557 -> 1297)
 
     def test_max_sends(self):
-        assert _max_sends(self.result) <= 17
+        assert _max_sends(self.result) <= 10  # M12P2: reduced from 17
 
     def test_max_queue_depth(self):
-        assert (
-            _max_queue_depth(self.result) <= 8
-        )  # M10P2: 6 -> 8 (parallel sends increase concurrency)
+        assert _max_queue_depth(self.result) <= 5  # M12P2: reduced from 8
 
     def test_max_hops_per_route(self):
         _, _, max_hops = _route_stats(self.program)
@@ -102,7 +98,7 @@ class TestSmallConfig:
 
     def test_link_contentions(self):
         """Link contentions with shared-bandwidth fabric."""
-        assert self.result.link_contentions <= 45, (
+        assert self.result.link_contentions <= 30, (
             f"link_contentions={self.result.link_contentions} exceeds threshold"
         )
 
@@ -116,24 +112,26 @@ class TestMediumConfig:
         cls.config = CompilerConfig(mesh_height=8)
 
     def test_mesh_width(self):
-        assert self.program.mesh_config.width <= 11  # Phase 4: 12 -> 11 (ADD co-located)
+        assert self.program.mesh_config.width <= 11
 
     def test_total_messages(self):
-        assert self.result.total_messages <= 170
+        assert self.result.total_messages <= 124  # M12P2: fused RMSNorm (170 -> 124)
 
     def test_total_hops(self):
-        assert self.result.total_hops <= 380  # M12P1: stagger adds a few hops (376 -> 380)
+        assert self.result.total_hops <= 259  # M12P2: fused RMSNorm (380 -> 259)
 
     def test_final_timestamp(self):
-        assert (
-            self.result.final_timestamp <= 6901
-        )  # M12P1: slight increase from stagger (6839 -> 6901)
+        assert self.result.final_timestamp <= 5761  # M12P2: fused RMSNorm (6901 -> 5761)
 
     def test_max_sends(self):
-        assert _max_sends(self.result) <= 22
+        assert _max_sends(self.result) <= 17  # M12P2: reduced from 22
 
     def test_max_queue_depth(self):
-        assert _max_queue_depth(self.result) <= 9  # M10P2.1: diversity increases concurrency
+        assert _max_queue_depth(self.result) <= 8
+
+    def test_max_hops_per_route(self):
+        _, _, max_hops = _route_stats(self.program)
+        assert max_hops <= 10
 
     def test_total_colors_within_budget(self):
         """Total colors used must fit within the color budget."""
@@ -144,6 +142,6 @@ class TestMediumConfig:
 
     def test_link_contentions(self):
         """Link contentions with shared-bandwidth fabric."""
-        assert self.result.link_contentions <= 110, (
+        assert self.result.link_contentions <= 75, (
             f"link_contentions={self.result.link_contentions} exceeds threshold"
         )

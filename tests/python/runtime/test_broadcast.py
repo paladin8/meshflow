@@ -14,7 +14,7 @@ import torch
 from meshflow._mesh_runtime import run_program
 from meshflow.compiler import CompilerConfig, compile
 from meshflow.compiler.artifact import (
-    RmsNormReduceTask,
+    RmsNormFusedTask,
     deserialize,
     serialize,
 )
@@ -208,12 +208,13 @@ class TestBroadcastProfiling:
 class TestBroadcastDetectionArtifact:
     """Verify the compiler emits broadcast routes in the serialized artifact."""
 
-    def test_rmsnorm_reduce_has_column_broadcast(self) -> None:
-        """RmsNormReduce tasks in a FORWARD->RMSNORM->COLLECT graph use column broadcast.
+    def test_rmsnorm_fused_pe_has_correct_task(self) -> None:
+        """Fused RMSNorm in a FORWARD->RMSNORM->COLLECT graph has an RmsNormFusedTask.
 
-        The reduce PE broadcasts the scale factor south to all tile PEs in the
-        same column. With routing tables, this is verified by checking that
-        intermediate PEs have DeliverAndForward entries (non-None deliver_slot).
+        With the fused single-PE architecture, the RMSNorm is computed on a
+        single PE. There are no separate tile or reduce PEs, so no column
+        broadcast is needed for the scale factor. This test verifies the fused
+        PE has the correct task type and gamma weights.
         """
         d_model = 8
         eps = 1e-6
@@ -238,28 +239,30 @@ class TestBroadcastDetectionArtifact:
         artifact_bytes = _compile_artifact(graph, weights, mesh_height=6)
         program = deserialize(artifact_bytes)
 
-        reduce_tasks = [
+        fused_tasks = [
             task
             for pe in program.pe_programs
             for task in pe.tasks
-            if isinstance(task, RmsNormReduceTask)
+            if isinstance(task, RmsNormFusedTask)
         ]
 
-        assert len(reduce_tasks) > 0, "no RmsNormReduceTask found in artifact"
-
-        # With broadcast, the reduce PE sends one route per direction to
-        # the farthest tile, and intermediate tiles get DeliverAndForward
-        # entries in the routing table.
-        deliver_and_forward_count = 0
-        for pe in program.pe_programs:
-            for entry in pe.routing_table.values():
-                if entry.deliver_slot is not None:
-                    deliver_and_forward_count += 1
-
-        assert deliver_and_forward_count > 0, (
-            "RmsNormReduce broadcast should produce DeliverAndForward routing "
-            "table entries on intermediate tile PEs; found none"
+        assert len(fused_tasks) == 1, (
+            f"expected exactly 1 RmsNormFusedTask, found {len(fused_tasks)}"
         )
+
+        task = fused_tasks[0]
+        assert task.feature_count == d_model
+        assert abs(task.eps - eps) < 1e-10
+        assert task.gamma_slot == 1
+
+        # Gamma weights loaded on the fused PE at SRAM slot 1
+        fused_pe = next(
+            pe
+            for pe in program.pe_programs
+            if any(isinstance(t, RmsNormFusedTask) for t in pe.tasks)
+        )
+        assert 1 in fused_pe.initial_sram
+        assert len(fused_pe.initial_sram[1]) == d_model
 
     def test_concat_collect_forward_broadcast_mlp(self) -> None:
         """ConcatCollectForward tasks in a 3-layer MLP use broadcast routes.

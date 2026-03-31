@@ -9,8 +9,7 @@ from meshflow.compiler.spatial_ir import (
     PlacedAttentionPeData,
     PlacedCollectData,
     PlacedNodeKind,
-    PlacedRmsNormReduceData,
-    PlacedRmsNormTileData,
+    PlacedRmsNormFusedData,
     PlacedTileData,
 )
 
@@ -438,7 +437,8 @@ class TestMultiLayerPlacement:
 
 
 class TestRmsNormPlacement:
-    def test_rmsnorm_column_layout(self) -> None:
+    def test_rmsnorm_fused_single_pe(self) -> None:
+        """Fused RMSNorm places a single PE in a column."""
         graph = GraphIR(
             nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"eps": 1e-6, "feature_count": 4})],
             edges=[],
@@ -446,22 +446,16 @@ class TestRmsNormPlacement:
         expanded = expand(graph, CompilerConfig())
         spatial = place(expanded, CompilerConfig())
 
-        # 4 tile PEs + 1 reduce PE + 1 collect PE = 6 nodes
-        assert len(spatial.nodes) == 6
-        coords = {n.id: n.coord for n in spatial.nodes}
-        # All in column 0
-        for i in range(4):
-            assert coords[f"rn_tile_{i}"][0] == 0
-        assert coords["rn_reduce"][0] == 0
-        assert coords["rn_collect"][0] == 0
-        # Collect is within the column (staggered by col % 3)
-        tile_ys = [coords[f"rn_tile_{i}"][1] for i in range(4)]
-        assert coords["rn_collect"][1] not in tile_ys
-        assert 0 <= coords["rn_collect"][1] <= max(tile_ys)
-        # Reduce is above all tiles and collect
-        assert coords["rn_reduce"][1] > max(tile_ys)
+        # Single fused PE
+        rn_nodes = [n for n in spatial.nodes if n.id.startswith("rn_")]
+        assert len(rn_nodes) == 1
+        fused = rn_nodes[0]
+        assert fused.id == "rn_norm"
+        assert fused.kind == PlacedNodeKind.RMSNORM_FUSED
+        assert fused.coord[0] == 0  # column 0
 
-    def test_rmsnorm_data_types(self) -> None:
+    def test_rmsnorm_fused_data_type(self) -> None:
+        """Fused PE has PlacedRmsNormFusedData with correct fields."""
         graph = GraphIR(
             nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"eps": 1e-6, "feature_count": 4})],
             edges=[],
@@ -469,18 +463,14 @@ class TestRmsNormPlacement:
         expanded = expand(graph, CompilerConfig())
         spatial = place(expanded, CompilerConfig())
 
-        tile = next(n for n in spatial.nodes if n.id == "rn_tile_0")
-        assert isinstance(tile.data, PlacedRmsNormTileData)
-        assert tile.data.tile_index == 0
-        assert tile.data.origin_id == "rn"
+        fused = next(n for n in spatial.nodes if n.id == "rn_norm")
+        assert isinstance(fused.data, PlacedRmsNormFusedData)
+        assert fused.data.feature_count == 4
+        assert fused.data.eps == 1e-6
+        assert fused.data.origin_id == "rn"
 
-        reduce_pe = next(n for n in spatial.nodes if n.id == "rn_reduce")
-        assert isinstance(reduce_pe.data, PlacedRmsNormReduceData)
-        assert reduce_pe.data.num_tiles == 4
-        assert reduce_pe.data.feature_count == 4
-        assert reduce_pe.data.eps == 1e-6
-
-    def test_rmsnorm_internal_edges(self) -> None:
+    def test_rmsnorm_no_internal_edges(self) -> None:
+        """Fused single-PE RMSNorm has no internal edges."""
         graph = GraphIR(
             nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"eps": 1e-6, "feature_count": 3})],
             edges=[],
@@ -488,12 +478,25 @@ class TestRmsNormPlacement:
         expanded = expand(graph, CompilerConfig())
         spatial = place(expanded, CompilerConfig())
 
-        # 3 internal edges: tile → reduce
-        internal = [e for e in spatial.edges if e.dst_node == "rn_reduce"]
-        assert len(internal) == 3
-        for i, edge in enumerate(internal):
-            assert edge.src_node == f"rn_tile_{i}"
-            assert edge.dst_slot == i
+        # No internal edges (no tile->reduce chain)
+        rn_edges = [
+            e
+            for e in spatial.edges
+            if e.src_node.startswith("rn_") and e.dst_node.startswith("rn_")
+        ]
+        assert len(rn_edges) == 0
+
+    def test_rmsnorm_column_height_is_one(self) -> None:
+        """Fused RMSNorm occupies a single row in its column."""
+        graph = GraphIR(
+            nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"eps": 1e-6, "feature_count": 8})],
+            edges=[],
+        )
+        expanded = expand(graph, CompilerConfig())
+        spatial = place(expanded, CompilerConfig())
+
+        rn_nodes = [n for n in spatial.nodes if n.id.startswith("rn_")]
+        assert len(rn_nodes) == 1
 
 
 class TestAttentionPlacement:

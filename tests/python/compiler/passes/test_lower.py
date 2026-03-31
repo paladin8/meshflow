@@ -6,9 +6,7 @@ from meshflow.compiler.artifact import (
     BroadcastRouteTask,
     ForwardActivationTask,
     MatMulTask,
-    RmsNormNormalizeTask,
-    RmsNormPartialSumTask,
-    RmsNormReduceTask,
+    RmsNormFusedTask,
     SoftmaxTask,
 )
 from meshflow.compiler.graph_ir import Edge, GraphIR, Node, OpType
@@ -21,9 +19,6 @@ from meshflow.compiler.schedule_ir import (
     BroadcastRoute,
     Direction,
     MatMulEntry,
-    RmsNormNormalizeEntry,
-    RmsNormPartialSumEntry,
-    RmsNormReduceEntry,
     SoftmaxEntry,
 )
 
@@ -173,73 +168,8 @@ class TestLowerNewTasks:
         assert len(task.routes) == 1
         assert task.routes[0] == BroadcastRouteTask(dest=(1, 0), payload_slot=0)
 
-    def test_lower_rms_norm_partial_sum_entry(self) -> None:
-        entry = RmsNormPartialSumEntry(
-            trigger_slot=0,
-            input_slot=0,
-            routes=[
-                BroadcastRoute(
-                    dest=(0, 4),
-                    hops=[Direction.NORTH, Direction.NORTH],
-                    payload_slot=2,
-                ),
-            ],
-        )
-        task = _lower_task(entry)
-        assert isinstance(task, RmsNormPartialSumTask)
-        assert task.kind == "rms_norm_partial_sum"
-        assert task.trigger_slot == 0
-        assert task.input_slot == 0
-        assert len(task.routes) == 1
-        assert task.routes[0].dest == (0, 4)
-        assert task.routes[0].payload_slot == 2
-
-    def test_lower_rms_norm_normalize_entry(self) -> None:
-        entry = RmsNormNormalizeEntry(
-            trigger_slot=1,
-            input_slot=0,
-            scale_slot=1,
-            gamma_slot=2,
-            routes=[
-                BroadcastRoute(dest=(1, 0), hops=[Direction.EAST], payload_slot=0),
-            ],
-        )
-        task = _lower_task(entry)
-        assert isinstance(task, RmsNormNormalizeTask)
-        assert task.kind == "rms_norm_normalize"
-        assert task.trigger_slot == 1
-        assert task.input_slot == 0
-        assert task.scale_slot == 1
-        assert task.gamma_slot == 2
-        assert len(task.routes) == 1
-        assert task.routes[0] == BroadcastRouteTask(dest=(1, 0), payload_slot=0)
-
-    def test_lower_rms_norm_reduce_entry(self) -> None:
-        entry = RmsNormReduceEntry(
-            trigger_slot=0,
-            num_tiles=3,
-            feature_count=8,
-            eps=1e-6,
-            routes=[
-                BroadcastRoute(
-                    dest=(0, 0), hops=[Direction.SOUTH, Direction.SOUTH], payload_slot=1
-                ),
-                BroadcastRoute(dest=(0, 1), hops=[Direction.SOUTH], payload_slot=1),
-            ],
-        )
-        task = _lower_task(entry)
-        assert isinstance(task, RmsNormReduceTask)
-        assert task.kind == "rms_norm_reduce"
-        assert task.trigger_slot == 0
-        assert task.num_tiles == 3
-        assert task.feature_count == 8
-        assert abs(task.eps - 1e-6) < 1e-10
-        assert len(task.routes) == 2
-        assert task.routes[0] == BroadcastRouteTask(dest=(0, 0), payload_slot=1)
-        assert task.routes[1] == BroadcastRouteTask(dest=(0, 1), payload_slot=1)
-
     def test_lower_rmsnorm_full_pipeline(self) -> None:
-        """End-to-end: FORWARD → RMSNORM → COLLECT through all passes."""
+        """End-to-end: FORWARD → RMSNORM → COLLECT through all passes (fused architecture)."""
         import numpy as np
 
         graph = GraphIR(
@@ -261,30 +191,26 @@ class TestLowerNewTasks:
         program = lower(schedule, config)
 
         assert program.version == 1
-        # Check that the program has PE programs for tile PEs, reduce PE, etc.
         assert len(program.pe_programs) > 0
 
-        # Find a tile PE and check its tasks
-        tile_pe = next(
+        # Find the fused RMSNorm PE and check its task
+        fused_pe = next(
             pe
             for pe in program.pe_programs
-            if any(isinstance(t, RmsNormPartialSumTask) for t in pe.tasks)
+            if any(isinstance(t, RmsNormFusedTask) for t in pe.tasks)
         )
-        ps_tasks = [t for t in tile_pe.tasks if isinstance(t, RmsNormPartialSumTask)]
-        assert len(ps_tasks) == 1
-        assert len(ps_tasks[0].routes) == 1  # should have one route
+        fused_tasks = [t for t in fused_pe.tasks if isinstance(t, RmsNormFusedTask)]
+        assert len(fused_tasks) == 1
+        assert fused_tasks[0].kind == "rms_norm_fused"
+        assert fused_tasks[0].feature_count == 3
+        assert abs(fused_tasks[0].eps - 1e-6) < 1e-10
+        assert fused_tasks[0].input_slot == 0
+        assert fused_tasks[0].gamma_slot == 1
+        assert len(fused_tasks[0].routes) >= 1  # routes to downstream collect
 
-        norm_tasks = [t for t in tile_pe.tasks if isinstance(t, RmsNormNormalizeTask)]
-        assert len(norm_tasks) == 1
-
-        # Find the reduce PE
-        reduce_pe = next(
-            pe
-            for pe in program.pe_programs
-            if any(isinstance(t, RmsNormReduceTask) for t in pe.tasks)
-        )
-        reduce_tasks = [t for t in reduce_pe.tasks if isinstance(t, RmsNormReduceTask)]
-        assert len(reduce_tasks) == 3  # one per partial sum slot
+        # Gamma weights should be loaded in SRAM slot 1
+        assert 1 in fused_pe.initial_sram
+        assert fused_pe.initial_sram[1] == [1.0, 1.0, 1.0]
 
     def test_lower_add_full_pipeline(self) -> None:
         """End-to-end: FORWARD + FORWARD → ADD → COLLECT."""

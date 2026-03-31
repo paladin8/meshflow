@@ -12,9 +12,7 @@ from meshflow.compiler.artifact import (
     MatMulTask,
     MeshProgramConfig,
     PEProgram,
-    RmsNormNormalizeTask,
-    RmsNormPartialSumTask,
-    RmsNormReduceTask,
+    RmsNormFusedTask,
     RouteTableEntry,
     RuntimeProgram,
     SoftmaxTask,
@@ -30,9 +28,7 @@ from meshflow.compiler.schedule_ir import (
     ForwardActivationEntry,
     LinearEntry,
     MatMulEntry,
-    RmsNormNormalizeEntry,
-    RmsNormPartialSumEntry,
-    RmsNormReduceEntry,
+    RmsNormFusedEntry,
     ScheduleIR,
     SoftmaxEntry,
     TaskEntry,
@@ -121,29 +117,11 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             output_slot=task.output_slot,
             routes=[_lower_route(r) for r in task.routes],
         )
-    if isinstance(task, RmsNormPartialSumEntry):
-        return RmsNormPartialSumTask(
+    if isinstance(task, RmsNormFusedEntry):
+        return RmsNormFusedTask(
             trigger_slot=task.trigger_slot,
             input_slot=task.input_slot,
-            routes=[_lower_route(r) for r in task.routes],
-            slice_offset=task.slice_offset,
-            slice_size=task.slice_size,
-            feature_count=task.feature_count,
-        )
-    if isinstance(task, RmsNormNormalizeEntry):
-        return RmsNormNormalizeTask(
-            trigger_slot=task.trigger_slot,
-            input_slot=task.input_slot,
-            scale_slot=task.scale_slot,
             gamma_slot=task.gamma_slot,
-            routes=[_lower_route(r) for r in task.routes],
-            slice_offset=task.slice_offset,
-            slice_size=task.slice_size,
-        )
-    if isinstance(task, RmsNormReduceEntry):
-        return RmsNormReduceTask(
-            trigger_slot=task.trigger_slot,
-            num_tiles=task.num_tiles,
             feature_count=task.feature_count,
             eps=task.eps,
             routes=[_lower_route(r) for r in task.routes],

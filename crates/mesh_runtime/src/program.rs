@@ -172,6 +172,16 @@ enum TaskProgram {
         #[serde(default)]
         routes: Vec<BroadcastRouteProgram>,
     },
+    #[serde(rename = "rms_norm_fused")]
+    RmsNormFused {
+        trigger_slot: u32,
+        input_slot: u32,
+        gamma_slot: u32,
+        feature_count: u32,
+        eps: f32,
+        #[serde(default)]
+        routes: Vec<BroadcastRouteProgram>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -635,6 +645,26 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
             Ok(TaskConfig {
                 kind: TaskKind::RmsNormReduce {
                     num_tiles: *num_tiles,
+                    feature_count: *feature_count,
+                    eps: *eps,
+                    routes: converted_routes,
+                },
+                trigger_slot: *trigger_slot,
+            })
+        }
+        TaskProgram::RmsNormFused {
+            trigger_slot,
+            input_slot,
+            gamma_slot,
+            feature_count,
+            eps,
+            routes,
+        } => {
+            let converted_routes = convert_routes(routes, width, height)?;
+            Ok(TaskConfig {
+                kind: TaskKind::RmsNormFused {
+                    input_slot: *input_slot,
+                    gamma_slot: *gamma_slot,
                     feature_count: *feature_count,
                     eps: *eps,
                     routes: converted_routes,

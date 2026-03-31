@@ -178,6 +178,15 @@ pub enum TaskKind {
         eps: f32,
         routes: Vec<BroadcastRouteRuntime>,
     },
+    /// Fused RMSNorm: receive full input, normalize in-place, broadcast.
+    /// Single-PE replacement for the tile + reduce + collect pipeline.
+    RmsNormFused {
+        input_slot: SlotId,
+        gamma_slot: SlotId,
+        feature_count: u32,
+        eps: f32,
+        routes: Vec<BroadcastRouteRuntime>,
+    },
 }
 
 impl std::fmt::Display for TaskKind {
@@ -194,6 +203,7 @@ impl std::fmt::Display for TaskKind {
             TaskKind::RmsNormPartialSum { .. } => write!(f, "rms_norm_partial_sum"),
             TaskKind::RmsNormNormalize { .. } => write!(f, "rms_norm_normalize"),
             TaskKind::RmsNormReduce { .. } => write!(f, "rms_norm_reduce"),
+            TaskKind::RmsNormFused { .. } => write!(f, "rms_norm_fused"),
         }
     }
 }

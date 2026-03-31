@@ -222,7 +222,7 @@ class TestExpandMultiLayer:
 
 
 class TestExpandRmsNorm:
-    """RMSNORM expansion into tile PEs + reduce PE."""
+    """RMSNORM expansion into a fused single-PE group."""
 
     def test_rmsnorm_creates_group(self):
         graph = GraphIR(
@@ -241,20 +241,21 @@ class TestExpandRmsNorm:
 
         rn_group = next(g for g in expanded.groups if isinstance(g, RmsNormGroup))
         assert rn_group.origin_id == "rn"
-        assert rn_group.num_tiles == 8
+        assert rn_group.num_tiles == 0  # fused single PE, no tiles
         assert rn_group.feature_count == 8
         assert rn_group.eps == 1e-6
 
-    def test_rmsnorm_tile_count_limited_by_mesh(self):
+    def test_rmsnorm_fused_no_tiles_regardless_of_mesh(self):
+        """Fused RMSNorm always has num_tiles=0 regardless of mesh_height."""
         graph = GraphIR(
             nodes=[Node(id="rn", op=OpType.RMSNORM, attrs={"eps": 1e-6, "feature_count": 16})],
             edges=[],
         )
-        config = CompilerConfig(mesh_height=5)  # 3 tiles + 1 reduce + 1 collect
+        config = CompilerConfig(mesh_height=5)
         expanded = expand(graph, config)
 
         rn_group = next(g for g in expanded.groups if isinstance(g, RmsNormGroup))
-        assert rn_group.num_tiles == 3
+        assert rn_group.num_tiles == 0
 
     def test_rmsnorm_node_expansions(self):
         graph = GraphIR(
@@ -263,8 +264,8 @@ class TestExpandRmsNorm:
         )
         expanded = expand(graph, CompilerConfig())
         exp = expanded.node_expansions["rn"]
-        assert exp.input_pe_ids == ["rn_tile_0", "rn_tile_1", "rn_tile_2", "rn_tile_3"]
-        assert exp.output_pe_ids == ["rn_collect"]
+        assert exp.input_pe_ids == ["rn_norm"]
+        assert exp.output_pe_ids == ["rn_norm"]
 
 
 class TestExpandMatMul:

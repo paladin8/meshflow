@@ -15,8 +15,7 @@ from meshflow.compiler.spatial_ir import (
     PlacedEdge,
     PlacedNode,
     PlacedNodeKind,
-    PlacedRmsNormReduceData,
-    PlacedRmsNormTileData,
+    PlacedRmsNormFusedData,
     PlacedTileData,
     SpatialIR,
 )
@@ -84,12 +83,8 @@ def _place_columns(expanded: ExpandedIR, config: CompilerConfig) -> SpatialIR:
             nodes, edges, height = _place_rmsnorm_group(group, col)
             placed_nodes.extend(nodes)
             placed_edges.extend(edges)
-            tile_ids = [f"{group.origin_id}_tile_{i}" for i in range(group.num_tiles)]
-            reduce_id = f"{group.origin_id}_reduce"
-            collect_id = f"{group.origin_id}_collect"
-            node_pe_map[group.origin_id] = tile_ids + [reduce_id, collect_id]
-            collect_node = next(n for n in nodes if n.id == collect_id)
-            collect_coords[collect_id] = collect_node.coord
+            norm_id = f"{group.origin_id}_norm"
+            node_pe_map[group.origin_id] = [norm_id]
 
         elif isinstance(group, AttentionGroup):
             nodes, edges_attn, height = _place_attention_group(group, col)
@@ -382,105 +377,25 @@ def _place_tiled_compute_group(
 def _place_rmsnorm_group(
     group: RmsNormGroup, col: int
 ) -> tuple[list[PlacedNode], list[PlacedEdge], int]:
-    """Place an RMSNORM group: tile PEs + reduce PE + collect PE in a column.
+    """Place a fused single-PE RMSNorm group.
 
-    Collect PE is centered among the tiles.  Reduce PE is placed above all
-    tiles and collect.
+    One PE receives the full input, computes RMSNorm in-place, and
+    broadcasts the normalized result.  No tiles or reduce PE.
     """
-    nodes: list[PlacedNode] = []
-    edges: list[PlacedEdge] = []
-
-    tile_rows, collect_row = _middle_collect_rows(group.num_tiles, stagger_offset=col)
-    # Reduce PE goes above all tiles and collect
-    reduce_row = group.num_tiles + 1  # tiles occupy N rows + 1 for collect
-
-    base = group.feature_count // group.num_tiles
-    remainder = group.feature_count % group.num_tiles
-
-    offset = 0
-    for i in range(group.num_tiles):
-        slice_size = base + 1 if i < remainder else base
-        tile_id = f"{group.origin_id}_tile_{i}"
-        nodes.append(
-            PlacedNode(
-                id=tile_id,
-                kind=PlacedNodeKind.RMSNORM_TILE,
-                coord=(col, tile_rows[i]),
-                data=PlacedRmsNormTileData(
-                    tile_index=i,
-                    feature_slice_size=slice_size,
-                    feature_slice_offset=offset,
-                    origin_id=group.origin_id,
-                ),
-            )
-        )
-        offset += slice_size
-
-    reduce_id = f"{group.origin_id}_reduce"
-    nodes.append(
+    norm_id = f"{group.origin_id}_norm"
+    nodes = [
         PlacedNode(
-            id=reduce_id,
-            kind=PlacedNodeKind.RMSNORM_REDUCE,
-            coord=(col, reduce_row),
-            data=PlacedRmsNormReduceData(
-                num_tiles=group.num_tiles,
+            id=norm_id,
+            kind=PlacedNodeKind.RMSNORM_FUSED,
+            coord=(col, 0),
+            data=PlacedRmsNormFusedData(
                 feature_count=group.feature_count,
                 eps=group.eps,
                 origin_id=group.origin_id,
             ),
         )
-    )
-
-    # Internal edges: tile → reduce (partial sums, phase 1)
-    for i in range(group.num_tiles):
-        edges.append(
-            PlacedEdge(
-                src_node=f"{group.origin_id}_tile_{i}",
-                src_slot=0,
-                dst_node=reduce_id,
-                dst_slot=i,
-            )
-        )
-
-    # Internal edges: reduce → tile (scale factor broadcast, phase 2)
-    for i in range(group.num_tiles):
-        edges.append(
-            PlacedEdge(
-                src_node=reduce_id,
-                src_slot=i,
-                dst_node=f"{group.origin_id}_tile_{i}",
-                dst_slot=1,  # scale factor arrives in slot 1 on tile PEs
-            )
-        )
-
-    # Collect PE gathers normalized fragments from all tiles
-    collect_id = f"{group.origin_id}_collect"
-    nodes.append(
-        PlacedNode(
-            id=collect_id,
-            kind=PlacedNodeKind.LINEAR_COLLECT,
-            coord=(col, collect_row),
-            data=PlacedCollectData(
-                num_fragments=group.num_tiles,
-                total_rows=group.feature_count,
-                origin_id=group.origin_id,
-                activation=None,
-            ),
-        )
-    )
-
-    # Internal edges: tile → collect (normalized fragments)
-    for i in range(group.num_tiles):
-        edges.append(
-            PlacedEdge(
-                src_node=f"{group.origin_id}_tile_{i}",
-                src_slot=1,  # normalize output
-                dst_node=collect_id,
-                dst_slot=i,
-            )
-        )
-
-    return nodes, edges, reduce_row + 1
+    ]
+    return nodes, [], 1
 
 
 def _place_attention_group(

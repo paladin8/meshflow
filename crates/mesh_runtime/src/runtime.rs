@@ -881,6 +881,52 @@ impl Simulator {
                 task_end_ts = base_time;
                 self.broadcast_to_dests(base_time, coord, &routes, scales);
             }
+            TaskKind::RmsNormFused {
+                input_slot,
+                gamma_slot,
+                feature_count,
+                eps,
+                ref routes,
+            } => {
+                let pe = self.mesh.pe_mut(coord);
+                let data = pe.read_slot(input_slot).clone();
+                let gamma = pe.read_slot(gamma_slot).clone();
+                pe.counters.tasks_executed += 1;
+                self.profile.total_tasks_executed += 1;
+
+                let fc = feature_count as usize;
+                let num_positions = if fc > 0 && data.len() > fc {
+                    debug_assert_eq!(data.len() % fc, 0);
+                    data.len() / fc
+                } else {
+                    1
+                };
+
+                // Compute per-position scale: 1/sqrt(mean(x^2) + eps)
+                let scales: Vec<f32> = (0..num_positions)
+                    .map(|p| {
+                        let start = p * fc;
+                        let sum_sq: f32 = data[start..start + fc].iter().map(|x| x * x).sum();
+                        let mean_sq = sum_sq / (fc as f32);
+                        1.0 / (mean_sq + eps).sqrt()
+                    })
+                    .collect();
+
+                // Normalize: x * scale * gamma
+                let mut result = Vec::with_capacity(data.len());
+                for (p, &scale) in scales.iter().enumerate() {
+                    let start = p * fc;
+                    for j in 0..fc {
+                        result.push(data[start + j] * scale * gamma[j]);
+                    }
+                }
+
+                let routes = routes.clone();
+                let elements = (fc as u64) * (num_positions as u64) * 2; // sum_sq + normalize
+                let base_time = timestamp + self.task_cost(elements);
+                task_end_ts = base_time;
+                self.broadcast_to_dests(base_time, coord, &routes, result);
+            }
         }
 
         // Record operator timing with actual completion time

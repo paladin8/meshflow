@@ -11,8 +11,7 @@ class PlacedNodeKind(Enum):
     COLLECT_SIMPLE = "collect_simple"
     LINEAR_TILE = "linear_tile"
     LINEAR_COLLECT = "linear_collect"
-    RMSNORM_TILE = "rmsnorm_tile"
-    RMSNORM_REDUCE = "rmsnorm_reduce"
+    RMSNORM_FUSED = "rmsnorm_fused"
     ATTENTION_PE = "attention_pe"
     ADD = "add"
     SOFTMAX = "softmax"
@@ -40,26 +39,6 @@ class PlacedCollectData:
 
 
 @dataclass
-class PlacedRmsNormTileData:
-    """Typed data for an RMSNORM tile PE."""
-
-    tile_index: int
-    feature_slice_size: int
-    feature_slice_offset: int
-    origin_id: str
-
-
-@dataclass
-class PlacedRmsNormReduceData:
-    """Typed data for an RMSNORM reduce PE."""
-
-    num_tiles: int
-    feature_count: int
-    eps: float
-    origin_id: str
-
-
-@dataclass
 class PlacedAttentionPeData:
     """Typed data for an attention PE (MATMUL + co-located SOFTMAX)."""
 
@@ -71,13 +50,17 @@ class PlacedAttentionPeData:
     av_matmul_id: str | None = None
 
 
+@dataclass
+class PlacedRmsNormFusedData:
+    """Typed data for a fused single-PE RMSNorm."""
+
+    feature_count: int
+    eps: float
+    origin_id: str
+
+
 PlacedNodeData = (
-    PlacedTileData
-    | PlacedCollectData
-    | PlacedRmsNormTileData
-    | PlacedRmsNormReduceData
-    | PlacedAttentionPeData
-    | None
+    PlacedTileData | PlacedCollectData | PlacedRmsNormFusedData | PlacedAttentionPeData | None
 )
 
 

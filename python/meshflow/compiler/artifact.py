@@ -132,33 +132,13 @@ class MatMulTask:
 
 
 @dataclass
-class RmsNormPartialSumTask:
-    kind: str = field(default="rms_norm_partial_sum", init=False)
+class RmsNormFusedTask:
+    """Fused RMSNorm: receive full input, normalize in-place, broadcast."""
+
+    kind: str = field(default="rms_norm_fused", init=False)
     trigger_slot: int = 0
     input_slot: int = 0
-    routes: list[BroadcastRouteTask] = field(default_factory=list)
-    slice_offset: int = 0
-    slice_size: int = 0
-    feature_count: int = 0
-
-
-@dataclass
-class RmsNormNormalizeTask:
-    kind: str = field(default="rms_norm_normalize", init=False)
-    trigger_slot: int = 1
-    input_slot: int = 0
-    scale_slot: int = 1
-    gamma_slot: int = 2
-    routes: list[BroadcastRouteTask] = field(default_factory=list)
-    slice_offset: int = 0
-    slice_size: int = 0
-
-
-@dataclass
-class RmsNormReduceTask:
-    kind: str = field(default="rms_norm_reduce", init=False)
-    trigger_slot: int = 0
-    num_tiles: int = 0
+    gamma_slot: int = 1
     feature_count: int = 0
     eps: float = 1e-6
     routes: list[BroadcastRouteTask] = field(default_factory=list)
@@ -173,9 +153,7 @@ TaskProgram = (
     | AddTask
     | SoftmaxTask
     | MatMulTask
-    | RmsNormPartialSumTask
-    | RmsNormNormalizeTask
-    | RmsNormReduceTask
+    | RmsNormFusedTask
 )
 """Union of all task types that can appear in a PEProgram."""
 
@@ -312,18 +290,15 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
         if "routes" in fields:
             fields["routes"] = _reconstruct_routes(fields["routes"])
         return MatMulTask(**fields)
-    if kind == "rms_norm_partial_sum":
+    if kind in ("rms_norm_partial_sum", "rms_norm_normalize", "rms_norm_reduce"):
+        raise ValueError(
+            f"legacy RMSNorm task kind {kind!r} from pre-M12 artifact; "
+            f"re-compile the model with the current compiler"
+        )
+    if kind == "rms_norm_fused":
         if "routes" in fields:
             fields["routes"] = _reconstruct_routes(fields["routes"])
-        return RmsNormPartialSumTask(**fields)
-    if kind == "rms_norm_normalize":
-        if "routes" in fields:
-            fields["routes"] = _reconstruct_routes(fields["routes"])
-        return RmsNormNormalizeTask(**fields)
-    if kind == "rms_norm_reduce":
-        if "routes" in fields:
-            fields["routes"] = _reconstruct_routes(fields["routes"])
-        return RmsNormReduceTask(**fields)
+        return RmsNormFusedTask(**fields)
     raise ValueError(f"unknown task kind: {kind!r}")
 
 
