@@ -9,6 +9,7 @@ from meshflow.compiler.schedule_ir import (
     AddEntry,
     BroadcastRoute,
     CollectOutputEntry,
+    ConcatAddEntry,
     ConcatCollectEntry,
     ConcatCollectForwardEntry,
     Direction,
@@ -91,6 +92,8 @@ def _route_xy(
             pe_tasks.setdefault((x, y), [])
             pe_sram.setdefault((x, y), {})
 
+    handled_adds: set[str] = set()  # ADDs fused into ConcatAdd
+
     for node in spatial.nodes:
         if node.kind == PlacedNodeKind.FORWARD:
             outgoing = _outgoing_edges(spatial, node.id)
@@ -164,51 +167,113 @@ def _route_xy(
             remainder = collect.total_rows % collect.num_fragments
 
             if is_intermediate:
-                collect_routes: list[BroadcastRoute] = []
+                # Check for co-located ADD (fused ConcatAdd optimization).
+                # If one outgoing edge targets a co-located ADD at the same
+                # coord, replace ConcatCollectForward + Add with ConcatAdd.
+                colocated_add = None
                 for edge in outgoing:
                     dst = node_map[edge.dst_node]
-                    tile_hops = _generate_route_xy(node.coord, dst.coord)
-                    collect_routes.append(
-                        BroadcastRoute(
-                            dest=dst.coord,
-                            hops=tile_hops,
-                            deliver_at=[],
-                            payload_slot=edge.dst_slot,
+                    if dst.kind == PlacedNodeKind.ADD and dst.coord == node.coord:
+                        colocated_add = dst
+                        break
+
+                # Cannot fuse ConcatAdd when activation is present on the collect
+                if colocated_add is not None and collect.activation is not None:
+                    colocated_add = None
+
+                if colocated_add is not None:
+                    # Fused ConcatAdd: find residual slot and ADD's output routes
+                    add_incoming = [e for e in spatial.edges if e.dst_node == colocated_add.id]
+                    # Residual is the ADD input that doesn't come from the collect
+                    residual_slot = None
+                    for e in add_incoming:
+                        if e.src_node != node.id:
+                            residual_slot = e.dst_slot
+                            break
+                    assert residual_slot is not None, (
+                        f"co-located ADD {colocated_add.id} has no residual input"
+                    )
+
+                    # Routes from the ADD's outgoing edges (not the collect's)
+                    add_outgoing = _outgoing_edges(spatial, colocated_add.id)
+                    add_routes: list[BroadcastRoute] = []
+                    for edge in add_outgoing:
+                        dst = node_map[edge.dst_node]
+                        hops = _generate_route_xy(node.coord, dst.coord)
+                        add_routes.append(
+                            BroadcastRoute(
+                                dest=dst.coord,
+                                hops=hops,
+                                deliver_at=[],
+                                payload_slot=edge.dst_slot,
+                            )
                         )
-                    )
+                    add_routes = _try_linear_broadcast(node.coord, add_routes)
 
-                # Detect scatter: when routing to multiple attention PEs
-                # and delivering to the Q slot (0), scatter Q rows instead
-                # of broadcasting the full matrix.
-                use_scatter = False
-                if len(outgoing) > 1:
-                    all_attn = all(
-                        node_map[e.dst_node].kind == PlacedNodeKind.ATTENTION_PE for e in outgoing
-                    )
-                    # Q slot = 0 on attention PEs
-                    all_q_slot = all(e.dst_slot == 0 for e in outgoing)
-                    if all_attn and all_q_slot:
-                        use_scatter = True
-
-                # Apply broadcast detection for non-scatter routes
-                if not use_scatter:
-                    collect_routes = _try_linear_broadcast(node.coord, collect_routes)
-
-                for i in range(collect.num_fragments):
-                    frag_offset = i * base + min(i, remainder)
-                    tile_rows = base + 1 if i < remainder else base
-                    pe_tasks[node.coord].append(
-                        ConcatCollectForwardEntry(
-                            trigger_slot=i,
-                            num_fragments=collect.num_fragments,
-                            total_rows=collect.total_rows,
-                            fragment_offset=frag_offset,
-                            fragment_rows=tile_rows,
-                            activation=collect.activation,
-                            routes=list(collect_routes),
-                            scatter=use_scatter,
+                    for i in range(collect.num_fragments):
+                        frag_offset = i * base + min(i, remainder)
+                        tile_rows = base + 1 if i < remainder else base
+                        pe_tasks[node.coord].append(
+                            ConcatAddEntry(
+                                trigger_slot=i,
+                                num_fragments=collect.num_fragments,
+                                total_rows=collect.total_rows,
+                                fragment_offset=frag_offset,
+                                fragment_rows=tile_rows,
+                                residual_slot=residual_slot,
+                                routes=list(add_routes),
+                            )
                         )
-                    )
+
+                    # Mark ADD as handled so _route_add skips it
+                    handled_adds.add(colocated_add.id)
+                else:
+                    collect_routes: list[BroadcastRoute] = []
+                    for edge in outgoing:
+                        dst = node_map[edge.dst_node]
+                        tile_hops = _generate_route_xy(node.coord, dst.coord)
+                        collect_routes.append(
+                            BroadcastRoute(
+                                dest=dst.coord,
+                                hops=tile_hops,
+                                deliver_at=[],
+                                payload_slot=edge.dst_slot,
+                            )
+                        )
+
+                    # Detect scatter: when routing to multiple attention PEs
+                    # and delivering to the Q slot (0), scatter Q rows instead
+                    # of broadcasting the full matrix.
+                    use_scatter = False
+                    if len(outgoing) > 1:
+                        all_attn = all(
+                            node_map[e.dst_node].kind == PlacedNodeKind.ATTENTION_PE
+                            for e in outgoing
+                        )
+                        # Q slot = 0 on attention PEs
+                        all_q_slot = all(e.dst_slot == 0 for e in outgoing)
+                        if all_attn and all_q_slot:
+                            use_scatter = True
+
+                    # Apply broadcast detection for non-scatter routes
+                    if not use_scatter:
+                        collect_routes = _try_linear_broadcast(node.coord, collect_routes)
+
+                    for i in range(collect.num_fragments):
+                        frag_offset = i * base + min(i, remainder)
+                        tile_rows = base + 1 if i < remainder else base
+                        pe_tasks[node.coord].append(
+                            ConcatCollectForwardEntry(
+                                trigger_slot=i,
+                                num_fragments=collect.num_fragments,
+                                total_rows=collect.total_rows,
+                                fragment_offset=frag_offset,
+                                fragment_rows=tile_rows,
+                                activation=collect.activation,
+                                routes=list(collect_routes),
+                                scatter=use_scatter,
+                            )
+                        )
             else:
                 for i in range(collect.num_fragments):
                     frag_offset = i * base + min(i, remainder)
@@ -230,6 +295,8 @@ def _route_xy(
             _route_attention_pe(node, spatial, node_map, pe_tasks)
 
         elif node.kind == PlacedNodeKind.ADD:
+            if node.id in handled_adds:
+                continue  # fused into ConcatAdd
             _route_add(node, spatial, node_map, pe_tasks)
 
         elif node.kind == PlacedNodeKind.SOFTMAX:

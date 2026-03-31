@@ -131,6 +131,19 @@ class MatMulEntry:
 
 
 @dataclass
+class ConcatAddEntry:
+    kind: str = field(default="concat_add", init=False)
+    trigger_slot: int = 0
+    num_fragments: int = 0
+    total_rows: int = 0
+    fragment_offset: int = 0
+    fragment_rows: int = 0
+    num_positions: int = 0
+    residual_slot: int = 0
+    routes: list[BroadcastRoute] = field(default_factory=list)
+
+
+@dataclass
 class RmsNormFusedEntry:
     kind: str = field(default="rms_norm_fused", init=False)
     trigger_slot: int = 0
@@ -150,6 +163,7 @@ TaskEntry = (
     | AddEntry
     | SoftmaxEntry
     | MatMulEntry
+    | ConcatAddEntry
     | RmsNormFusedEntry
 )
 

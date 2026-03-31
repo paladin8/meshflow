@@ -71,13 +71,13 @@ class TestSmallConfig:
         assert self.program.mesh_config.width <= 11
 
     def test_total_messages(self):
-        assert self.result.total_messages <= 84  # M12P2: fused RMSNorm (114 -> 84)
+        assert self.result.total_messages <= 82  # M12P4: ConcatAdd (84 -> 82)
 
     def test_total_hops(self):
         assert self.result.total_hops <= 154  # M12P2: fused RMSNorm (222 -> 154)
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 1303  # M12P3: centered FFN collect (1297 -> 1303)
+        assert self.result.final_timestamp <= 1237  # M12P4: ConcatAdd (1303 -> 1237)
 
     def test_max_sends(self):
         assert _max_sends(self.result) <= 10  # M12P2: reduced from 17
@@ -115,13 +115,13 @@ class TestMediumConfig:
         assert self.program.mesh_config.width <= 11
 
     def test_total_messages(self):
-        assert self.result.total_messages <= 124  # M12P2: fused RMSNorm (170 -> 124)
+        assert self.result.total_messages <= 122  # M12P4: ConcatAdd (124 -> 122)
 
     def test_total_hops(self):
         assert self.result.total_hops <= 259  # M12P2: fused RMSNorm (380 -> 259)
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 5721  # M12P3: centered FFN collect (5761 -> 5721)
+        assert self.result.final_timestamp <= 5463  # M12P4: ConcatAdd (5721 -> 5463)
 
     def test_max_sends(self):
         assert _max_sends(self.result) <= 17  # M12P2: reduced from 22

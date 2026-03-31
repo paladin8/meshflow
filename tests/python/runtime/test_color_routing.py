@@ -77,7 +77,7 @@ class TestParallelSendBehavior:
         result = run_program(artifact_bytes, inputs={"input": x.flatten().tolist()})
 
         assert result.final_timestamp > 0
-        assert result.final_timestamp <= 1400  # M12P2: fused RMSNorm (~1297)
+        assert result.final_timestamp <= 1300  # M12P4: ConcatAdd (~1237)
 
     def test_small_transformer_link_contentions(self) -> None:
         """Small transformer block link contentions are bounded.

@@ -881,6 +881,54 @@ impl Simulator {
                 task_end_ts = base_time;
                 self.broadcast_to_dests(base_time, coord, &routes, scales);
             }
+            TaskKind::ConcatAdd {
+                num_fragments,
+                total_rows,
+                fragment_offset,
+                fragment_rows,
+                num_positions,
+                residual_slot,
+                ref routes,
+            } => {
+                // Reuse process_concat_fragment for accumulation (same as CCF).
+                let trigger_slot = self.mesh.pe(coord).tasks[task_index].trigger_slot;
+                let completed = self.process_concat_fragment(
+                    coord,
+                    trigger_slot,
+                    num_fragments,
+                    total_rows,
+                    fragment_offset,
+                    fragment_rows,
+                    num_positions,
+                );
+                if let Some(assembled) = completed {
+                    // All fragments gathered and transposed — add residual.
+                    // The residual must have arrived before the last fragment
+                    // (it travels a shorter skip path). Panic if not present.
+                    let pe = self.mesh.pe_mut(coord);
+                    assert!(
+                        pe.has_slot(residual_slot),
+                        "ConcatAdd at {}: residual slot {} not populated when last fragment arrived",
+                        coord,
+                        residual_slot
+                    );
+                    let residual = pe.read_slot(residual_slot).clone();
+                    pe.remove_slot(residual_slot);
+
+                    debug_assert_eq!(assembled.len(), residual.len());
+                    let result: Vec<f32> = assembled
+                        .iter()
+                        .zip(residual.iter())
+                        .map(|(a, r)| a + r)
+                        .collect();
+
+                    let routes = routes.clone();
+                    let elements = assembled.len() as u64;
+                    let base_time = timestamp + self.task_cost(elements);
+                    task_end_ts = base_time;
+                    self.broadcast_to_dests(base_time, coord, &routes, result);
+                }
+            }
             TaskKind::RmsNormFused {
                 input_slot,
                 gamma_slot,

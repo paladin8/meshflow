@@ -172,6 +172,20 @@ enum TaskProgram {
         #[serde(default)]
         routes: Vec<BroadcastRouteProgram>,
     },
+    #[serde(rename = "concat_add")]
+    ConcatAdd {
+        trigger_slot: u32,
+        num_fragments: u32,
+        total_rows: u32,
+        fragment_offset: u32,
+        #[serde(default)]
+        fragment_rows: u32,
+        #[serde(default)]
+        num_positions: u32,
+        residual_slot: u32,
+        #[serde(default)]
+        routes: Vec<BroadcastRouteProgram>,
+    },
     #[serde(rename = "rms_norm_fused")]
     RmsNormFused {
         trigger_slot: u32,
@@ -647,6 +661,30 @@ fn convert_task(task: &TaskProgram, width: u32, height: u32) -> Result<TaskConfi
                     num_tiles: *num_tiles,
                     feature_count: *feature_count,
                     eps: *eps,
+                    routes: converted_routes,
+                },
+                trigger_slot: *trigger_slot,
+            })
+        }
+        TaskProgram::ConcatAdd {
+            trigger_slot,
+            num_fragments,
+            total_rows,
+            fragment_offset,
+            fragment_rows,
+            num_positions,
+            residual_slot,
+            routes,
+        } => {
+            let converted_routes = convert_routes(routes, width, height)?;
+            Ok(TaskConfig {
+                kind: TaskKind::ConcatAdd {
+                    num_fragments: *num_fragments,
+                    total_rows: *total_rows,
+                    fragment_offset: *fragment_offset,
+                    fragment_rows: *fragment_rows,
+                    num_positions: *num_positions,
+                    residual_slot: *residual_slot,
                     routes: converted_routes,
                 },
                 trigger_slot: *trigger_slot,

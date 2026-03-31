@@ -132,6 +132,21 @@ class MatMulTask:
 
 
 @dataclass
+class ConcatAddTask:
+    """Fused concat + add: accumulate fragments into residual incrementally."""
+
+    kind: str = field(default="concat_add", init=False)
+    trigger_slot: int = 0
+    num_fragments: int = 0
+    total_rows: int = 0
+    fragment_offset: int = 0
+    fragment_rows: int = 0
+    num_positions: int = 0
+    residual_slot: int = 0
+    routes: list[BroadcastRouteTask] = field(default_factory=list)
+
+
+@dataclass
 class RmsNormFusedTask:
     """Fused RMSNorm: receive full input, normalize in-place, broadcast."""
 
@@ -153,6 +168,7 @@ TaskProgram = (
     | AddTask
     | SoftmaxTask
     | MatMulTask
+    | ConcatAddTask
     | RmsNormFusedTask
 )
 """Union of all task types that can appear in a PEProgram."""
@@ -290,6 +306,10 @@ def _dict_to_task(d: dict[str, Any]) -> TaskProgram:
         if "routes" in fields:
             fields["routes"] = _reconstruct_routes(fields["routes"])
         return MatMulTask(**fields)
+    if kind == "concat_add":
+        if "routes" in fields:
+            fields["routes"] = _reconstruct_routes(fields["routes"])
+        return ConcatAddTask(**fields)
     if kind in ("rms_norm_partial_sum", "rms_norm_normalize", "rms_norm_reduce"):
         raise ValueError(
             f"legacy RMSNorm task kind {kind!r} from pre-M12 artifact; "

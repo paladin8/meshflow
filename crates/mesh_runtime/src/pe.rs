@@ -178,6 +178,18 @@ pub enum TaskKind {
         eps: f32,
         routes: Vec<BroadcastRouteRuntime>,
     },
+    /// Fused concat + add: accumulate fragments into residual incrementally.
+    /// Replaces ConcatCollectForward + Add at residual connection points.
+    /// Each fragment is added to the residual as it arrives (pipelined).
+    ConcatAdd {
+        num_fragments: u32,
+        total_rows: u32,
+        fragment_offset: u32,
+        fragment_rows: u32,
+        num_positions: u32,
+        residual_slot: SlotId,
+        routes: Vec<BroadcastRouteRuntime>,
+    },
     /// Fused RMSNorm: receive full input, normalize in-place, broadcast.
     /// Single-PE replacement for the tile + reduce + collect pipeline.
     RmsNormFused {
@@ -203,6 +215,7 @@ impl std::fmt::Display for TaskKind {
             TaskKind::RmsNormPartialSum { .. } => write!(f, "rms_norm_partial_sum"),
             TaskKind::RmsNormNormalize { .. } => write!(f, "rms_norm_normalize"),
             TaskKind::RmsNormReduce { .. } => write!(f, "rms_norm_reduce"),
+            TaskKind::ConcatAdd { .. } => write!(f, "concat_add"),
             TaskKind::RmsNormFused { .. } => write!(f, "rms_norm_fused"),
         }
     }

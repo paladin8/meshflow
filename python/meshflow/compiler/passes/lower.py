@@ -4,6 +4,7 @@ from meshflow.compiler.artifact import (
     AddTask,
     BroadcastRouteTask,
     CollectOutputTask,
+    ConcatAddTask,
     ConcatCollectForwardTask,
     ConcatCollectTask,
     ForwardActivationTask,
@@ -28,6 +29,7 @@ from meshflow.compiler.schedule_ir import (
     ForwardActivationEntry,
     LinearEntry,
     MatMulEntry,
+    ConcatAddEntry,
     RmsNormFusedEntry,
     ScheduleIR,
     SoftmaxEntry,
@@ -115,6 +117,17 @@ def _lower_task(task: TaskEntry) -> TaskProgram:
             cols=task.cols,
             transpose=task.transpose,
             output_slot=task.output_slot,
+            routes=[_lower_route(r) for r in task.routes],
+        )
+    if isinstance(task, ConcatAddEntry):
+        return ConcatAddTask(
+            trigger_slot=task.trigger_slot,
+            num_fragments=task.num_fragments,
+            total_rows=task.total_rows,
+            fragment_offset=task.fragment_offset,
+            fragment_rows=task.fragment_rows,
+            num_positions=task.num_positions,
+            residual_slot=task.residual_slot,
             routes=[_lower_route(r) for r in task.routes],
         )
     if isinstance(task, RmsNormFusedEntry):
