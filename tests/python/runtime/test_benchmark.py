@@ -77,7 +77,7 @@ class TestSmallConfig:
         assert self.result.total_hops <= 154  # M12P2: fused RMSNorm (222 -> 154)
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 1297  # M12P2: fused RMSNorm (1557 -> 1297)
+        assert self.result.final_timestamp <= 1303  # M12P3: centered FFN collect (1297 -> 1303)
 
     def test_max_sends(self):
         assert _max_sends(self.result) <= 10  # M12P2: reduced from 17
@@ -121,7 +121,7 @@ class TestMediumConfig:
         assert self.result.total_hops <= 259  # M12P2: fused RMSNorm (380 -> 259)
 
     def test_final_timestamp(self):
-        assert self.result.final_timestamp <= 5761  # M12P2: fused RMSNorm (6901 -> 5761)
+        assert self.result.final_timestamp <= 5721  # M12P3: centered FFN collect (5761 -> 5721)
 
     def test_max_sends(self):
         assert _max_sends(self.result) <= 17  # M12P2: reduced from 22

@@ -326,7 +326,12 @@ def _place_tiled_compute_group(
     nodes: list[PlacedNode] = []
     edges: list[PlacedEdge] = []
 
-    tile_rows, collect_row = _middle_collect_rows(len(group.tiles), stagger_offset=col)
+    # Center the collect for FFN columns (asymmetric in_features vs total_rows)
+    # where the tile→collect gather is the critical-path bottleneck.
+    # Symmetric columns (Q/K/V/Proj) benefit from stagger for broadcast distribution.
+    is_gather_dominated = group.tiles[0].in_features != group.collect.total_rows
+    stagger = 1 if is_gather_dominated else col  # 1 → center, col → stagger
+    tile_rows, collect_row = _middle_collect_rows(len(group.tiles), stagger_offset=stagger)
 
     for spec in group.tiles:
         tile_id = f"{group.origin_id}_tile_{spec.tile_index}"
