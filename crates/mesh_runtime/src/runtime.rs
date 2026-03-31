@@ -504,20 +504,17 @@ impl Simulator {
         // Clone the task to avoid borrow conflicts with the PE
         let task = self.mesh.pe(coord).tasks[task_index].kind.clone();
 
-        // Record operator timing and trace event
         let task_kind_str = task.to_string();
-        self.profile.operator_timings.push(OperatorTiming {
-            task_kind: task_kind_str.clone(),
-            coord,
-            start_ts: timestamp,
-            end_ts: timestamp + self.config.task_base_latency,
-        });
         self.profile.trace_events.push(TraceEvent {
             timestamp,
             coord,
             kind: TraceEventKind::TaskExecute,
-            detail: task_kind_str,
+            detail: task_kind_str.clone(),
         });
+
+        // Actual task completion time — set by each handler to include
+        // element-proportional compute cost, not just task_base_latency.
+        let mut task_end_ts = timestamp + self.config.task_base_latency;
 
         match task {
             TaskKind::ForwardActivation {
@@ -577,6 +574,7 @@ impl Simulator {
                 let routes = routes.clone();
                 let elements = (tile_rows as u64) * (tile_cols as u64) * (num_positions as u64);
                 let send_time = timestamp + self.task_cost(elements);
+                task_end_ts = send_time;
                 self.broadcast_to_dests(send_time, coord, &routes, y);
             }
             TaskKind::ConcatCollect {
@@ -644,7 +642,7 @@ impl Simulator {
                 let pe = self.mesh.pe_mut(coord);
 
                 if !pe.has_slot(input_slot_a) || !pe.has_slot(input_slot_b) {
-                    return;
+                    return; // inputs not ready — no timing recorded
                 }
 
                 pe.counters.tasks_executed += 1;
@@ -663,6 +661,7 @@ impl Simulator {
 
                 let routes = routes.clone();
                 let base_time = timestamp + self.task_cost(elements);
+                task_end_ts = base_time;
                 self.broadcast_to_dests(base_time, coord, &routes, result);
             }
             TaskKind::Softmax {
@@ -681,6 +680,7 @@ impl Simulator {
 
                 let elements = 3 * data.len() as u64;
                 let element_cost = elements * self.config.cost_per_element;
+                task_end_ts = timestamp + element_cost;
                 self.task_write_slot(timestamp + element_cost, coord, output_slot, result);
             }
             TaskKind::MatMul {
@@ -695,7 +695,7 @@ impl Simulator {
                 let pe = self.mesh.pe_mut(coord);
 
                 if !pe.has_slot(matrix_slot) || !pe.has_slot(vector_slot) {
-                    return;
+                    return; // inputs not ready — no timing recorded
                 }
 
                 pe.counters.tasks_executed += 1;
@@ -724,6 +724,7 @@ impl Simulator {
 
                 let elements = (rows as u64) * (cols as u64);
                 let element_cost = elements * self.config.cost_per_element;
+                task_end_ts = timestamp + element_cost;
                 self.task_write_slot(timestamp + element_cost, coord, output_slot, result.clone());
 
                 let routes = routes.clone();
@@ -772,6 +773,7 @@ impl Simulator {
                 };
                 let elements = (ss as u64) * (num_pos as u64);
                 let send_time = timestamp + self.task_cost(elements);
+                task_end_ts = send_time;
                 self.broadcast_to_dests(send_time, coord, &routes, payload);
             }
             TaskKind::RmsNormNormalize {
@@ -817,6 +819,7 @@ impl Simulator {
                 let routes = routes.clone();
                 let elements = (ss as u64) * (num_positions as u64);
                 let base_time = timestamp + self.task_cost(elements);
+                task_end_ts = base_time;
                 self.broadcast_to_dests(base_time, coord, &routes, result);
             }
             TaskKind::RmsNormReduce {
@@ -850,7 +853,7 @@ impl Simulator {
                 pe.write_slot(counter_slot, vec![count as f32]);
 
                 if count < num_tiles {
-                    return;
+                    return; // not all partials arrived — no timing recorded
                 }
 
                 pe.counters.tasks_executed += 1;
@@ -875,9 +878,18 @@ impl Simulator {
                 let routes = routes.clone();
                 let elements = (num_tiles as u64) * (num_positions as u64);
                 let base_time = timestamp + self.task_cost(elements);
+                task_end_ts = base_time;
                 self.broadcast_to_dests(base_time, coord, &routes, scales);
             }
         }
+
+        // Record operator timing with actual completion time
+        self.profile.operator_timings.push(OperatorTiming {
+            task_kind: task_kind_str,
+            coord,
+            start_ts: timestamp,
+            end_ts: task_end_ts,
+        });
     }
 
     /// Create and enqueue a single outbound message from `source` to `dest`.
